@@ -1,8 +1,9 @@
-use crate::middleware::{ActorContext, ControlApiState};
+use crate::middleware::{AuthenticatedActor, ControlApiState, require_authenticated_actor};
 use axum::{
     Router,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Extension, State},
+    http::StatusCode,
+    middleware as axum_middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -12,9 +13,17 @@ use domain::governance::{
 use serde::Serialize;
 
 pub fn app_router(state: ControlApiState) -> Router {
+    let privileged_routes = Router::new().route(
+        "/control/rebalance",
+        post(rebalance_portfolio).route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        )),
+    );
+
     Router::new()
         .route("/health", get(health))
-        .route("/control/rebalance", post(rebalance_portfolio))
+        .merge(privileged_routes)
         .with_state(state)
 }
 
@@ -24,14 +33,13 @@ pub async fn health() -> &'static str {
 
 pub async fn rebalance_portfolio(
     State(state): State<ControlApiState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuthenticatedActor>,
 ) -> Response {
-    let actor = ActorContext::from_headers(&headers);
     let decision = state
         .authorization_guard
         .evaluate(&actor, ControlAction::ExecuteControlPlaneAction);
 
-    emit_authorization_telemetry(&decision);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
 
     if decision.outcome == AuthorizationOutcome::Allow {
         return (
@@ -42,6 +50,7 @@ pub async fn rebalance_portfolio(
                 actor_id: decision.actor_id,
                 role: decision.role,
                 outcome: "allow",
+                authentication_outcome: actor.authentication_outcome.as_str(),
                 correlation_id: decision.correlation_id,
                 timestamp_utc: decision.timestamp_utc,
             }),
@@ -68,6 +77,7 @@ pub async fn rebalance_portfolio(
             action: decision.action,
             actor_id: decision.actor_id,
             role: decision.role,
+            authentication_outcome: actor.authentication_outcome.as_str(),
             correlation_id: decision.correlation_id,
             timestamp_utc: decision.timestamp_utc,
         }),
@@ -75,7 +85,10 @@ pub async fn rebalance_portfolio(
         .into_response()
 }
 
-fn emit_authorization_telemetry(decision: &AuthorizationDecision) {
+fn emit_authorization_telemetry(
+    decision: &AuthorizationDecision,
+    authentication_outcome: &'static str,
+) {
     let telemetry_event = AuthorizationTelemetryEvent {
         event_name: "authorization_decision_v1",
         actor_id: &decision.actor_id,
@@ -86,6 +99,7 @@ fn emit_authorization_telemetry(decision: &AuthorizationDecision) {
             AuthorizationOutcome::Deny => "deny",
         },
         reason: reason_key(decision.reason),
+        authentication_outcome,
         correlation_id: &decision.correlation_id,
         timestamp_utc: &decision.timestamp_utc,
     };
@@ -118,6 +132,7 @@ struct AuthorizationTelemetryEvent<'a> {
     action: &'a str,
     outcome: &'a str,
     reason: &'a str,
+    authentication_outcome: &'a str,
     correlation_id: &'a str,
     timestamp_utc: &'a str,
 }
@@ -129,6 +144,7 @@ pub struct ControlActionAccepted {
     pub actor_id: String,
     pub role: String,
     pub outcome: &'static str,
+    pub authentication_outcome: &'static str,
     pub correlation_id: String,
     pub timestamp_utc: String,
 }
@@ -141,6 +157,7 @@ pub struct ControlActionDenied {
     pub action: String,
     pub actor_id: String,
     pub role: String,
+    pub authentication_outcome: &'static str,
     pub correlation_id: String,
     pub timestamp_utc: String,
 }
@@ -148,19 +165,34 @@ pub struct ControlActionDenied {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::{ControlApiState, GovernanceAuthorizationGuard};
+    use crate::middleware::{
+        AuthenticatedActor, AuthenticationError, Authenticator, AuthorizationGuard,
+        ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator,
+    };
     use axum::{
         body::{Body, to_bytes},
+        http::HeaderMap,
         http::Request,
     };
-    use domain::governance::AuthorizationEvaluator;
+    use domain::governance::{AuthorizationDecision, AuthorizationEvaluator, ControlAction};
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    fn bearer_token(actor_id: &str, role: &str, expires_unix: i64) -> String {
+        format!("Bearer {actor_id}:{role}:{expires_unix}")
+    }
+
     fn test_app() -> Router {
-        app_router(ControlApiState::new(Arc::new(
-            GovernanceAuthorizationGuard::new(AuthorizationEvaluator::default()),
-        )))
+        app_router(ControlApiState::new(
+            Arc::new(GovernanceAuthorizationGuard::new(
+                AuthorizationEvaluator::default(),
+            )),
+            Arc::new(HeaderTokenAuthenticator),
+        ))
+    }
+
+    fn test_app_with_state(state: ControlApiState) -> Router {
+        app_router(state)
     }
 
     #[tokio::test]
@@ -180,14 +212,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_credentials_reject_privileged_request_with_machine_readable_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header("x-correlation-id", "corr-auth-missing-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_missing_credentials");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr-auth-missing-001");
+        assert_eq!(
+            payload["security_signal"]["name"],
+            "unauthorized_privileged_auth_attempt_v1"
+        );
+        assert_eq!(payload["security_signal"]["alert_compatible"], true);
+        assert_eq!(payload["security_signal"]["alert_target_seconds"], 30);
+    }
+
+    #[tokio::test]
+    async fn malformed_credentials_reject_privileged_request_with_machine_readable_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header("authorization", "Token malformed")
+                    .header("x-correlation-id", "corr-auth-malformed-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_malformed_credentials");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr-auth-malformed-001");
+    }
+
+    #[tokio::test]
+    async fn expired_credentials_reject_privileged_request_with_machine_readable_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 1),
+                    )
+                    .header("x-correlation-id", "corr-auth-expired-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_expired_credentials");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr-auth-expired-001");
+    }
+
+    #[tokio::test]
+    async fn invalid_expiry_material_rejects_privileged_request_with_machine_readable_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        "Bearer ops-1:operational_control:not-a-timestamp",
+                    )
+                    .header("x-correlation-id", "corr-auth-invalid-expiry-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_invalid_credentials");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr-auth-invalid-expiry-001");
+    }
+
+    #[tokio::test]
+    async fn invalid_actor_id_format_rejects_privileged_request_with_machine_readable_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops@1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-auth-invalid-actor-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_unknown_actor_context");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr-auth-invalid-actor-001");
+    }
+
+    #[tokio::test]
+    async fn invalid_correlation_id_format_rejects_privileged_request_with_machine_readable_error()
+    {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr invalid format 001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_unknown_actor_context");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr invalid format 001");
+        assert_eq!(
+            payload["security_signal"]["name"],
+            "unauthorized_privileged_auth_attempt_v1"
+        );
+        assert_eq!(payload["security_signal"]["alert_compatible"], true);
+    }
+
+    #[tokio::test]
     async fn denied_control_path_returns_machine_readable_authorization_error() {
         let response = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/control/rebalance")
                     .method("POST")
-                    .header("x-actor-id", "analytics-reader")
-                    .header("x-actor-role", "read_only_analytics")
+                    .header(
+                        "authorization",
+                        bearer_token("analytics-reader", "read_only_analytics", 4_102_444_800),
+                    )
                     .header("x-correlation-id", "corr-deny-001")
                     .body(Body::empty())
                     .expect("deny request should build"),
@@ -216,8 +447,10 @@ mod tests {
                 Request::builder()
                     .uri("/control/rebalance")
                     .method("POST")
-                    .header("x-actor-id", "analytics-reader")
-                    .header("x-actor-role", "read_only_analytics")
+                    .header(
+                        "authorization",
+                        bearer_token("analytics-reader", "read_only_analytics", 4_102_444_800),
+                    )
                     .header("x-correlation-id", "corr-deny-002")
                     .body(Body::empty())
                     .expect("request should build"),
@@ -258,14 +491,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_actor_context_role_returns_machine_readable_auth_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "unsupported_role", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-unknown-actor-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_unknown_actor_context");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr-unknown-actor-001");
+    }
+
+    #[tokio::test]
     async fn missing_correlation_id_returns_invalid_actor_context_error() {
         let response = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/control/rebalance")
                     .method("POST")
-                    .header("x-actor-id", "ops-1")
-                    .header("x-actor-role", "operational_control")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -274,42 +541,15 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should be readable");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("payload should be valid json");
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
 
-        assert_eq!(payload["error_code"], "invalid_actor_context");
-        assert_eq!(payload["reason"], "invalid_actor_context");
-    }
-
-    #[tokio::test]
-    async fn unknown_role_returns_machine_readable_bad_request() {
-        let response = test_app()
-            .oneshot(
-                Request::builder()
-                    .uri("/control/rebalance")
-                    .method("POST")
-                    .header("x-actor-id", "ops-1")
-                    .header("x-actor-role", "guest")
-                    .header("x-correlation-id", "corr-unknown-role-001")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should be readable");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("payload should be valid json");
-
-        assert_eq!(payload["error_code"], "unknown_role");
-        assert_eq!(payload["reason"], "unknown_role");
+        assert_eq!(payload["error"]["code"], "auth_unknown_actor_context");
+        assert_eq!(payload["authentication_outcome"], "denied");
     }
 
     #[tokio::test]
@@ -319,8 +559,10 @@ mod tests {
                 Request::builder()
                     .uri("/control/rebalance")
                     .method("POST")
-                    .header("x-actor-id", "ops-1")
-                    .header("x-actor-role", "operational_control")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
                     .header("x-correlation-id", "corr-allow-001")
                     .body(Body::empty())
                     .expect("allow request should build"),
@@ -337,8 +579,55 @@ mod tests {
             serde_json::from_slice(&body).expect("allow payload should be valid json");
 
         assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["authentication_outcome"], "authenticated");
         assert_eq!(payload["outcome"], "allow");
         assert_eq!(payload["action"], "execute_control_plane_action");
+        assert_eq!(payload["actor_id"], "ops-1");
+        assert_eq!(payload["role"], "operational_control");
+        assert_eq!(payload["correlation_id"], "corr-allow-001");
+    }
+
+    #[tokio::test]
+    async fn administrative_actions_role_allow_path_includes_timestamp_traceability() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("admin-1", "administrative_actions", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-allow-admin-001")
+                    .body(Body::empty())
+                    .expect("allow request should build"),
+            )
+            .await
+            .expect("allow request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("allow payload should be valid json");
+
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+        assert_eq!(payload["outcome"], "allow");
+        assert_eq!(payload["authentication_outcome"], "authenticated");
+        assert_eq!(payload["actor_id"], "admin-1");
+        assert_eq!(payload["role"], "administrative_actions");
+        assert_eq!(payload["correlation_id"], "corr-allow-admin-001");
+
+        let timestamp_utc = payload["timestamp_utc"]
+            .as_str()
+            .expect("allow payload should include timestamp evidence");
+        assert!(
+            timestamp_utc.contains('T') && timestamp_utc.ends_with('Z'),
+            "allow payload timestamp should be RFC3339 UTC"
+        );
     }
 
     #[tokio::test]
@@ -370,8 +659,7 @@ mod tests {
                     Request::builder()
                         .uri("/control/rebalance")
                         .method("POST")
-                        .header("x-actor-id", actor_id)
-                        .header("x-actor-role", role)
+                        .header("authorization", bearer_token(actor_id, role, 4_102_444_800))
                         .header("x-correlation-id", correlation_id)
                         .body(Body::empty())
                         .expect("request should build"),
@@ -395,6 +683,7 @@ mod tests {
             assert_eq!(payload["actor_id"], actor_id);
             assert_eq!(payload["role"], role);
             assert_eq!(payload["correlation_id"], correlation_id);
+            assert_eq!(payload["authentication_outcome"], "authenticated");
 
             if expected_status == StatusCode::FORBIDDEN {
                 assert_eq!(payload["error_code"], "authorization_denied");
@@ -404,5 +693,104 @@ mod tests {
                 assert_eq!(payload["outcome"], "allow");
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct FailingAuthenticator;
+
+    impl Authenticator for FailingAuthenticator {
+        fn authenticate(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<AuthenticatedActor, Box<AuthenticationError>> {
+            let correlation_id = headers
+                .get("x-correlation-id")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            Err(Box::new(AuthenticationError::verification_failed(
+                "authentication adapter unavailable",
+                correlation_id,
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicAuthorizationGuard;
+
+    impl AuthorizationGuard for PanicAuthorizationGuard {
+        fn evaluate(
+            &self,
+            _actor: &AuthenticatedActor,
+            _action: ControlAction,
+        ) -> AuthorizationDecision {
+            panic!("authorization guard should not be invoked when authentication fails")
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticator_adapter_failure_is_fail_closed() {
+        let app = test_app_with_state(ControlApiState::new(
+            Arc::new(GovernanceAuthorizationGuard::new(
+                AuthorizationEvaluator::default(),
+            )),
+            Arc::new(FailingAuthenticator),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-auth-adapter-failure-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error"]["code"], "auth_verification_failed");
+        assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["correlation_id"], "corr-auth-adapter-failure-001");
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_do_not_invoke_authorization_guard() {
+        let app = test_app_with_state(ControlApiState::new(
+            Arc::new(PanicAuthorizationGuard),
+            Arc::new(HeaderTokenAuthenticator),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header("x-correlation-id", "corr-pre-execution-guard-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error"]["code"], "auth_missing_credentials");
     }
 }

@@ -51,3 +51,36 @@ For access-change operations and incident review:
 1. Validate requested assignment against least-privilege policy before writing `user_roles`.
 2. Confirm machine-readable deny reasons exist for rejected out-of-scope requests.
 3. Review telemetry evidence for both successful and denied decisions during QA and incident triage.
+
+## Control-plane authentication contract (Story 1.3)
+
+Privileged control endpoints (currently `POST /control/rebalance`) are authenticated before RBAC authorization is evaluated.
+
+Required request inputs:
+
+1. `Authorization: Bearer <actor_id>:<role>:<expires_unix>`
+2. `x-correlation-id: <traceable-correlation-id>`
+
+Validation is deterministic and fail-closed:
+
+- Missing credentials -> `auth_missing_credentials` (401)
+- Malformed credential shape -> `auth_malformed_credentials` (401)
+- Invalid credential material -> `auth_invalid_credentials` (401)
+- Expired credentials -> `auth_expired_credentials` (401)
+- Unknown/invalid actor context fields -> `auth_unknown_actor_context` (400)
+- Authenticator adapter verification failures -> `auth_verification_failed` (401)
+
+Authentication denials return machine-readable envelope fields under `error.code`, emit UTC RFC3339 timestamps, and include alert-compatible security signal attributes for unauthorized privileged-attempt detection (targetable to <=30s alert objectives).
+
+## Story 1.4 immutable audit handoff expectations
+
+Story 1.4 must append immutable audit records using authenticated identity context already emitted by the control-plane boundary:
+
+- `actor_id`
+- `role`
+- `correlation_id`
+- `authentication_outcome`
+- auth/authorization decision codes
+- RFC3339 UTC decision timestamp
+
+The append pipeline should consume these authenticated context fields directly and must not re-introduce raw caller-supplied identity trust.
