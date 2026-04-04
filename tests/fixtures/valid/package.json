@@ -1,0 +1,13 @@
+{
+  "name": "fixture-root",
+  "private": true,
+  "packageManager": "pnpm@10.10.0",
+  "scripts": {
+    "bootstrap:verify": "npm run preflight && npm run bootstrap:check",
+    "ci:rust": "npm run rust:test",
+    "ci:web": "npm run web:build",
+    "ci:security": "node tools/bootstrap/security-scan.mjs",
+    "rust:test": "cargo test --workspace",
+    "web:build": "pnpm --filter operator-console build"
+  }
+}

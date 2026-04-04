@@ -1,0 +1,11 @@
+[package]
+name = "research-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio.workspace = true
+common = { path = "../../crates/common" }
+domain = { path = "../../crates/domain" }

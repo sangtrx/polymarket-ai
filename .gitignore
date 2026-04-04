@@ -1,0 +1,22 @@
+# Runtime secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+apps/operator-console/node_modules/
+.pnpm-store/
+
+# Rust
+target/
+
+# Build artifacts and CI evidence
+bootstrap-evidence/
+apps/operator-console/.next/
+apps/operator-console/out/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

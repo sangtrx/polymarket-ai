@@ -1,0 +1,57 @@
+name: ci-rust
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  rust-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.10.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          components: rustfmt,clippy
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run preflight and bootstrap checks
+        run: |
+          set -euo pipefail
+          mkdir -p bootstrap-evidence
+          npm run preflight 2>&1 | tee bootstrap-evidence/preflight.log
+          node tools/bootstrap/check-bootstrap.mjs --evidence-file bootstrap-evidence/bootstrap-check.json 2>&1 | tee bootstrap-evidence/bootstrap-check.log
+
+      - name: Run rust quality gates
+        run: |
+          set -euo pipefail
+          npm run rust:fmt 2>&1 | tee bootstrap-evidence/rust-fmt.log
+          npm run rust:lint 2>&1 | tee bootstrap-evidence/rust-lint.log
+          npm run rust:test 2>&1 | tee bootstrap-evidence/rust-test.log
+          npm run rust:build 2>&1 | tee bootstrap-evidence/rust-build.log
+
+      - name: Upload bootstrap evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-evidence
+          path: bootstrap-evidence

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+  "services/control-api",
+  "services/execution-engine",
+  "services/risk-engine",
+  "services/portfolio-engine",
+  "services/governance-service",
+  "services/reporting-service",
+  "services/research-gateway",
+  "crates/domain",
+  "crates/common",
+  "crates/persistence",
+]
+default-members = [
+  "services/control-api",
+  "services/execution-engine",
+  "services/risk-engine",
+  "crates/domain",
+  "crates/common",
+  "crates/persistence",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Polymarket AI Team"]
+
+[workspace.dependencies]
+axum = "0.8.8"
+opentelemetry = "0.31.0"
+polymarket-client-sdk = { version = "0.4.4", default-features = false, features = ["clob", "ws"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal"] }

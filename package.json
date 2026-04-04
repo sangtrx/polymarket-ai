@@ -1,0 +1,29 @@
+{
+  "name": "polymarket-ai",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.10.0",
+  "engines": {
+    "node": ">=20.9.0",
+    "pnpm": ">=10.0.0 <11.0.0"
+  },
+  "scripts": {
+    "preflight": "node tools/bootstrap/preflight.mjs",
+    "bootstrap:check": "node tools/bootstrap/check-bootstrap.mjs",
+    "bootstrap:verify": "npm run preflight && npm run bootstrap:check",
+    "bootstrap:verify:negative": "node --test tests/bootstrap/bootstrap-negative.test.mjs",
+    "bootstrap:test": "node --test tests/bootstrap/*.test.mjs tests/api/*.test.mjs tests/e2e/*.test.mjs",
+    "qa:test:story-1-1": "node --test tests/api/bootstrap-cli-api.test.mjs tests/e2e/bootstrap-baseline.e2e.test.mjs",
+    "rust:fmt": "cargo fmt --all -- --check",
+    "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "rust:test": "cargo test --workspace --all-targets",
+    "rust:build": "cargo build --workspace --all-targets",
+    "web:lint": "pnpm --filter operator-console lint",
+    "web:typecheck": "pnpm --filter operator-console typecheck",
+    "web:build": "pnpm --filter operator-console build",
+    "ci:rust": "npm run preflight && npm run bootstrap:check && npm run rust:fmt && npm run rust:lint && npm run rust:test && npm run rust:build",
+    "ci:web": "npm run preflight && npm run bootstrap:check && npm run web:lint && npm run web:typecheck && npm run web:build",
+    "ci:security": "npm run preflight && npm run bootstrap:check && node tools/bootstrap/security-scan.mjs",
+    "test": "npm run bootstrap:test && npm run rust:test"
+  }
+}

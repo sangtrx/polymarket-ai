@@ -1,0 +1,56 @@
+name: ci-web
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  web-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.10.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          components: rustfmt,clippy
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run preflight and bootstrap checks
+        run: |
+          set -euo pipefail
+          mkdir -p bootstrap-evidence
+          npm run preflight 2>&1 | tee bootstrap-evidence/preflight.log
+          node tools/bootstrap/check-bootstrap.mjs --evidence-file bootstrap-evidence/bootstrap-check.json 2>&1 | tee bootstrap-evidence/bootstrap-check.log
+
+      - name: Run web quality gates
+        run: |
+          set -euo pipefail
+          npm run web:lint 2>&1 | tee bootstrap-evidence/web-lint.log
+          npm run web:typecheck 2>&1 | tee bootstrap-evidence/web-typecheck.log
+          npm run web:build 2>&1 | tee bootstrap-evidence/web-build.log
+
+      - name: Upload bootstrap evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-evidence
+          path: bootstrap-evidence

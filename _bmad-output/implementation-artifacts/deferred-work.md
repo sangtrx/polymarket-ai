@@ -1,0 +1,3 @@
+## Deferred from: code review of 1-1-set-up-initial-project-from-starter-template (2026-04-04T19:19:16Z)
+
+- `.scripts/bmad-auto/copilot/bmad-progress.log` appears in git status but is outside story application scope and not part of the story implementation file list.
