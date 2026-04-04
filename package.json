@@ -14,6 +14,7 @@
     "bootstrap:verify:negative": "node --test tests/bootstrap/bootstrap-negative.test.mjs",
     "bootstrap:test": "node --test tests/bootstrap/*.test.mjs tests/api/*.test.mjs tests/e2e/*.test.mjs",
     "qa:test:story-1-1": "node --test tests/api/bootstrap-cli-api.test.mjs tests/e2e/bootstrap-baseline.e2e.test.mjs",
+    "qa:test:story-1-2": "cargo test -p control-api routes::tests::",
     "rust:fmt": "cargo fmt --all -- --check",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace --all-targets",

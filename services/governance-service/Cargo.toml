@@ -7,5 +7,6 @@ authors.workspace = true
 
 [dependencies]
 tokio.workspace = true
+serde.workspace = true
 common = { path = "../../crates/common" }
 domain = { path = "../../crates/domain" }

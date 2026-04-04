@@ -7,3 +7,5 @@ authors.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+domain = { path = "../domain" }
+sqlx.workspace = true

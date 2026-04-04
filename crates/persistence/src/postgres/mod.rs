@@ -1,3 +1,5 @@
+pub mod rbac;
+
 pub fn migration_namespace() -> &'static str {
-    "bootstrap"
+    "governance_rbac"
 }

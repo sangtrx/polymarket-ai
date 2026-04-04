@@ -7,3 +7,4 @@ authors.workspace = true
 
 [dependencies]
 serde.workspace = true
+time.workspace = true
