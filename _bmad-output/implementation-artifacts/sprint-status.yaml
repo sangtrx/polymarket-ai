@@ -1,0 +1,97 @@
+# generated: 2026-04-04T17:40:16Z
+# last_updated: 2026-04-04T17:40:16Z
+# project: polymarket-ai
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: {project-root}/_bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - SM typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+
+generated: 2026-04-04T17:40:16Z
+last_updated: 2026-04-04T17:40:16Z
+project: polymarket-ai
+project_key: NOKEY
+tracking_system: file-system
+story_location: '{project-root}/_bmad-output/implementation-artifacts'
+
+development_status:
+  epic-1: backlog
+  1-1-set-up-initial-project-from-starter-template: backlog
+  1-2-define-role-based-access-model: backlog
+  1-3-add-authenticated-control-middleware: backlog
+  1-4-implement-immutable-privileged-audit-logging: backlog
+  1-5-enforce-dual-approval-governance-for-critical-mutations: backlog
+  1-6-add-scheduled-and-emergency-credential-rotation-flows: backlog
+  epic-1-retrospective: optional
+  epic-2: backlog
+  2-1-configure-market-universe-policy-engine: backlog
+  2-2-ingest-market-stream-with-latency-guarantees: backlog
+  2-3-ingest-authenticated-user-stream-with-ordering-guarantees: backlog
+  2-4-enforce-data-freshness-gates-and-stale-feed-pausing: backlog
+  2-5-implement-venue-compatible-order-lifecycle-handling: backlog
+  2-6-build-reconciliation-and-exposure-visibility-core: backlog
+  2-7-configure-portfolio-market-and-strategy-limit-policies: backlog
+  2-8-enforce-pre-trade-gate-evaluation-pipeline: backlog
+  2-9-add-emergency-controls-and-automatic-safe-state-triggers: backlog
+  epic-2-retrospective: optional
+  epic-3: backlog
+  3-1-build-token-first-dashboard-shell-and-navigation-model: backlog
+  3-2-implement-risk-posture-banner-and-persistent-safety-action-rail: backlog
+  3-3-deliver-allocation-policy-and-drift-rebalance-workflows: backlog
+  3-4-build-cost-aware-pnl-and-attribution-surfaces: backlog
+  3-5-implement-incident-search-and-causal-timeline-forensics: backlog
+  3-6-add-severity-based-alerts-with-recommended-operator-actions: backlog
+  3-7-implement-controlled-recovery-readiness-gates: backlog
+  3-8-add-backup-integrity-validation-and-deterministic-restore-rehearsal: backlog
+  3-9-enforce-accessibility-and-reduced-motion-standards-in-critical-flows: backlog
+  epic-3-retrospective: optional
+  epic-4: backlog
+  4-1-define-normalized-reporting-read-models: backlog
+  4-2-build-versioned-read-only-api-contracts: backlog
+  4-3-implement-recurring-summary-report-scheduling: backlog
+  4-4-deliver-weekly-on-demand-and-incident-export-workflows: backlog
+  epic-4-retrospective: optional
+  epic-5: backlog
+  5-1-implement-reward-per-risk-policy-configuration-and-scoring: backlog
+  5-2-add-incentive-and-regime-shift-detection-alerts: backlog
+  5-3-enforce-low-liquidity-and-overnight-participation-guardrails: backlog
+  5-4-configure-core-satellite-market-stratification-policies: backlog
+  epic-5-retrospective: optional
+  epic-6: backlog
+  6-1-build-alpha-hypothesis-registry-with-required-metadata: backlog
+  6-2-configure-leakage-and-data-quality-gate-definitions: backlog
+  6-3-implement-validation-workflow-and-diagnostics-artifact-store: backlog
+  6-4-add-shadow-mode-evaluation-pipeline: backlog
+  6-5-enforce-promotion-thresholds-evidence-criteria-and-lifecycle-actions: backlog
+  6-6-integrate-counterfactual-replay-stress-gates: backlog
+  6-7-implement-live-alpha-health-monitoring-and-threshold-detection: backlog
+  6-8-deliver-alpha-governance-readiness-card-ux: backlog
+  6-9-enforce-automatic-deallocation-and-stop-research-policies: backlog
+  epic-6-retrospective: optional

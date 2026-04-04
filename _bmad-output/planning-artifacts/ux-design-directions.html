@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UX Design Directions — polymarket-ai</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:wght@600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f6f2ea;
+      --surface: #fffdf9;
+      --elevated: #ffffff;
+      --text: #1f1d1a;
+      --muted: #6d675e;
+      --border: #e7e0d3;
+      --accent: #c96a3d;
+      --info: #2f5d9a;
+      --warn: #b16b00;
+      --danger: #b2352f;
+      --good: #1f7a4c;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .wrap {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 28px;
+      display: grid;
+      gap: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-family: "Source Serif 4", Georgia, serif;
+      font-size: clamp(2rem, 3vw, 3rem);
+      line-height: 1.08;
+    }
+
+    .sub {
+      color: var(--muted);
+      margin-top: 8px;
+      max-width: 920px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 380px minmax(0, 1fr);
+      gap: 14px;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 14px;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 1rem;
+    }
+
+    .dir-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .dir {
+      border: 1px solid var(--border);
+      background: var(--elevated);
+      color: var(--text);
+      border-radius: 12px;
+      text-align: left;
+      cursor: pointer;
+      padding: 12px;
+      transition: transform .2s ease, border-color .2s ease;
+    }
+
+    .dir:hover,
+    .dir:focus-visible {
+      transform: translateY(-1px);
+      border-color: var(--accent);
+      outline: none;
+    }
+
+    .dir.active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+
+    .dir small {
+      display: block;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    .meta {
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    .preview {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: var(--elevated);
+      font-size: 0.85rem;
+    }
+
+    .chip {
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      font-size: 0.72rem;
+      background: var(--surface);
+    }
+
+    .chip.hot {
+      border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+      background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+    }
+
+    .shell {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      min-height: 560px;
+      background: linear-gradient(180deg, var(--surface), color-mix(in srgb, var(--surface) 55%, var(--bg) 45%));
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .grid-2 { display: grid; grid-template-columns: 1.6fr 1fr; gap: 10px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .stack { display: grid; gap: 10px; }
+
+    .block {
+      border: 1px solid var(--border);
+      background: var(--elevated);
+      border-radius: 12px;
+      padding: 12px;
+      min-height: 84px;
+    }
+
+    .block h3 {
+      margin: 0;
+      font-size: 0.84rem;
+    }
+
+    .block p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    .block.warn {
+      border-color: color-mix(in srgb, var(--warn) 35%, var(--border));
+      background: color-mix(in srgb, var(--warn) 7%, var(--elevated));
+    }
+
+    .block.danger {
+      border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+      background: color-mix(in srgb, var(--danger) 7%, var(--elevated));
+    }
+
+    .block.info {
+      border-color: color-mix(in srgb, var(--info) 35%, var(--border));
+      background: color-mix(in srgb, var(--info) 7%, var(--elevated));
+    }
+
+    .legend {
+      border-top: 1px dashed var(--border);
+      padding-top: 10px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      display: grid;
+      gap: 6px;
+    }
+
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: 1fr; }
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div>
+      <h1>Design Direction Mockups</h1>
+      <p class="sub">
+        Six distinct UI directions for <strong>polymarket-ai</strong> based on the UX spec and Claude-inspired visual language.
+        Select a direction to inspect structure, hierarchy, and workflow fit.
+      </p>
+    </div>
+
+    <div class="layout">
+      <aside class="panel">
+        <h2>Directions</h2>
+        <div id="dirList" class="dir-list"></div>
+        <div id="meta" class="meta"></div>
+      </aside>
+
+      <section class="preview">
+        <div class="bar">
+          <strong id="title">Direction</strong>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip">Operator view</span>
+            <span class="chip hot" id="focus">Focus</span>
+          </div>
+        </div>
+
+        <div id="shell" class="shell"></div>
+
+        <div id="legend" class="legend"></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const directions = {
+      warmPrecision: {
+        name: "A. Warm Precision",
+        focus: "Balanced calm + clarity",
+        density: "Medium",
+        bestFor: "Daily operator workflows",
+        notes: [
+          "Editorial top summary + practical control rail.",
+          "Warm neutrals lower stress while preserving urgency contrast.",
+          "Strong default for core product identity."
+        ],
+        render: () => `
+          <div class="grid-2">
+            <div class="stack">
+              <div class="block info"><h3>Portfolio State</h3><p>Net PnL, drawdown, exposure spread by sleeve.</p></div>
+              <div class="block"><h3>Alpha Attribution</h3><p>Family-level impact with confidence trendline.</p></div>
+              <div class="grid-3">
+                <div class="block"><h3>Latency</h3><p>2.1s</p></div>
+                <div class="block warn"><h3>Staleness</h3><p>2 markets</p></div>
+                <div class="block"><h3>Inventory</h3><p>Within limits</p></div>
+              </div>
+            </div>
+            <div class="stack">
+              <div class="block danger"><h3>Safety Rail</h3><p>Pause / reduce-only / cancel unsafe.</p></div>
+              <div class="block"><h3>Incident Timeline</h3><p>Signal → Order → Fill → PnL events.</p></div>
+            </div>
+          </div>
+        `
+      },
+      commandSplit: {
+        name: "B. Command Center Split",
+        focus: "Fast intervention",
+        density: "High",
+        bestFor: "Incident-heavy operation",
+        notes: [
+          "Left side: always-on action rail.",
+          "Right side: live telemetry and alerts.",
+          "Optimized for speed over narrative depth."
+        ],
+        render: () => `
+          <div class="grid-2" style="grid-template-columns: 1fr 1.8fr;">
+            <div class="stack">
+              <div class="block danger"><h3>Control Strip</h3><p>Primary controls with gate states.</p></div>
+              <div class="block"><h3>Risk Gates</h3><p>Freshness, reconciliation, policy checksum.</p></div>
+              <div class="block"><h3>Escalation</h3><p>On-call + runbook launch.</p></div>
+            </div>
+            <div class="stack">
+              <div class="grid-3">
+                <div class="block"><h3>Exposure</h3><p>78% cap</p></div>
+                <div class="block warn"><h3>Drawdown</h3><p>-2.2%</p></div>
+                <div class="block"><h3>Health</h3><p>Nominal</p></div>
+              </div>
+              <div class="block"><h3>Live Orders + Position Delta</h3><p>High-frequency operational pane.</p></div>
+              <div class="block info"><h3>Alert Queue</h3><p>Prioritized by severity and confidence.</p></div>
+            </div>
+          </div>
+        `
+      },
+      narrativeTimeline: {
+        name: "C. Narrative Timeline",
+        focus: "Explainability",
+        density: "Medium",
+        bestFor: "Post-event diagnosis",
+        notes: [
+          "Centerpiece timeline to explain why PnL moved.",
+          "Ideal for support and governance reviews.",
+          "Slightly slower for emergency action than split layouts."
+        ],
+        render: () => `
+          <div class="stack">
+            <div class="grid-3">
+              <div class="block"><h3>Context</h3><p>Market cluster + regime state.</p></div>
+              <div class="block"><h3>Impact</h3><p>Alpha and portfolio deltas.</p></div>
+              <div class="block"><h3>Action</h3><p>Recommended interventions.</p></div>
+            </div>
+            <div class="block info" style="min-height:320px;"><h3>Causal Timeline</h3><p>Event stream with jump-to-evidence cards and reversible filters.</p></div>
+            <div class="grid-2">
+              <div class="block"><h3>Validation Artifacts</h3><p>Promotion packet + threshold outcomes.</p></div>
+              <div class="block"><h3>Audit Summary</h3><p>Actor, action, timestamp, approval chain.</p></div>
+            </div>
+          </div>
+        `
+      },
+      denseAnalyst: {
+        name: "D. Dense Analyst Grid",
+        focus: "Information throughput",
+        density: "Very high",
+        bestFor: "Experienced quant operators",
+        notes: [
+          "Maximum data density and side-by-side comparables.",
+          "Powerful for experts, harder for first-time users.",
+          "Needs strict hierarchy to avoid overload."
+        ],
+        render: () => `
+          <div class="stack">
+            <div class="grid-3">
+              <div class="block"><h3>Market Heatmap</h3><p>Spread x reward x volatility.</p></div>
+              <div class="block"><h3>Alpha Leaderboard</h3><p>Sharpe / hit / drawdown.</p></div>
+              <div class="block"><h3>Execution Quality</h3><p>Fill efficiency + slippage.</p></div>
+            </div>
+            <div class="grid-3">
+              <div class="block"><h3>Book Imbalance</h3><p>Streaming microstructure.</p></div>
+              <div class="block warn"><h3>Regime Shift Flags</h3><p>Adaptive route suggestions.</p></div>
+              <div class="block"><h3>Policy Checks</h3><p>Pass/fail matrix.</p></div>
+            </div>
+            <div class="block" style="min-height:230px;"><h3>Unified Data Table</h3><p>Pinned columns, instant filter chips, keyboard-first ops.</p></div>
+          </div>
+        `
+      },
+      incidentRadar: {
+        name: "E. Incident-First Radar",
+        focus: "Safety and containment",
+        density: "Medium-high",
+        bestFor: "High-volatility windows",
+        notes: [
+          "Critical-state centered with alert sequencing.",
+          "Highlights what to do now, not everything available.",
+          "Strong complement to standard daily view."
+        ],
+        render: () => `
+          <div class="stack">
+            <div class="block danger"><h3>Critical Header</h3><p>Current severity + policy lock state + mandatory next step.</p></div>
+            <div class="grid-2">
+              <div class="block"><h3>Containment Actions</h3><p>Pause routes, reduce-only, cancel unsafe.</p></div>
+              <div class="block warn"><h3>Recovery Gates</h3><p>Freshness, recon, auth, approval checks.</p></div>
+            </div>
+            <div class="grid-2">
+              <div class="block info"><h3>Incident Timeline</h3><p>Chronological cause/effect with evidence links.</p></div>
+              <div class="block"><h3>Comms + Ownership</h3><p>On-call ack, escalation path, review queue.</p></div>
+            </div>
+          </div>
+        `
+      },
+      researchWorkbench: {
+        name: "F. Research-Forward Workbench",
+        focus: "Model governance",
+        density: "Medium",
+        bestFor: "Alpha lifecycle decisions",
+        notes: [
+          "Blends validation, shadow performance, and promotion gates.",
+          "Best for research lead workflows.",
+          "Should pair with operator dashboard as companion mode."
+        ],
+        render: () => `
+          <div class="stack">
+            <div class="grid-3">
+              <div class="block"><h3>Candidate Status</h3><p>Draft / shadow / live candidate.</p></div>
+              <div class="block"><h3>Validation Score</h3><p>Purged CV + CPCV confidence.</p></div>
+              <div class="block warn"><h3>Overfit Risk</h3><p>PBO/DSR diagnostics.</p></div>
+            </div>
+            <div class="grid-2">
+              <div class="block" style="min-height:260px;"><h3>Shadow vs Live Comparator</h3><p>Counterfactual and stressed path overlays.</p></div>
+              <div class="block"><h3>Promotion Checklist</h3><p>Evidence packet + dual sign-off control.</p></div>
+            </div>
+            <div class="block info"><h3>Decision Journal</h3><p>Why promoted, why blocked, and what changed since last review.</p></div>
+          </div>
+        `
+      }
+    };
+
+    const dirList = document.getElementById("dirList");
+    const meta = document.getElementById("meta");
+    const title = document.getElementById("title");
+    const focus = document.getElementById("focus");
+    const shell = document.getElementById("shell");
+    const legend = document.getElementById("legend");
+
+    let active = "warmPrecision";
+
+    function render(key) {
+      const d = directions[key];
+      title.textContent = d.name;
+      focus.textContent = d.focus;
+      shell.innerHTML = d.render();
+      legend.innerHTML = d.notes.map(n => `<div>• ${n}</div>`).join("");
+      meta.innerHTML = `
+        <div><strong>Focus:</strong> ${d.focus}</div>
+        <div><strong>Density:</strong> ${d.density}</div>
+        <div><strong>Best for:</strong> ${d.bestFor}</div>
+      `;
+
+      [...dirList.querySelectorAll("button")].forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.key === key);
+      });
+    }
+
+    Object.entries(directions).forEach(([k, d]) => {
+      const b = document.createElement("button");
+      b.className = "dir";
+      b.dataset.key = k;
+      b.innerHTML = `<strong>${d.name}</strong><small>${d.focus} • ${d.bestFor}</small>`;
+      b.addEventListener("click", () => {
+        active = k;
+        render(k);
+      });
+      dirList.appendChild(b);
+    });
+
+    render(active);
+  </script>
+</body>
+</html>

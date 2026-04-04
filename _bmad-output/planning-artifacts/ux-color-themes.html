@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UX Color Themes — polymarket-ai</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:wght@600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-canvas: #f6f2ea;
+      --bg-surface: #fffdf9;
+      --bg-elevated: #ffffff;
+      --text-primary: #1f1d1a;
+      --text-muted: #6d675e;
+      --border-soft: #e7e0d3;
+      --accent-primary: #c96a3d;
+      --accent-secondary: #8c5a3c;
+      --state-success: #1f7a4c;
+      --state-warning: #b16b00;
+      --state-danger: #b2352f;
+      --state-info: #2f5d9a;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      line-height: 1.45;
+    }
+
+    .wrap {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 32px;
+    }
+
+    h1 {
+      margin: 0;
+      font-family: "Source Serif 4", Georgia, serif;
+      font-size: clamp(2rem, 2.8vw, 3rem);
+      line-height: 1.1;
+      letter-spacing: -0.01em;
+    }
+
+    .sub {
+      color: var(--text-muted);
+      margin-top: 10px;
+      max-width: 860px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--border-soft);
+      background: var(--bg-surface);
+      color: var(--text-muted);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 0.82rem;
+      margin-top: 18px;
+    }
+
+    .section {
+      margin-top: 26px;
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr);
+      gap: 20px;
+    }
+
+    .panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-soft);
+      border-radius: 18px;
+      padding: 16px;
+    }
+
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 1rem;
+    }
+
+    .themes {
+      display: grid;
+      gap: 10px;
+    }
+
+    .theme-btn {
+      width: 100%;
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      text-align: left;
+      padding: 12px;
+      cursor: pointer;
+      transition: border-color .2s ease, transform .2s ease;
+    }
+
+    .theme-btn:hover,
+    .theme-btn:focus-visible {
+      border-color: var(--accent-primary);
+      transform: translateY(-1px);
+      outline: none;
+    }
+
+    .theme-btn.active {
+      border-color: var(--accent-primary);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 18%, transparent);
+    }
+
+    .theme-btn small {
+      display: block;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    .token-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      border-top: 1px dashed var(--border-soft);
+      padding: 8px 0;
+      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+      font-size: 0.78rem;
+    }
+
+    .token-row:first-of-type {
+      border-top: 0;
+      padding-top: 0;
+    }
+
+    .swatch {
+      width: 20px;
+      height: 20px;
+      border: 1px solid var(--border-soft);
+      border-radius: 6px;
+    }
+
+    .preview {
+      display: grid;
+      gap: 14px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--border-soft);
+      background: var(--bg-surface);
+    }
+
+    .brand {
+      font-weight: 700;
+      font-size: 0.96rem;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn,
+    .chip {
+      border: 1px solid var(--border-soft);
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 0.8rem;
+    }
+
+    .btn.primary {
+      background: var(--accent-primary);
+      color: #fff;
+      border-color: color-mix(in srgb, var(--accent-primary) 70%, #000 30%);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr;
+      gap: 14px;
+    }
+
+    .card {
+      border: 1px solid var(--border-soft);
+      background: var(--bg-surface);
+      border-radius: 14px;
+      padding: 14px;
+    }
+
+    .card h3 {
+      margin: 0;
+      font-size: 0.95rem;
+    }
+
+    .muted {
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      margin-top: 6px;
+    }
+
+    .metric-grid {
+      margin-top: 12px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .metric {
+      border: 1px solid var(--border-soft);
+      border-radius: 10px;
+      padding: 10px;
+      background: var(--bg-elevated);
+    }
+
+    .metric .k {
+      color: var(--text-muted);
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .metric .v {
+      margin-top: 4px;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+
+    .v.good { color: var(--state-success); }
+    .v.warn { color: var(--state-warning); }
+    .v.bad { color: var(--state-danger); }
+
+    .timeline {
+      margin-top: 10px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .event {
+      border-left: 3px solid var(--state-info);
+      background: color-mix(in srgb, var(--state-info) 8%, var(--bg-surface));
+      padding: 8px 10px;
+      border-radius: 0 10px 10px 0;
+      font-size: 0.78rem;
+    }
+
+    .event.warn {
+      border-left-color: var(--state-warning);
+      background: color-mix(in srgb, var(--state-warning) 8%, var(--bg-surface));
+    }
+
+    .event.danger {
+      border-left-color: var(--state-danger);
+      background: color-mix(in srgb, var(--state-danger) 8%, var(--bg-surface));
+    }
+
+    @media (max-width: 1060px) {
+      .section {
+        grid-template-columns: 1fr;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Claude-inspired Theme Lab</h1>
+    <p class="sub">
+      Visual exploration for <strong>polymarket-ai</strong>. This board compares warm editorial and operator-focused palettes
+      inspired by Claude’s calm product language, adapted for high-stakes trading workflows.
+    </p>
+    <div class="badge">Theme source reference: claude.com + claude.com/blog (adapted, not copied)</div>
+
+    <div class="section">
+      <aside class="panel">
+        <h2>Theme options</h2>
+        <div id="themeList" class="themes"></div>
+
+        <h2 style="margin-top:16px;">Token snapshot</h2>
+        <div id="tokenList"></div>
+      </aside>
+
+      <main class="preview">
+        <div class="topbar">
+          <div class="brand">polymarket-ai • Operator Console</div>
+          <div class="toolbar">
+            <span class="chip">Live</span>
+            <button class="btn">Reduce-only</button>
+            <button class="btn primary">Pause Trading</button>
+          </div>
+        </div>
+
+        <div class="grid">
+          <section class="card">
+            <h3>Risk Posture</h3>
+            <p class="muted">Fast health snapshot aligned to core operator loop.</p>
+            <div class="metric-grid">
+              <div class="metric">
+                <div class="k">Drawdown</div>
+                <div class="v warn">-1.8%</div>
+              </div>
+              <div class="metric">
+                <div class="k">Net PnL</div>
+                <div class="v good">+$2,140</div>
+              </div>
+              <div class="metric">
+                <div class="k">Stale Feed</div>
+                <div class="v bad">0 markets</div>
+              </div>
+            </div>
+            <div class="timeline">
+              <div class="event">12:04:12 • Spread widened in 2 markets</div>
+              <div class="event warn">12:07:39 • Rebate regime changed (sports)</div>
+              <div class="event danger">12:10:51 • Auto-throttle applied to market cluster #4</div>
+            </div>
+          </section>
+
+          <section class="card">
+            <h3>Action Rail</h3>
+            <p class="muted">Safety-critical controls with explicit states.</p>
+            <div style="display:grid; gap:8px; margin-top:10px;">
+              <button class="btn primary">Pause + Cancel Unsafe</button>
+              <button class="btn">Enable Reduce-only</button>
+              <button class="btn">Open Incident Timeline</button>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    const themes = {
+      warmPrecision: {
+        name: "Warm Precision (selected)",
+        note: "Editorial calm + operational sharpness",
+        vars: {
+          "--bg-canvas": "#f6f2ea",
+          "--bg-surface": "#fffdf9",
+          "--bg-elevated": "#ffffff",
+          "--text-primary": "#1f1d1a",
+          "--text-muted": "#6d675e",
+          "--border-soft": "#e7e0d3",
+          "--accent-primary": "#c96a3d",
+          "--accent-secondary": "#8c5a3c",
+          "--state-success": "#1f7a4c",
+          "--state-warning": "#b16b00",
+          "--state-danger": "#b2352f",
+          "--state-info": "#2f5d9a"
+        }
+      },
+      quietTerminal: {
+        name: "Quiet Terminal",
+        note: "Muted slate surfaces with warm action accents",
+        vars: {
+          "--bg-canvas": "#ece9e2",
+          "--bg-surface": "#f8f5ef",
+          "--bg-elevated": "#ffffff",
+          "--text-primary": "#20242a",
+          "--text-muted": "#69707a",
+          "--border-soft": "#dbe1e8",
+          "--accent-primary": "#b96843",
+          "--accent-secondary": "#705341",
+          "--state-success": "#1d7b57",
+          "--state-warning": "#a97016",
+          "--state-danger": "#b33c3c",
+          "--state-info": "#3c5c9e"
+        }
+      },
+      editorialLedger: {
+        name: "Editorial Ledger",
+        note: "Higher contrast typography with paper-like surfaces",
+        vars: {
+          "--bg-canvas": "#f4efe6",
+          "--bg-surface": "#fffdfa",
+          "--bg-elevated": "#ffffff",
+          "--text-primary": "#171513",
+          "--text-muted": "#6f665d",
+          "--border-soft": "#e2dacd",
+          "--accent-primary": "#b65c30",
+          "--accent-secondary": "#7f5637",
+          "--state-success": "#1f7f4f",
+          "--state-warning": "#a46600",
+          "--state-danger": "#aa302d",
+          "--state-info": "#2f5f98"
+        }
+      },
+      minimalMission: {
+        name: "Minimal Mission Control",
+        note: "Cleaner neutrals for dashboard-heavy views",
+        vars: {
+          "--bg-canvas": "#f3f2ee",
+          "--bg-surface": "#fbfaf7",
+          "--bg-elevated": "#ffffff",
+          "--text-primary": "#1f2125",
+          "--text-muted": "#666d75",
+          "--border-soft": "#dce1e6",
+          "--accent-primary": "#b6643a",
+          "--accent-secondary": "#5c5f7f",
+          "--state-success": "#1d7d56",
+          "--state-warning": "#9f6c12",
+          "--state-danger": "#b33737",
+          "--state-info": "#3861a7"
+        }
+      },
+      contrastRiskDesk: {
+        name: "Contrast Risk Desk",
+        note: "Crisp hierarchy for high-alert operation",
+        vars: {
+          "--bg-canvas": "#efeae1",
+          "--bg-surface": "#fffdf8",
+          "--bg-elevated": "#ffffff",
+          "--text-primary": "#131313",
+          "--text-muted": "#625e57",
+          "--border-soft": "#ddd4c5",
+          "--accent-primary": "#cc6030",
+          "--accent-secondary": "#83482f",
+          "--state-success": "#1d7b44",
+          "--state-warning": "#b26a00",
+          "--state-danger": "#bf2f2f",
+          "--state-info": "#2a5f9f"
+        }
+      },
+      duskOperational: {
+        name: "Dusk Operational",
+        note: "Dark-leaning neutral for lower-eye-strain night ops",
+        vars: {
+          "--bg-canvas": "#22252b",
+          "--bg-surface": "#2b2f37",
+          "--bg-elevated": "#333844",
+          "--text-primary": "#f3f1eb",
+          "--text-muted": "#b8b6b0",
+          "--border-soft": "#474d58",
+          "--accent-primary": "#d47a4b",
+          "--accent-secondary": "#a66a48",
+          "--state-success": "#5dc592",
+          "--state-warning": "#e4b05a",
+          "--state-danger": "#e17d78",
+          "--state-info": "#7aa0df"
+        }
+      }
+    };
+
+    const themeListEl = document.getElementById("themeList");
+    const tokenListEl = document.getElementById("tokenList");
+
+    let active = "warmPrecision";
+
+    function applyTheme(key) {
+      active = key;
+      const theme = themes[key];
+      Object.entries(theme.vars).forEach(([k, v]) => {
+        document.documentElement.style.setProperty(k, v);
+      });
+
+      [...themeListEl.querySelectorAll("button")].forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.key === key);
+      });
+
+      tokenListEl.innerHTML = Object.entries(theme.vars).map(([token, value]) => {
+        return `
+          <div class="token-row">
+            <span>${token}</span>
+            <span>${value}</span>
+            <span class="swatch" style="background:${value}"></span>
+          </div>
+        `;
+      }).join("");
+    }
+
+    Object.entries(themes).forEach(([key, cfg]) => {
+      const btn = document.createElement("button");
+      btn.className = "theme-btn";
+      btn.dataset.key = key;
+      btn.innerHTML = `<strong>${cfg.name}</strong><small>${cfg.note}</small>`;
+      btn.addEventListener("click", () => applyTheme(key));
+      themeListEl.appendChild(btn);
+    });
+
+    applyTheme(active);
+  </script>
+</body>
+</html>
