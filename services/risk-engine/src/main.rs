@@ -3,6 +3,7 @@ mod limits;
 mod safe_state;
 
 use common::time::timestamp_utc;
+use domain::reconciliation::ReconciliationReasonCode;
 use domain::risk::{FreshnessGateReasonCode, MarketClusterOverride, MarketPolicyReasonCode};
 
 #[tokio::main]
@@ -10,6 +11,10 @@ async fn main() {
     let runtime_policy_state = gates::InMemoryRuntimePolicyState::default();
     runtime_policy_state.set_user_stream_auth_block(false);
     runtime_policy_state.set_freshness_pause(false, FreshnessGateReasonCode::BoundarySafe.code());
+    runtime_policy_state.set_reconciliation_halt(
+        false,
+        ReconciliationReasonCode::CriticalMismatch.code(),
+    );
     runtime_policy_state.upsert_cluster_override(MarketClusterOverride {
         cluster_id: "bootstrap-cluster".to_string(),
         is_enabled: true,

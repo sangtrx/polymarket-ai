@@ -2,28 +2,33 @@
 
 ## Story
 
-- 2-5-implement-venue-compatible-order-lifecycle-handling
+- 2-6-build-reconciliation-and-exposure-visibility-core
 
 ## Generated Tests
 
 ### API Tests
 
-- [x] Not applicable for this story scope (Story 2.5 introduces no new HTTP/API route surface).
+- [x] Not applicable for this story scope (Story 2.6 introduces no new HTTP/API route surface).
 
 ### E2E Tests
 
-- [x] `services/execution-engine/src/orders/mod.rs` — `batch_cancel_retry_preserves_idempotency_keys_and_deterministic_outcomes` validates retry-safe batch-cancel idempotency normalization and deterministic mixed outcomes across repeated requests.
-- [x] `services/execution-engine/src/ingestion/user_stream.rs` — `process_order_message_rejects_unsupported_venue_state_without_side_effects` validates unsupported venue lifecycle status rejection with explicit machine-readable error and no canonical-state mutation.
-- [x] `services/execution-engine/src/ingestion/user_stream.rs` — `process_order_message_rejects_unsupported_message_type_without_side_effects` validates unsupported venue message type rejection with explicit machine-readable error and no persistence/runtime side effects.
-- [x] Existing Story 2.5 critical-flow coverage remains active: lifecycle progression to terminal states, terminal-boundary immutability, invalid transition rejection, idempotency normalization/duplicate handling, batch-cancel mixed outcomes, and duplicate/out-of-order user-stream non-mutation guarantees.
+- [x] `services/execution-engine/src/reconciliation/mod.rs` — `execution_run_is_deterministic_for_identical_inputs` validates deterministic reconciliation diff classification for identical windows.
+- [x] `services/execution-engine/src/reconciliation/mod.rs` — `critical_mismatch_run_enforces_safe_state_and_keeps_snapshot_readable` validates `mismatch_rate > 0.1%` critical halt transition plus halted-state exposure visibility.
+- [x] `services/execution-engine/src/reconciliation/mod.rs` — `unauthorized_read_queries_fail_closed_with_machine_reason_code` validates fail-closed authz behavior on reconciliation/exposure read paths.
+- [x] `services/execution-engine/src/reconciliation/mod.rs` — `incident_query_path_satisfies_operability_target` validates representative incident read path stays within `<= 5s`.
+- [x] `services/risk-engine/src/gates/mod.rs` — reconciliation halt gate tests validate deny behavior, recovery behavior, and non-halt reason normalization.
 
 ## Coverage
 
-- Story 2.5 lifecycle critical flows: 24/24 targeted tests passing across domain, persistence, and execution-engine suites.
-- Story-specific API endpoints: 0/0 applicable in Story 2.5 scope.
+- Story 2.6 critical flows covered across domain, persistence, execution-engine, and risk-engine suites:
+  - deterministic diff taxonomy + boundary threshold semantics,
+  - migration scope/constraints/index contracts,
+  - reconciliation evidence persistence/read-path contracts,
+  - reconciliation halt deny-path gating with exposure read continuity,
+  - authz fail-closed read-path behavior and incident-query operability target checks.
 
 ## Execution Result
 
-- `npm run --silent qa:test:story-2-5` ✅
+- `npm run --silent qa:test:story-2-6` ✅
 - `npm run --silent rust:lint` ✅
 - `npm run --silent rust:build` ✅

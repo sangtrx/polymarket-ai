@@ -22,6 +22,7 @@
     "qa:test:story-2-3": "cargo test -p domain risk::tests::user_stream_ && cargo test -p persistence postgres::user_stream::tests:: && cargo test -p execution-engine ingestion::user_stream::tests:: && cargo test -p risk-engine gates::tests::",
     "qa:test:story-2-4": "cargo test -p domain risk::tests::freshness_gate_ && cargo test -p persistence postgres::freshness_gate::tests:: && cargo test -p execution-engine ingestion::freshness_gate::tests:: && cargo test -p risk-engine gates::tests::order_intent_gate_",
     "qa:test:story-2-5": "cargo test -p domain order::tests:: && cargo test -p persistence postgres::orders::tests:: && cargo test -p execution-engine orders::tests:: && cargo test -p execution-engine ingestion::user_stream::tests::",
+    "qa:test:story-2-6": "cargo test -p domain reconciliation::tests:: && cargo test -p persistence postgres::reconciliation::tests:: && cargo test -p execution-engine reconciliation::tests:: && cargo test -p risk-engine gates::tests::order_intent_gate_",
     "rust:fmt": "cargo fmt --all -- --check",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace --all-targets",

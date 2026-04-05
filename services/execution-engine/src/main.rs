@@ -30,6 +30,11 @@ async fn main() {
         freshness_signals.clone(),
         freshness_config,
     );
+    let _reconciliation_runtime = reconciliation::ReconciliationRuntime::new(
+        reconciliation::PostgresInternalTruthProvider::new(pool.clone()),
+        reconciliation::StaticVenueTruthProvider::default(),
+        reconciliation::PostgresReconciliationEvidenceStore::new(pool.clone()),
+    );
     let user_stream_enabled = std::env::var("EXECUTION_USER_STREAM_ENABLED")
         .map(|value| {
             matches!(

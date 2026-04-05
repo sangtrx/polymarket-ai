@@ -5,6 +5,7 @@ pub mod freshness_gate;
 pub mod market_policy;
 pub mod market_stream;
 pub mod orders;
+pub mod reconciliation;
 pub mod rbac;
 pub mod user_stream;
 

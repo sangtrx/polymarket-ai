@@ -1,3 +1,4 @@
+use domain::reconciliation::ReconciliationReasonCode;
 use domain::risk::{
     FreshnessGateReasonCode, MarketClusterOverride, MarketPolicyReasonCode, UserStreamReasonCode,
 };
@@ -30,6 +31,7 @@ pub trait RuntimePolicyStateReader: Send + Sync {
     fn cluster_override(&self, cluster_id: &str) -> Option<MarketClusterOverride>;
     fn user_stream_auth_block_active(&self) -> bool;
     fn freshness_pause_reason_code(&self) -> Option<String>;
+    fn reconciliation_halt_reason_code(&self) -> Option<String>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +39,7 @@ pub struct InMemoryRuntimePolicyState {
     overrides: Arc<RwLock<BTreeMap<String, MarketClusterOverride>>>,
     auth_block_active: Arc<AtomicBool>,
     freshness_pause_reason_code: Arc<RwLock<Option<String>>>,
+    reconciliation_halt_reason_code: Arc<RwLock<Option<String>>>,
 }
 
 impl InMemoryRuntimePolicyState {
@@ -66,6 +69,19 @@ impl InMemoryRuntimePolicyState {
             *freshness_pause_reason_code = None;
         }
     }
+
+    pub fn set_reconciliation_halt(&self, is_active: bool, reason_code: &str) {
+        let mut reconciliation_halt_reason_code = self
+            .reconciliation_halt_reason_code
+            .write()
+            .expect("reconciliation halt runtime state should not be poisoned");
+        if is_active {
+            *reconciliation_halt_reason_code =
+                Some(normalize_reconciliation_halt_reason(reason_code));
+        } else {
+            *reconciliation_halt_reason_code = None;
+        }
+    }
 }
 
 fn normalize_freshness_pause_reason(reason_code: &str) -> String {
@@ -75,6 +91,19 @@ fn normalize_freshness_pause_reason(reason_code: &str) -> String {
         FreshnessGateReasonCode::BoundarySafe | FreshnessGateReasonCode::RecoveryConfirmed => {
             FreshnessGateReasonCode::StateUnavailable
         }
+        other => other,
+    };
+    normalized.code().to_string()
+}
+
+fn normalize_reconciliation_halt_reason(reason_code: &str) -> String {
+    let parsed = ReconciliationReasonCode::parse(reason_code)
+        .unwrap_or(ReconciliationReasonCode::CriticalMismatch);
+    let normalized = match parsed {
+        ReconciliationReasonCode::Matched
+        | ReconciliationReasonCode::NonCriticalMismatch
+        | ReconciliationReasonCode::Unauthorized
+        | ReconciliationReasonCode::InvalidPayload => ReconciliationReasonCode::CriticalMismatch,
         other => other,
     };
     normalized.code().to_string()
@@ -99,6 +128,13 @@ impl RuntimePolicyStateReader for InMemoryRuntimePolicyState {
             .expect("freshness pause runtime state should not be poisoned")
             .clone()
     }
+
+    fn reconciliation_halt_reason_code(&self) -> Option<String> {
+        self.reconciliation_halt_reason_code
+            .read()
+            .expect("reconciliation halt runtime state should not be poisoned")
+            .clone()
+    }
 }
 
 pub fn evaluate_order_intent_gate<S: RuntimePolicyStateReader>(
@@ -108,6 +144,10 @@ pub fn evaluate_order_intent_gate<S: RuntimePolicyStateReader>(
     let (allowed, reason_code) =
         if let Some(freshness_reason_code) = runtime_policy_state.freshness_pause_reason_code() {
             (false, freshness_reason_code)
+        } else if let Some(reconciliation_reason_code) =
+            runtime_policy_state.reconciliation_halt_reason_code()
+        {
+            (false, reconciliation_reason_code)
         } else if runtime_policy_state.user_stream_auth_block_active() {
             (false, UserStreamReasonCode::AuthExpired.code().to_string())
         } else if intent.cluster_id.trim().is_empty() {
@@ -329,6 +369,64 @@ mod tests {
         assert_eq!(
             decision.reason_code,
             FreshnessGateReasonCode::StateUnavailable.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_denies_when_reconciliation_halt_is_active() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_reconciliation_halt(
+            true,
+            ReconciliationReasonCode::CriticalMismatch.code(),
+        );
+
+        let decision = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            ReconciliationReasonCode::CriticalMismatch.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_recovery_unblocks_after_reconciliation_halt_clears() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_reconciliation_halt(
+            true,
+            ReconciliationReasonCode::CriticalMismatch.code(),
+        );
+
+        let blocked = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+        assert!(!blocked.allowed);
+
+        runtime_state.set_reconciliation_halt(
+            false,
+            ReconciliationReasonCode::CriticalMismatch.code(),
+        );
+        let recovered = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+
+        assert!(recovered.allowed);
+        assert_eq!(
+            recovered.reason_code,
+            MarketPolicyReasonCode::MarketEligible.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_normalizes_non_halt_reconciliation_reasons_when_active() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_reconciliation_halt(true, ReconciliationReasonCode::Matched.code());
+
+        let decision = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            ReconciliationReasonCode::CriticalMismatch.code()
         );
     }
 }
