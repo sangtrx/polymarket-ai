@@ -9,6 +9,7 @@ use domain::governance::{
     AuthorizationDecision, AuthorizationEvaluator, AuthorizationRequest, ControlAction,
     GovernanceRole, PrivilegedAuditRecord,
 };
+use governance_service::approvals::{ApprovalOrchestrator, GovernanceApprovalService};
 use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
 use serde::Serialize;
 use serde_json::json;
@@ -204,18 +205,35 @@ pub struct ControlApiState {
     pub authorization_guard: Arc<dyn AuthorizationGuard>,
     pub authenticator: Arc<dyn Authenticator>,
     pub audit_appender: Arc<dyn PrivilegedAuditAppender>,
+    pub approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
 }
 
 impl ControlApiState {
+    #[allow(dead_code)]
     pub fn new(
         authorization_guard: Arc<dyn AuthorizationGuard>,
         authenticator: Arc<dyn Authenticator>,
         audit_appender: Arc<dyn PrivilegedAuditAppender>,
     ) -> Self {
+        Self::with_approval_orchestrator(
+            authorization_guard,
+            authenticator,
+            audit_appender,
+            Arc::new(GovernanceApprovalService::default()),
+        )
+    }
+
+    pub fn with_approval_orchestrator(
+        authorization_guard: Arc<dyn AuthorizationGuard>,
+        authenticator: Arc<dyn Authenticator>,
+        audit_appender: Arc<dyn PrivilegedAuditAppender>,
+        approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
+    ) -> Self {
         Self {
             authorization_guard,
             authenticator,
             audit_appender,
+            approval_orchestrator,
         }
     }
 }

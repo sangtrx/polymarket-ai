@@ -1276,6 +1276,7 @@ dependencies = [
  "governance-service",
  "serde",
  "serde_json",
+ "sqlx",
  "time",
  "tokio",
  "tower",
@@ -1957,8 +1958,10 @@ version = "0.1.0"
 dependencies = [
  "common",
  "domain",
+ "persistence",
  "serde",
  "serde_json",
+ "sqlx",
  "time",
  "tokio",
 ]

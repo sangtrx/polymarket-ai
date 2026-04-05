@@ -15,6 +15,7 @@
     "bootstrap:test": "node --test tests/bootstrap/*.test.mjs tests/api/*.test.mjs tests/e2e/*.test.mjs",
     "qa:test:story-1-1": "node --test tests/api/bootstrap-cli-api.test.mjs tests/e2e/bootstrap-baseline.e2e.test.mjs",
     "qa:test:story-1-2": "cargo test -p control-api routes::tests::",
+    "qa:test:story-1-5": "cargo test -p governance-service approvals::tests:: && cargo test -p control-api routes::tests::critical_action_ && cargo test -p control-api routes::tests::approved_critical_execution_propagates_non_null_approval_reference_to_audit",
     "rust:fmt": "cargo fmt --all -- --check",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace --all-targets",

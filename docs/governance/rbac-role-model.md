@@ -100,3 +100,53 @@ Story handoff dependencies:
 
 1. Story 1.5 should populate `approval_reference` for dual-approval workflows (never inferred in Story 1.4).
 2. Story 4 reporting/incident consumers should treat `audit_log_append` as immutable source-of-truth for privileged-action trace reconstruction.
+
+## Story 1.5 dual-approval governance lifecycle
+
+Story 1.5 adds FR34 dual-approval controls for the canonical critical actions:
+
+1. `strategy_promotion_override`
+2. `risk_limit_increase`
+3. `kill_switch_disable`
+4. `production_config_change`
+
+Lifecycle contract:
+
+1. Proposer submits an approval request with explicit `expires_at_utc`.
+2. Request starts in `pending` state and is rate-limited to `<= 5` proposer submissions per rolling hour.
+3. A distinct approver (`proposer != approver`, canonicalized actor identity) records an `approve` or `reject` vote.
+4. Approved requests transition to `approved` with non-null `approval_reference`; rejected requests transition to `rejected`.
+5. Any evaluation where `now_utc >= expires_at_utc` transitions/returns `expired` and is denied.
+6. Critical mutation execution is blocked unless request state is `approved` with a valid `approval_reference`.
+
+Deterministic machine-readable denial codes include:
+
+- `approval_missing_request`
+- `approval_unknown_request`
+- `approval_missing_second_approver`
+- `approval_self_approval_attempt`
+- `approval_duplicate_vote`
+- `approval_expired_window`
+- `approval_unauthorized_role`
+- `approval_rate_limited_actor`
+- `approval_invalid_state_transition`
+
+## Incident-review evidence expectations for Story 1.5
+
+For both allowed and denied FR34 decisions, operators should be able to reconstruct:
+
+- `actor_id`
+- `action` (canonical critical action id)
+- `outcome` / `state`
+- `reason_code`
+- `correlation_id`
+- `timestamp_utc`
+- `request_id` linkage
+- `approval_reference` linkage (required for approved execution, absent for denied paths)
+
+Denied FR34 responses and telemetry must include alert-compatible security-signal fields:
+
+- `name = unauthorized_privileged_approval_attempt_v1`
+- `alert_compatible = true`
+- `alert_target_seconds = 30`
+- `severity = high`

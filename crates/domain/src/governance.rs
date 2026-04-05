@@ -507,6 +507,309 @@ fn timestamp_utc() -> String {
         .expect("RFC3339 formatting for authorization telemetry should succeed")
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CriticalActionId {
+    StrategyPromotionOverride,
+    RiskLimitIncrease,
+    KillSwitchDisable,
+    ProductionConfigChange,
+}
+
+impl CriticalActionId {
+    pub const ALL: [Self; 4] = [
+        Self::StrategyPromotionOverride,
+        Self::RiskLimitIncrease,
+        Self::KillSwitchDisable,
+        Self::ProductionConfigChange,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StrategyPromotionOverride => "strategy_promotion_override",
+            Self::RiskLimitIncrease => "risk_limit_increase",
+            Self::KillSwitchDisable => "kill_switch_disable",
+            Self::ProductionConfigChange => "production_config_change",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ApprovalContractError> {
+        match value {
+            "strategy_promotion_override" => Ok(Self::StrategyPromotionOverride),
+            "risk_limit_increase" => Ok(Self::RiskLimitIncrease),
+            "kill_switch_disable" => Ok(Self::KillSwitchDisable),
+            "production_config_change" => Ok(Self::ProductionConfigChange),
+            _ => Err(ApprovalContractError::invalid_action(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalState {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+impl ApprovalState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ApprovalContractError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            _ => Err(ApprovalContractError::invalid_state(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalVoteDecision {
+    Approve,
+    Reject,
+}
+
+impl ApprovalVoteDecision {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ApprovalContractError> {
+        match value {
+            "approve" => Ok(Self::Approve),
+            "reject" => Ok(Self::Reject),
+            _ => Err(ApprovalContractError::invalid_vote(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionOutcome {
+    Allow,
+    Deny,
+    Pending,
+}
+
+impl ApprovalDecisionOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Pending => "pending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalReasonCode {
+    ApprovalAllowed,
+    ApprovalPending,
+    MissingApprovalRequest,
+    UnknownRequest,
+    MissingSecondApprover,
+    SelfApprovalAttempt,
+    DuplicateVote,
+    ExpiredWindow,
+    UnauthorizedRole,
+    RateLimitedActor,
+    InvalidStateTransition,
+    ExplicitlyRejected,
+}
+
+impl ApprovalReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ApprovalAllowed => "approval_allowed",
+            Self::ApprovalPending => "approval_pending",
+            Self::MissingApprovalRequest => "approval_missing_request",
+            Self::UnknownRequest => "approval_unknown_request",
+            Self::MissingSecondApprover => "approval_missing_second_approver",
+            Self::SelfApprovalAttempt => "approval_self_approval_attempt",
+            Self::DuplicateVote => "approval_duplicate_vote",
+            Self::ExpiredWindow => "approval_expired_window",
+            Self::UnauthorizedRole => "approval_unauthorized_role",
+            Self::RateLimitedActor => "approval_rate_limited_actor",
+            Self::InvalidStateTransition => "approval_invalid_state_transition",
+            Self::ExplicitlyRejected => "approval_rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    pub action_id: String,
+    pub proposer_actor_id: String,
+    pub status: ApprovalState,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub approval_reference: Option<String>,
+    pub created_at_utc: String,
+    pub expires_at_utc: String,
+}
+
+impl ApprovalRequest {
+    pub fn is_expired_at(&self, now_utc: &str) -> Result<bool, ApprovalContractError> {
+        approval_window_expired(now_utc, &self.expires_at_utc)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalVoteRecord {
+    pub request_id: String,
+    pub actor_id: String,
+    pub decision: ApprovalVoteDecision,
+    pub correlation_id: String,
+    pub voted_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalDecisionEvidence {
+    pub request_id: Option<String>,
+    pub actor_id: String,
+    pub action_id: String,
+    pub outcome: ApprovalDecisionOutcome,
+    pub state: ApprovalState,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub approval_reference: Option<String>,
+    pub timestamp_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalContractError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ApprovalContractError {
+    fn invalid_action(value: &str) -> Self {
+        Self {
+            code: "approval_invalid_action",
+            message: format!("unknown critical action `{value}`"),
+        }
+    }
+
+    fn invalid_state(value: &str) -> Self {
+        Self {
+            code: "approval_invalid_state",
+            message: format!("unknown approval state `{value}`"),
+        }
+    }
+
+    fn invalid_vote(value: &str) -> Self {
+        Self {
+            code: "approval_invalid_vote",
+            message: format!("unknown approval vote `{value}`"),
+        }
+    }
+
+    fn invalid_timestamp(field: &str, value: &str) -> Self {
+        Self {
+            code: "approval_invalid_timestamp",
+            message: format!("invalid RFC3339 UTC timestamp for `{field}`: `{value}`"),
+        }
+    }
+
+    fn invalid_reference_component(field: &str) -> Self {
+        Self {
+            code: "approval_invalid_reference_component",
+            message: format!("approval reference component `{field}` cannot be blank"),
+        }
+    }
+}
+
+pub fn canonical_actor_id(actor_id: &str) -> String {
+    actor_id.trim().to_ascii_lowercase()
+}
+
+pub fn actors_are_distinct(proposer_actor_id: &str, approver_actor_id: &str) -> bool {
+    !canonical_actor_id(proposer_actor_id).is_empty()
+        && !canonical_actor_id(approver_actor_id).is_empty()
+        && canonical_actor_id(proposer_actor_id) != canonical_actor_id(approver_actor_id)
+}
+
+pub fn approval_window_expired(
+    now_utc: &str,
+    expires_at_utc: &str,
+) -> Result<bool, ApprovalContractError> {
+    let now = parse_utc_timestamp("now_utc", now_utc)?;
+    let expires = parse_utc_timestamp("expires_at_utc", expires_at_utc)?;
+    Ok(now >= expires)
+}
+
+pub fn generate_approval_reference(
+    request_id: &str,
+    action_id: CriticalActionId,
+    proposer_actor_id: &str,
+    approver_actor_id: &str,
+    approved_at_utc: &str,
+) -> Result<String, ApprovalContractError> {
+    let sanitized_request_id = sanitize_reference_component("request_id", request_id)?;
+    let sanitized_proposer = sanitize_reference_component("proposer_actor_id", proposer_actor_id)?;
+    let sanitized_approver = sanitize_reference_component("approver_actor_id", approver_actor_id)?;
+    let approved_at = parse_utc_timestamp("approved_at_utc", approved_at_utc)?;
+
+    Ok(format!(
+        "apr_{}_{}_{}_{}_{}",
+        action_id.as_str(),
+        sanitized_request_id,
+        sanitized_proposer,
+        sanitized_approver,
+        approved_at.unix_timestamp()
+    ))
+}
+
+fn sanitize_reference_component(
+    field: &'static str,
+    value: &str,
+) -> Result<String, ApprovalContractError> {
+    let canonical = canonical_actor_id(value);
+    if canonical.is_empty() {
+        return Err(ApprovalContractError::invalid_reference_component(field));
+    }
+
+    Ok(canonical
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect())
+}
+
+fn parse_utc_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<OffsetDateTime, ApprovalContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| ApprovalContractError::invalid_timestamp(field, value))?;
+    if parsed.offset() != time::UtcOffset::UTC {
+        return Err(ApprovalContractError::invalid_timestamp(field, value));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +1056,53 @@ mod tests {
         assert_eq!(record.timestamp, "2026-04-04T23:59:59Z");
         assert_eq!(record.authentication_outcome, "denied");
         assert_eq!(record.outcome, PrivilegedAuditOutcome::AuthenticationDenied);
+    }
+
+    #[test]
+    fn critical_action_identifiers_are_canonicalized_for_fr34_scope() {
+        for action in CriticalActionId::ALL {
+            let parsed = CriticalActionId::parse(action.as_str())
+                .expect("canonical action identifiers should parse");
+            assert_eq!(parsed, action);
+        }
+        let err =
+            CriticalActionId::parse("execute_control_plane_action").expect_err("unknown action");
+        assert_eq!(err.code, "approval_invalid_action");
+    }
+
+    #[test]
+    fn approval_window_expiry_denies_at_exact_boundary() {
+        let expires_at = "2026-04-05T00:00:00Z";
+        assert!(
+            approval_window_expired("2026-04-05T00:00:00Z", expires_at)
+                .expect("boundary timestamp should parse")
+        );
+        assert!(
+            !approval_window_expired("2026-04-04T23:59:59Z", expires_at)
+                .expect("pre-boundary timestamp should parse")
+        );
+    }
+
+    #[test]
+    fn proposer_and_approver_distinctness_uses_canonical_actor_identity() {
+        assert!(actors_are_distinct("ops-one", "admin-two"));
+        assert!(!actors_are_distinct("Ops-One", "ops-one"));
+        assert!(!actors_are_distinct("ops-one", ""));
+    }
+
+    #[test]
+    fn approval_reference_generation_is_deterministic_and_non_blank() {
+        let reference = generate_approval_reference(
+            "req-42",
+            CriticalActionId::RiskLimitIncrease,
+            "Ops-One",
+            "Admin-Two",
+            "2026-04-05T00:00:00Z",
+        )
+        .expect("approval reference generation should succeed");
+        assert_eq!(
+            reference,
+            "apr_risk_limit_increase_req-42_ops-one_admin-two_1775347200"
+        );
     }
 }

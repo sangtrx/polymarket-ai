@@ -3,18 +3,22 @@ use crate::middleware::{
 };
 use axum::{
     Router,
-    extract::{Extension, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     middleware as axum_middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use domain::governance::{
-    AuthorizationDecision, AuthorizationOutcome, AuthorizationReason, ControlAction,
+    ApprovalDecisionEvidence, ApprovalDecisionOutcome, ApprovalReasonCode, AuthorizationDecision,
+    AuthorizationOutcome, AuthorizationReason, ControlAction, PrivilegedAuditOutcome,
     PrivilegedAuditRecord,
 };
+use governance_service::approvals::{
+    EvaluateApprovalExecutionInput, RecordApprovalVoteInput, SubmitApprovalRequestInput,
+};
 use governance_service::audit::AuditAppendError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub fn app_router(state: ControlApiState) -> Router {
@@ -25,10 +29,28 @@ pub fn app_router(state: ControlApiState) -> Router {
             require_authenticated_actor,
         )),
     );
+    let critical_routes = Router::new()
+        .route(
+            "/control/critical-actions/{action_id}/requests/{request_id}",
+            post(submit_critical_action_request),
+        )
+        .route(
+            "/control/critical-actions/{action_id}/requests/{request_id}/votes",
+            post(record_critical_action_vote),
+        )
+        .route(
+            "/control/critical-actions/{action_id}/requests/{request_id}/execute",
+            post(execute_critical_action),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
         .merge(privileged_routes)
+        .merge(critical_routes)
         .with_state(state)
 }
 
@@ -109,6 +131,417 @@ pub async fn rebalance_portfolio(
         }),
     )
         .into_response()
+}
+
+pub async fn submit_critical_action_request(
+    State(state): State<ControlApiState>,
+    Path((action_id, request_id)): Path<(String, String)>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<CriticalActionRequestPayload>,
+) -> Response {
+    let endpoint = format!("/control/critical-actions/{action_id}/requests/{request_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision = match state
+        .approval_orchestrator
+        .submit_request(SubmitApprovalRequestInput {
+            request_id,
+            action_id,
+            proposer_actor_id: actor.actor_id.clone(),
+            proposer_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            now_utc: authorization.timestamp_utc.clone(),
+            expires_at_utc: payload.expires_at_utc,
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return approval_service_error_response(
+                error.code,
+                error.message,
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    critical_approval_response(&state, &actor, decision, endpoint, "request_submission")
+}
+
+pub async fn record_critical_action_vote(
+    State(state): State<ControlApiState>,
+    Path((action_id, request_id)): Path<(String, String)>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<CriticalActionVotePayload>,
+) -> Response {
+    let endpoint = format!("/control/critical-actions/{action_id}/requests/{request_id}/votes");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let vote = match domain::governance::ApprovalVoteDecision::parse(&payload.decision) {
+        Ok(vote) => vote,
+        Err(error) => {
+            return approval_service_error_response(
+                error.code,
+                error.message,
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    let decision = match state
+        .approval_orchestrator
+        .record_vote(RecordApprovalVoteInput {
+            request_id,
+            action_id,
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            vote,
+            correlation_id: actor.correlation_id.clone(),
+            now_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return approval_service_error_response(
+                error.code,
+                error.message,
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    critical_approval_response(&state, &actor, decision, endpoint, "approval_vote")
+}
+
+pub async fn execute_critical_action(
+    State(state): State<ControlApiState>,
+    Path((action_id, request_id)): Path<(String, String)>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/critical-actions/{action_id}/requests/{request_id}/execute");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision =
+        match state
+            .approval_orchestrator
+            .evaluate_execution(EvaluateApprovalExecutionInput {
+                request_id,
+                action_id,
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                now_utc: authorization.timestamp_utc.clone(),
+            }) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return approval_service_error_response(
+                    error.code,
+                    error.message,
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+
+    critical_approval_response(&state, &actor, decision, endpoint, "execution_gate")
+}
+
+fn authorize_critical_action(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ExecuteControlPlaneAction);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    let status = match decision.reason {
+        AuthorizationReason::UnknownRole
+        | AuthorizationReason::UnknownAction
+        | AuthorizationReason::InvalidActorContext => StatusCode::BAD_REQUEST,
+        _ => StatusCode::FORBIDDEN,
+    };
+
+    Err(Box::new(
+        (
+            status,
+            axum::Json(ControlActionDenied {
+                error_code: machine_error.code,
+                reason: reason_key(decision.reason),
+                message: machine_error.message,
+                action: decision.action,
+                actor_id: decision.actor_id,
+                role: decision.role,
+                authentication_outcome: actor.authentication_outcome.as_str(),
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.timestamp_utc,
+            }),
+        )
+            .into_response(),
+    ))
+}
+
+fn critical_approval_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: ApprovalDecisionEvidence,
+    endpoint: String,
+    stage: &'static str,
+) -> Response {
+    if let Some(audit_outcome) = critical_approval_audit_outcome(decision.outcome) {
+        let audit_record = PrivilegedAuditRecord {
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            action_type: decision.action_id.clone(),
+            parameters: json!({
+                "endpoint": endpoint,
+                "http_method": "POST",
+                "approval_stage": stage,
+                "request_id": decision.request_id.as_deref(),
+            }),
+            approval_reference: if audit_outcome == PrivilegedAuditOutcome::Allow {
+                decision.approval_reference.clone()
+            } else {
+                None
+            },
+            timestamp: decision.timestamp_utc.clone(),
+            outcome: audit_outcome,
+            reason_code: decision.reason_code.clone(),
+            authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+            correlation_id: decision.correlation_id.clone(),
+        };
+
+        if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+            return audit_append_failure_response(
+                audit_error,
+                decision.action_id.clone(),
+                actor.actor_id.clone(),
+                actor.role.clone(),
+                actor.authentication_outcome.as_str(),
+                decision.correlation_id.clone(),
+                decision.timestamp_utc.clone(),
+            );
+        }
+    }
+
+    match decision.outcome {
+        ApprovalDecisionOutcome::Allow => (
+            StatusCode::ACCEPTED,
+            axum::Json(CriticalActionDecisionResponse {
+                status: "accepted",
+                error_code: None,
+                message: None,
+                action: decision.action_id,
+                request_id: decision
+                    .request_id
+                    .unwrap_or_else(|| "unknown_request".to_string()),
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                outcome: decision.outcome.as_str(),
+                state: decision.state.as_str(),
+                reason_code: decision.reason_code,
+                approval_reference: decision.approval_reference,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.timestamp_utc,
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        ApprovalDecisionOutcome::Pending => (
+            StatusCode::ACCEPTED,
+            axum::Json(CriticalActionDecisionResponse {
+                status: "pending",
+                error_code: None,
+                message: None,
+                action: decision.action_id,
+                request_id: decision
+                    .request_id
+                    .unwrap_or_else(|| "unknown_request".to_string()),
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                outcome: decision.outcome.as_str(),
+                state: decision.state.as_str(),
+                reason_code: decision.reason_code,
+                approval_reference: decision.approval_reference,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.timestamp_utc,
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        ApprovalDecisionOutcome::Deny => (
+            approval_denied_status(decision.reason_code.as_str()),
+            axum::Json(CriticalActionDecisionResponse {
+                status: "denied",
+                error_code: Some(decision.reason_code.clone()),
+                message: Some(approval_reason_message(decision.reason_code.as_str()).to_string()),
+                action: decision.action_id,
+                request_id: decision
+                    .request_id
+                    .unwrap_or_else(|| "unknown_request".to_string()),
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                outcome: decision.outcome.as_str(),
+                state: decision.state.as_str(),
+                reason_code: decision.reason_code,
+                approval_reference: None,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.timestamp_utc,
+                security_signal: Some(CriticalApprovalSecuritySignal {
+                    name: "unauthorized_privileged_approval_attempt_v1",
+                    severity: "high",
+                    alert_compatible: true,
+                    alert_target_seconds: 30,
+                }),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn critical_approval_audit_outcome(
+    outcome: ApprovalDecisionOutcome,
+) -> Option<PrivilegedAuditOutcome> {
+    match outcome {
+        ApprovalDecisionOutcome::Allow => Some(PrivilegedAuditOutcome::Allow),
+        ApprovalDecisionOutcome::Deny => Some(PrivilegedAuditOutcome::AuthorizationDenied),
+        ApprovalDecisionOutcome::Pending => None,
+    }
+}
+
+fn approval_denied_status(reason_code: &str) -> StatusCode {
+    match reason_code {
+        code if code == ApprovalReasonCode::MissingApprovalRequest.code()
+            || code == ApprovalReasonCode::UnknownRequest.code()
+            || code == ApprovalReasonCode::InvalidStateTransition.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::FORBIDDEN,
+    }
+}
+
+fn approval_reason_message(reason_code: &str) -> &'static str {
+    match reason_code {
+        code if code == ApprovalReasonCode::MissingApprovalRequest.code() => {
+            "approval request is required before execution"
+        }
+        code if code == ApprovalReasonCode::UnknownRequest.code() => {
+            "approval request was not found"
+        }
+        code if code == ApprovalReasonCode::MissingSecondApprover.code() => {
+            "a second distinct approver is required"
+        }
+        code if code == ApprovalReasonCode::SelfApprovalAttempt.code() => {
+            "proposer and approver must be different actors"
+        }
+        code if code == ApprovalReasonCode::DuplicateVote.code() => {
+            "actor has already cast a vote for this request"
+        }
+        code if code == ApprovalReasonCode::ExpiredWindow.code() => {
+            "approval request has expired and cannot be used"
+        }
+        code if code == ApprovalReasonCode::UnauthorizedRole.code() => {
+            "actor role is not authorized for critical approval workflow"
+        }
+        code if code == ApprovalReasonCode::RateLimitedActor.code() => {
+            "actor exceeded the per-hour critical approval request limit"
+        }
+        code if code == ApprovalReasonCode::InvalidStateTransition.code() => {
+            "approval request is in an invalid state for this operation"
+        }
+        code if code == ApprovalReasonCode::ExplicitlyRejected.code() => {
+            "approval request has been explicitly rejected"
+        }
+        _ => "critical approval request was denied",
+    }
+}
+
+fn approval_service_error_response(
+    error_code: &'static str,
+    message: String,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    (
+        approval_service_error_status(error_code),
+        axum::Json(CriticalApprovalServiceErrorResponse {
+            error_code,
+            message,
+            action: "critical_approval_workflow".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            security_signal: Some(CriticalApprovalSecuritySignal {
+                name: "unauthorized_privileged_approval_attempt_v1",
+                severity: "high",
+                alert_compatible: true,
+                alert_target_seconds: 30,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn approval_service_error_status(code: &str) -> StatusCode {
+    match code {
+        "approval_invalid_payload" | "approval_invalid_action" | "approval_invalid_vote" => {
+            StatusCode::BAD_REQUEST
+        }
+        "approval_duplicate_request"
+        | "approval_duplicate_vote"
+        | "approval_constraint_violation" => StatusCode::CONFLICT,
+        "approval_request_not_found" => StatusCode::BAD_REQUEST,
+        "approval_persistence_unavailable"
+        | "approval_query_failed"
+        | "approval_row_decode_failed" => StatusCode::SERVICE_UNAVAILABLE,
+        "approval_unauthorized_role" => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 fn audit_append_failure_response(
@@ -223,6 +656,60 @@ pub struct ControlActionAuditFailure {
     pub authentication_outcome: &'static str,
     pub correlation_id: String,
     pub timestamp_utc: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CriticalActionRequestPayload {
+    pub expires_at_utc: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CriticalActionVotePayload {
+    pub decision: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CriticalActionDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub action: String,
+    pub request_id: String,
+    pub actor_id: String,
+    pub role: String,
+    pub outcome: &'static str,
+    pub state: &'static str,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<CriticalApprovalSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CriticalApprovalServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<CriticalApprovalSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CriticalApprovalSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
 }
 
 #[cfg(test)]
@@ -1158,6 +1645,422 @@ mod tests {
                 "audit parameters must never contain bearer tokens"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn critical_action_request_submission_returns_pending_machine_payload() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/critical-actions/risk_limit_increase/requests/req-critical-001")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-submit-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expires_at_utc":"2099-01-01T00:00:00Z"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "pending");
+        assert_eq!(payload["action"], "risk_limit_increase");
+        assert_eq!(payload["request_id"], "req-critical-001");
+        assert_eq!(payload["outcome"], "pending");
+        assert_eq!(payload["reason_code"], "approval_pending");
+    }
+
+    #[tokio::test]
+    async fn critical_action_execute_denies_missing_second_approver_with_security_signal() {
+        let app = test_app();
+        let submit_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/critical-actions/risk_limit_increase/requests/req-critical-002")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-submit-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expires_at_utc":"2099-01-01T00:00:00Z"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(submit_response.status(), StatusCode::ACCEPTED);
+
+        let execute_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/critical-actions/risk_limit_increase/requests/req-critical-002/execute",
+                    )
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-execute-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(execute_response.status(), StatusCode::FORBIDDEN);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(execute_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["reason_code"], "approval_missing_second_approver");
+        assert_eq!(
+            payload["security_signal"]["name"],
+            "unauthorized_privileged_approval_attempt_v1"
+        );
+        assert_eq!(payload["security_signal"]["alert_compatible"], true);
+        assert_eq!(payload["security_signal"]["alert_target_seconds"], 30);
+    }
+
+    #[tokio::test]
+    async fn critical_action_vote_denies_self_approval_attempt() {
+        let app = test_app();
+        let submit_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/critical-actions/risk_limit_increase/requests/req-critical-003")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-submit-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expires_at_utc":"2099-01-01T00:00:00Z"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(submit_response.status(), StatusCode::ACCEPTED);
+
+        let vote_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/critical-actions/risk_limit_increase/requests/req-critical-003/votes",
+                    )
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-vote-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"decision":"approve"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(vote_response.status(), StatusCode::FORBIDDEN);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(vote_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["reason_code"], "approval_self_approval_attempt");
+    }
+
+    #[tokio::test]
+    async fn critical_action_rate_limit_boundary_denies_sixth_request() {
+        let app = test_app();
+        for index in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/control/critical-actions/risk_limit_increase/requests/req-critical-rate-{index}"
+                        ))
+                        .method("POST")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", format!("corr-critical-rate-{index}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"expires_at_utc":"2099-01-01T00:00:00Z"}"#,
+                        ))
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        let sixth = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/critical-actions/risk_limit_increase/requests/req-critical-rate-5")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-rate-5")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"expires_at_utc":"2099-01-01T00:00:00Z"}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(sixth.status(), StatusCode::FORBIDDEN);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(sixth.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["reason_code"], "approval_rate_limited_actor");
+    }
+
+    #[tokio::test]
+    async fn critical_action_submit_denies_expired_window_with_machine_payload() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/critical-actions/risk_limit_increase/requests/req-critical-expired-001",
+                    )
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-submit-expired-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expires_at_utc":"2000-01-01T00:00:00Z"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["state"], "expired");
+        assert_eq!(payload["reason_code"], "approval_expired_window");
+        assert_eq!(payload["error_code"], "approval_expired_window");
+        assert_eq!(
+            payload["message"],
+            "approval request has expired and cannot be used"
+        );
+        assert_eq!(payload["security_signal"]["alert_compatible"], true);
+    }
+
+    #[tokio::test]
+    async fn critical_action_vote_unknown_request_returns_bad_request_machine_payload() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/critical-actions/risk_limit_increase/requests/req-critical-missing-001/votes",
+                    )
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("admin-1", "administrative_actions", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-vote-missing-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"decision":"approve"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["reason_code"], "approval_unknown_request");
+        assert_eq!(payload["error_code"], "approval_unknown_request");
+        assert_eq!(payload["message"], "approval request was not found");
+        assert_eq!(
+            payload["security_signal"]["name"],
+            "unauthorized_privileged_approval_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_action_execute_without_request_returns_bad_request_machine_payload() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/critical-actions/risk_limit_increase/requests/req-critical-missing-002/execute",
+                    )
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-execute-missing-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["reason_code"], "approval_missing_request");
+        assert_eq!(payload["error_code"], "approval_missing_request");
+        assert_eq!(
+            payload["message"],
+            "approval request is required before execution"
+        );
+        assert_eq!(
+            payload["security_signal"]["name"],
+            "unauthorized_privileged_approval_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_critical_execution_propagates_non_null_approval_reference_to_audit() {
+        let audit_appender = Arc::new(CapturingAuditAppender::default());
+        let app = test_app_with_audit_appender(audit_appender.clone());
+
+        let submit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/critical-actions/risk_limit_increase/requests/req-critical-004")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-submit-004")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expires_at_utc":"2099-01-01T00:00:00Z"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+
+        let vote = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/critical-actions/risk_limit_increase/requests/req-critical-004/votes",
+                    )
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("admin-1", "administrative_actions", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-vote-004")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"decision":"approve"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(vote.status(), StatusCode::ACCEPTED);
+
+        let execute = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/critical-actions/risk_limit_increase/requests/req-critical-004/execute",
+                    )
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-critical-execute-004")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(execute.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        let approval_reference = payload["approval_reference"]
+            .as_str()
+            .expect("approved response should include approval reference")
+            .to_string();
+        assert!(!approval_reference.is_empty());
+
+        let records = audit_appender.snapshot();
+        let linked = records
+            .iter()
+            .filter(|record| record.action_type == "risk_limit_increase")
+            .any(|record| {
+                record.approval_reference.as_deref() == Some(approval_reference.as_str())
+            });
+        assert!(
+            linked,
+            "at least one immutable audit record should carry approval_reference for approved critical action"
+        );
+
+        let denied_records_with_reference = records
+            .iter()
+            .filter(|record| record.outcome == PrivilegedAuditOutcome::AuthorizationDenied)
+            .filter(|record| record.action_type == "risk_limit_increase")
+            .any(|record| record.approval_reference.is_some());
+        assert!(
+            !denied_records_with_reference,
+            "denied critical approvals must not synthesize approval_reference values"
+        );
     }
 
     #[derive(Debug)]
