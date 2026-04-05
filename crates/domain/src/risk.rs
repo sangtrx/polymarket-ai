@@ -11,6 +11,9 @@ pub const MARKET_STREAM_BACKLOG_DEGRADED_SECONDS: f64 = 10.0;
 pub const MARKET_STREAM_BACKLOG_SUSTAINED_DURATION_SECONDS: f64 = 30.0;
 pub const MARKET_STREAM_MAX_DEPTH_LEVELS: usize = 5;
 pub const USER_STREAM_AUTH_STATE_PARTITION_KEY: &str = "__user_stream_auth_state__";
+pub const FRESHNESS_STALE_THRESHOLD_SECONDS: f64 = 30.0;
+pub const FRESHNESS_RECOVERY_STABILITY_WINDOW_SECONDS: f64 = 10.0;
+pub const FRESHNESS_MAX_BREACH_TO_PAUSE_SECONDS: f64 = 5.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RiskLimit {
@@ -1397,6 +1400,739 @@ pub fn evaluate_user_stream_ordering(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FreshnessGatePolicy {
+    pub stale_threshold_seconds: f64,
+    pub stability_window_seconds: f64,
+    pub max_breach_to_pause_seconds: f64,
+}
+
+impl Default for FreshnessGatePolicy {
+    fn default() -> Self {
+        Self {
+            stale_threshold_seconds: FRESHNESS_STALE_THRESHOLD_SECONDS,
+            stability_window_seconds: FRESHNESS_RECOVERY_STABILITY_WINDOW_SECONDS,
+            max_breach_to_pause_seconds: FRESHNESS_MAX_BREACH_TO_PAUSE_SECONDS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessGateTransition {
+    PauseActivated,
+    PauseMaintained,
+    RecoveryPending,
+    RecoveryConfirmed,
+}
+
+impl FreshnessGateTransition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PauseActivated => "pause_activated",
+            Self::PauseMaintained => "pause_maintained",
+            Self::RecoveryPending => "recovery_pending",
+            Self::RecoveryConfirmed => "recovery_confirmed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, FreshnessGateContractError> {
+        match value {
+            "pause_activated" => Ok(Self::PauseActivated),
+            "pause_maintained" => Ok(Self::PauseMaintained),
+            "recovery_pending" => Ok(Self::RecoveryPending),
+            "recovery_confirmed" => Ok(Self::RecoveryConfirmed),
+            _ => Err(FreshnessGateContractError::invalid_payload(format!(
+                "unknown freshness gate transition `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessGateReasonCode {
+    StaleBreach,
+    BoundarySafe,
+    StateUnavailable,
+    RecoveryPending,
+    RecoveryConfirmed,
+    EvaluationError,
+    PersistenceUnavailable,
+    InvalidPayload,
+}
+
+impl FreshnessGateReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::StaleBreach => "freshness_gate_stale_breach",
+            Self::BoundarySafe => "freshness_gate_boundary_safe",
+            Self::StateUnavailable => "freshness_gate_state_unavailable",
+            Self::RecoveryPending => "freshness_gate_recovery_pending",
+            Self::RecoveryConfirmed => "freshness_gate_recovery_confirmed",
+            Self::EvaluationError => "freshness_gate_evaluation_error",
+            Self::PersistenceUnavailable => "freshness_gate_persistence_unavailable",
+            Self::InvalidPayload => "freshness_gate_invalid_payload",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, FreshnessGateContractError> {
+        match value {
+            "freshness_gate_stale_breach" => Ok(Self::StaleBreach),
+            "freshness_gate_boundary_safe" => Ok(Self::BoundarySafe),
+            "freshness_gate_state_unavailable" => Ok(Self::StateUnavailable),
+            "freshness_gate_recovery_pending" => Ok(Self::RecoveryPending),
+            "freshness_gate_recovery_confirmed" => Ok(Self::RecoveryConfirmed),
+            "freshness_gate_evaluation_error" => Ok(Self::EvaluationError),
+            "freshness_gate_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            "freshness_gate_invalid_payload" => Ok(Self::InvalidPayload),
+            _ => Err(FreshnessGateContractError::invalid_payload(format!(
+                "unknown freshness gate reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FreshnessSnapshot {
+    pub market_data_age_seconds: Option<f64>,
+    pub user_data_age_seconds: Option<f64>,
+    pub sampled_at_utc: String,
+    pub correlation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FreshnessGateState {
+    pub pause_active: bool,
+    pub reason_code: String,
+    pub stale_breach_detected_at_utc: Option<String>,
+    pub pause_activated_at_utc: Option<String>,
+    pub recovery_window_started_at_utc: Option<String>,
+    pub last_evaluated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FreshnessGateEvaluationOutcome {
+    pub transition: Option<FreshnessGateTransition>,
+    pub reason_code: String,
+    pub pause_active: bool,
+    pub block_new_order_creation: bool,
+    pub market_data_age_seconds: Option<f64>,
+    pub user_data_age_seconds: Option<f64>,
+    pub stale_breach_detected_at_utc: Option<String>,
+    pub pause_activated_at_utc: Option<String>,
+    pub recovery_window_started_at_utc: Option<String>,
+    pub recovery_confirmed_at_utc: Option<String>,
+    pub breach_to_pause_latency_seconds: Option<f64>,
+    pub evaluated_at_utc: String,
+    pub correlation_id: String,
+}
+
+impl FreshnessGateEvaluationOutcome {
+    pub fn to_state(&self) -> FreshnessGateState {
+        FreshnessGateState {
+            pause_active: self.pause_active,
+            reason_code: self.reason_code.clone(),
+            stale_breach_detected_at_utc: self.stale_breach_detected_at_utc.clone(),
+            pause_activated_at_utc: self.pause_activated_at_utc.clone(),
+            recovery_window_started_at_utc: self.recovery_window_started_at_utc.clone(),
+            last_evaluated_at_utc: self.evaluated_at_utc.clone(),
+        }
+    }
+
+    pub fn to_event(
+        &self,
+        event_id: impl Into<String>,
+        policy: &FreshnessGatePolicy,
+    ) -> Option<FreshnessGateEvent> {
+        self.transition.map(|transition| FreshnessGateEvent {
+            event_id: event_id.into(),
+            transition,
+            reason_code: self.reason_code.clone(),
+            pause_active: self.pause_active,
+            block_new_order_creation: self.block_new_order_creation,
+            market_data_age_seconds: self.market_data_age_seconds,
+            user_data_age_seconds: self.user_data_age_seconds,
+            stale_threshold_seconds: policy.stale_threshold_seconds,
+            stability_window_seconds: policy.stability_window_seconds,
+            max_breach_to_pause_seconds: policy.max_breach_to_pause_seconds,
+            stale_breach_detected_at_utc: self.stale_breach_detected_at_utc.clone(),
+            pause_activated_at_utc: self.pause_activated_at_utc.clone(),
+            recovery_window_started_at_utc: self.recovery_window_started_at_utc.clone(),
+            recovery_confirmed_at_utc: self.recovery_confirmed_at_utc.clone(),
+            breach_to_pause_latency_seconds: self.breach_to_pause_latency_seconds,
+            evaluated_at_utc: self.evaluated_at_utc.clone(),
+            correlation_id: self.correlation_id.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FreshnessGateEvent {
+    pub event_id: String,
+    pub transition: FreshnessGateTransition,
+    pub reason_code: String,
+    pub pause_active: bool,
+    pub block_new_order_creation: bool,
+    pub market_data_age_seconds: Option<f64>,
+    pub user_data_age_seconds: Option<f64>,
+    pub stale_threshold_seconds: f64,
+    pub stability_window_seconds: f64,
+    pub max_breach_to_pause_seconds: f64,
+    pub stale_breach_detected_at_utc: Option<String>,
+    pub pause_activated_at_utc: Option<String>,
+    pub recovery_window_started_at_utc: Option<String>,
+    pub recovery_confirmed_at_utc: Option<String>,
+    pub breach_to_pause_latency_seconds: Option<f64>,
+    pub evaluated_at_utc: String,
+    pub correlation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FreshnessGateValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FreshnessGateContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<FreshnessGateValidationIssue>,
+}
+
+impl FreshnessGateContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<FreshnessGateValidationIssue>,
+    ) -> Self {
+        Self {
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+pub fn validate_freshness_gate_policy(
+    policy: &FreshnessGatePolicy,
+) -> Result<(), FreshnessGateContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "stale_threshold_seconds",
+        Some(policy.stale_threshold_seconds),
+        true,
+    );
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "stability_window_seconds",
+        Some(policy.stability_window_seconds),
+        true,
+    );
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "max_breach_to_pause_seconds",
+        Some(policy.max_breach_to_pause_seconds),
+        true,
+    );
+
+    if policy.max_breach_to_pause_seconds > policy.stale_threshold_seconds {
+        field_errors.push(FreshnessGateValidationIssue {
+            field: "max_breach_to_pause_seconds",
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: "max_breach_to_pause_seconds cannot exceed stale_threshold_seconds"
+                .to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(FreshnessGateContractError::invalid_payload_with_issues(
+            "freshness gate policy is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_freshness_snapshot(
+    snapshot: &FreshnessSnapshot,
+) -> Result<(), FreshnessGateContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "market_data_age_seconds",
+        snapshot.market_data_age_seconds,
+        false,
+    );
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "user_data_age_seconds",
+        snapshot.user_data_age_seconds,
+        false,
+    );
+    validate_freshness_timestamp_field(
+        &mut field_errors,
+        "sampled_at_utc",
+        &snapshot.sampled_at_utc,
+    );
+    validate_freshness_non_empty(
+        &mut field_errors,
+        "correlation_id",
+        &snapshot.correlation_id,
+    );
+
+    if !field_errors.is_empty() {
+        return Err(FreshnessGateContractError::invalid_payload_with_issues(
+            "freshness snapshot is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_freshness_gate_state(
+    state: &FreshnessGateState,
+) -> Result<(), FreshnessGateContractError> {
+    let mut field_errors = Vec::new();
+    validate_freshness_non_empty(&mut field_errors, "reason_code", &state.reason_code);
+    if FreshnessGateReasonCode::parse(&state.reason_code).is_err() {
+        field_errors.push(FreshnessGateValidationIssue {
+            field: "reason_code",
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known freshness gate reason".to_string(),
+        });
+    }
+    validate_freshness_timestamp_field(
+        &mut field_errors,
+        "last_evaluated_at_utc",
+        &state.last_evaluated_at_utc,
+    );
+    if let Some(value) = state.stale_breach_detected_at_utc.as_ref() {
+        validate_freshness_timestamp_field(
+            &mut field_errors,
+            "stale_breach_detected_at_utc",
+            value,
+        );
+    }
+    if let Some(value) = state.pause_activated_at_utc.as_ref() {
+        validate_freshness_timestamp_field(&mut field_errors, "pause_activated_at_utc", value);
+    }
+    if let Some(value) = state.recovery_window_started_at_utc.as_ref() {
+        validate_freshness_timestamp_field(
+            &mut field_errors,
+            "recovery_window_started_at_utc",
+            value,
+        );
+    }
+
+    if state.pause_active && state.pause_activated_at_utc.is_none() {
+        field_errors.push(FreshnessGateValidationIssue {
+            field: "pause_activated_at_utc",
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: "pause_active state requires pause_activated_at_utc".to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(FreshnessGateContractError::invalid_payload_with_issues(
+            "freshness gate state is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_freshness_gate_event(
+    event: &FreshnessGateEvent,
+) -> Result<(), FreshnessGateContractError> {
+    let mut field_errors = Vec::new();
+    validate_freshness_non_empty(&mut field_errors, "event_id", &event.event_id);
+    validate_freshness_non_empty(&mut field_errors, "reason_code", &event.reason_code);
+    validate_freshness_non_empty(&mut field_errors, "correlation_id", &event.correlation_id);
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "market_data_age_seconds",
+        event.market_data_age_seconds,
+        false,
+    );
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "user_data_age_seconds",
+        event.user_data_age_seconds,
+        false,
+    );
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "stale_threshold_seconds",
+        Some(event.stale_threshold_seconds),
+        true,
+    );
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "stability_window_seconds",
+        Some(event.stability_window_seconds),
+        true,
+    );
+    validate_non_negative_freshness_age(
+        &mut field_errors,
+        "max_breach_to_pause_seconds",
+        Some(event.max_breach_to_pause_seconds),
+        true,
+    );
+    validate_freshness_timestamp_field(
+        &mut field_errors,
+        "evaluated_at_utc",
+        &event.evaluated_at_utc,
+    );
+    if let Some(value) = event.stale_breach_detected_at_utc.as_ref() {
+        validate_freshness_timestamp_field(
+            &mut field_errors,
+            "stale_breach_detected_at_utc",
+            value,
+        );
+    }
+    if let Some(value) = event.pause_activated_at_utc.as_ref() {
+        validate_freshness_timestamp_field(&mut field_errors, "pause_activated_at_utc", value);
+    }
+    if let Some(value) = event.recovery_window_started_at_utc.as_ref() {
+        validate_freshness_timestamp_field(
+            &mut field_errors,
+            "recovery_window_started_at_utc",
+            value,
+        );
+    }
+    if let Some(value) = event.recovery_confirmed_at_utc.as_ref() {
+        validate_freshness_timestamp_field(&mut field_errors, "recovery_confirmed_at_utc", value);
+    }
+    if let Some(latency) = event.breach_to_pause_latency_seconds {
+        if !latency.is_finite() || latency < 0.0 {
+            field_errors.push(FreshnessGateValidationIssue {
+                field: "breach_to_pause_latency_seconds",
+                code: FreshnessGateReasonCode::InvalidPayload.code(),
+                message: "breach_to_pause_latency_seconds must be finite and non-negative"
+                    .to_string(),
+            });
+        } else if latency > event.max_breach_to_pause_seconds {
+            field_errors.push(FreshnessGateValidationIssue {
+                field: "breach_to_pause_latency_seconds",
+                code: FreshnessGateReasonCode::InvalidPayload.code(),
+                message: "breach_to_pause_latency_seconds exceeds configured maximum".to_string(),
+            });
+        }
+    }
+    if FreshnessGateReasonCode::parse(&event.reason_code).is_err() {
+        field_errors.push(FreshnessGateValidationIssue {
+            field: "reason_code",
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known freshness gate reason".to_string(),
+        });
+    }
+
+    match event.transition {
+        FreshnessGateTransition::PauseActivated | FreshnessGateTransition::PauseMaintained => {
+            if !event.pause_active || !event.block_new_order_creation {
+                field_errors.push(FreshnessGateValidationIssue {
+                    field: "pause_active",
+                    code: FreshnessGateReasonCode::InvalidPayload.code(),
+                    message:
+                        "pause transitions must keep pause_active and block_new_order_creation true"
+                            .to_string(),
+                });
+            }
+            if event.pause_activated_at_utc.is_none() {
+                field_errors.push(FreshnessGateValidationIssue {
+                    field: "pause_activated_at_utc",
+                    code: FreshnessGateReasonCode::InvalidPayload.code(),
+                    message: "pause transitions require pause_activated_at_utc".to_string(),
+                });
+            }
+            if event.transition == FreshnessGateTransition::PauseActivated
+                && event.stale_breach_detected_at_utc.is_none()
+            {
+                field_errors.push(FreshnessGateValidationIssue {
+                    field: "stale_breach_detected_at_utc",
+                    code: FreshnessGateReasonCode::InvalidPayload.code(),
+                    message: "pause_activated transition requires stale_breach_detected_at_utc"
+                        .to_string(),
+                });
+            }
+        }
+        FreshnessGateTransition::RecoveryPending => {
+            if !event.pause_active || !event.block_new_order_creation {
+                field_errors.push(FreshnessGateValidationIssue {
+                    field: "pause_active",
+                    code: FreshnessGateReasonCode::InvalidPayload.code(),
+                    message:
+                        "recovery_pending transition must remain fail-closed while stability window runs"
+                            .to_string(),
+                });
+            }
+            if event.recovery_window_started_at_utc.is_none() {
+                field_errors.push(FreshnessGateValidationIssue {
+                    field: "recovery_window_started_at_utc",
+                    code: FreshnessGateReasonCode::InvalidPayload.code(),
+                    message: "recovery_pending transition requires recovery_window_started_at_utc"
+                        .to_string(),
+                });
+            }
+        }
+        FreshnessGateTransition::RecoveryConfirmed => {
+            if event.pause_active || event.block_new_order_creation {
+                field_errors.push(FreshnessGateValidationIssue {
+                    field: "pause_active",
+                    code: FreshnessGateReasonCode::InvalidPayload.code(),
+                    message:
+                        "recovery_confirmed transition must clear pause_active and un-block orders"
+                            .to_string(),
+                });
+            }
+            if event.recovery_confirmed_at_utc.is_none() {
+                field_errors.push(FreshnessGateValidationIssue {
+                    field: "recovery_confirmed_at_utc",
+                    code: FreshnessGateReasonCode::InvalidPayload.code(),
+                    message: "recovery_confirmed transition requires recovery_confirmed_at_utc"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    if !field_errors.is_empty() {
+        return Err(FreshnessGateContractError::invalid_payload_with_issues(
+            "freshness gate event is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn evaluate_freshness_gate(
+    snapshot: &FreshnessSnapshot,
+    previous_state: Option<&FreshnessGateState>,
+    policy: &FreshnessGatePolicy,
+) -> Result<FreshnessGateEvaluationOutcome, FreshnessGateContractError> {
+    validate_freshness_snapshot(snapshot)?;
+    validate_freshness_gate_policy(policy)?;
+    if let Some(state) = previous_state {
+        validate_freshness_gate_state(state)?;
+    }
+
+    let missing_inputs =
+        snapshot.market_data_age_seconds.is_none() || snapshot.user_data_age_seconds.is_none();
+    let market_stale = snapshot
+        .market_data_age_seconds
+        .is_some_and(|age| age > policy.stale_threshold_seconds);
+    let user_stale = snapshot
+        .user_data_age_seconds
+        .is_some_and(|age| age > policy.stale_threshold_seconds);
+    let stale_breach = market_stale || user_stale;
+
+    if missing_inputs || stale_breach {
+        let was_paused = previous_state.is_some_and(|state| state.pause_active);
+        let stale_breach_detected_at_utc = if was_paused {
+            previous_state
+                .and_then(|state| state.stale_breach_detected_at_utc.clone())
+                .unwrap_or_else(|| snapshot.sampled_at_utc.clone())
+        } else {
+            snapshot.sampled_at_utc.clone()
+        };
+        let pause_activated_at_utc = if was_paused {
+            previous_state
+                .and_then(|state| state.pause_activated_at_utc.clone())
+                .unwrap_or_else(|| snapshot.sampled_at_utc.clone())
+        } else {
+            snapshot.sampled_at_utc.clone()
+        };
+        let transition = if was_paused {
+            FreshnessGateTransition::PauseMaintained
+        } else {
+            FreshnessGateTransition::PauseActivated
+        };
+        let breach_to_pause_latency_seconds =
+            if transition == FreshnessGateTransition::PauseActivated {
+                Some(compute_elapsed_seconds(
+                    &stale_breach_detected_at_utc,
+                    &pause_activated_at_utc,
+                )?)
+            } else {
+                None
+            };
+        let reason_code = if missing_inputs {
+            FreshnessGateReasonCode::StateUnavailable.code()
+        } else {
+            FreshnessGateReasonCode::StaleBreach.code()
+        };
+
+        return Ok(FreshnessGateEvaluationOutcome {
+            transition: Some(transition),
+            reason_code: reason_code.to_string(),
+            pause_active: true,
+            block_new_order_creation: true,
+            market_data_age_seconds: snapshot.market_data_age_seconds,
+            user_data_age_seconds: snapshot.user_data_age_seconds,
+            stale_breach_detected_at_utc: Some(stale_breach_detected_at_utc),
+            pause_activated_at_utc: Some(pause_activated_at_utc),
+            recovery_window_started_at_utc: None,
+            recovery_confirmed_at_utc: None,
+            breach_to_pause_latency_seconds,
+            evaluated_at_utc: snapshot.sampled_at_utc.clone(),
+            correlation_id: snapshot.correlation_id.clone(),
+        });
+    }
+
+    if previous_state.is_some_and(|state| state.pause_active) {
+        let recovery_window_started_at_utc = previous_state
+            .and_then(|state| state.recovery_window_started_at_utc.clone())
+            .unwrap_or_else(|| snapshot.sampled_at_utc.clone());
+        let elapsed_recovery_seconds =
+            compute_elapsed_seconds(&recovery_window_started_at_utc, &snapshot.sampled_at_utc)?;
+
+        if elapsed_recovery_seconds >= policy.stability_window_seconds {
+            return Ok(FreshnessGateEvaluationOutcome {
+                transition: Some(FreshnessGateTransition::RecoveryConfirmed),
+                reason_code: FreshnessGateReasonCode::RecoveryConfirmed
+                    .code()
+                    .to_string(),
+                pause_active: false,
+                block_new_order_creation: false,
+                market_data_age_seconds: snapshot.market_data_age_seconds,
+                user_data_age_seconds: snapshot.user_data_age_seconds,
+                stale_breach_detected_at_utc: previous_state
+                    .and_then(|state| state.stale_breach_detected_at_utc.clone()),
+                pause_activated_at_utc: previous_state
+                    .and_then(|state| state.pause_activated_at_utc.clone()),
+                recovery_window_started_at_utc: Some(recovery_window_started_at_utc),
+                recovery_confirmed_at_utc: Some(snapshot.sampled_at_utc.clone()),
+                breach_to_pause_latency_seconds: None,
+                evaluated_at_utc: snapshot.sampled_at_utc.clone(),
+                correlation_id: snapshot.correlation_id.clone(),
+            });
+        }
+
+        return Ok(FreshnessGateEvaluationOutcome {
+            transition: Some(FreshnessGateTransition::RecoveryPending),
+            reason_code: FreshnessGateReasonCode::RecoveryPending.code().to_string(),
+            pause_active: true,
+            block_new_order_creation: true,
+            market_data_age_seconds: snapshot.market_data_age_seconds,
+            user_data_age_seconds: snapshot.user_data_age_seconds,
+            stale_breach_detected_at_utc: previous_state
+                .and_then(|state| state.stale_breach_detected_at_utc.clone()),
+            pause_activated_at_utc: previous_state
+                .and_then(|state| state.pause_activated_at_utc.clone()),
+            recovery_window_started_at_utc: Some(recovery_window_started_at_utc),
+            recovery_confirmed_at_utc: None,
+            breach_to_pause_latency_seconds: None,
+            evaluated_at_utc: snapshot.sampled_at_utc.clone(),
+            correlation_id: snapshot.correlation_id.clone(),
+        });
+    }
+
+    Ok(FreshnessGateEvaluationOutcome {
+        transition: None,
+        reason_code: FreshnessGateReasonCode::BoundarySafe.code().to_string(),
+        pause_active: false,
+        block_new_order_creation: false,
+        market_data_age_seconds: snapshot.market_data_age_seconds,
+        user_data_age_seconds: snapshot.user_data_age_seconds,
+        stale_breach_detected_at_utc: None,
+        pause_activated_at_utc: None,
+        recovery_window_started_at_utc: None,
+        recovery_confirmed_at_utc: None,
+        breach_to_pause_latency_seconds: None,
+        evaluated_at_utc: snapshot.sampled_at_utc.clone(),
+        correlation_id: snapshot.correlation_id.clone(),
+    })
+}
+
+fn validate_non_negative_freshness_age(
+    field_errors: &mut Vec<FreshnessGateValidationIssue>,
+    field: &'static str,
+    value: Option<f64>,
+    required: bool,
+) {
+    if value.is_none() && required {
+        field_errors.push(FreshnessGateValidationIssue {
+            field,
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: format!("{field} is required"),
+        });
+        return;
+    }
+
+    if let Some(value) = value {
+        if !value.is_finite() {
+            field_errors.push(FreshnessGateValidationIssue {
+                field,
+                code: FreshnessGateReasonCode::InvalidPayload.code(),
+                message: format!("{field} must be finite"),
+            });
+        } else if value < 0.0 {
+            field_errors.push(FreshnessGateValidationIssue {
+                field,
+                code: FreshnessGateReasonCode::InvalidPayload.code(),
+                message: format!("{field} must be greater than or equal to 0"),
+            });
+        }
+    }
+}
+
+fn validate_freshness_timestamp_field(
+    field_errors: &mut Vec<FreshnessGateValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(FreshnessGateValidationIssue {
+            field,
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
+fn validate_freshness_non_empty(
+    field_errors: &mut Vec<FreshnessGateValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(FreshnessGateValidationIssue {
+            field,
+            code: FreshnessGateReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn compute_elapsed_seconds(
+    start_utc: &str,
+    end_utc: &str,
+) -> Result<f64, FreshnessGateContractError> {
+    let start = parse_utc_timestamp(start_utc).map_err(|_| {
+        FreshnessGateContractError::invalid_payload("start timestamp must be RFC3339 UTC")
+    })?;
+    let end = parse_utc_timestamp(end_utc).map_err(|_| {
+        FreshnessGateContractError::invalid_payload("end timestamp must be RFC3339 UTC")
+    })?;
+    if end < start {
+        return Err(FreshnessGateContractError::invalid_payload(
+            "end timestamp cannot be earlier than start timestamp",
+        ));
+    }
+    Ok((end - start).as_seconds_f64())
+}
+
 fn validate_non_empty_user_stream_field(
     field_errors: &mut Vec<UserStreamValidationIssue>,
     field: &'static str,
@@ -2141,5 +2877,223 @@ mod tests {
         failing[98] = USER_STREAM_LATENCY_TARGET_SECONDS + 0.1;
         failing[99] = USER_STREAM_LATENCY_TARGET_SECONDS + 0.2;
         assert!(!user_stream_latency_slo_met(&failing));
+    }
+
+    fn sample_freshness_policy() -> FreshnessGatePolicy {
+        FreshnessGatePolicy {
+            stale_threshold_seconds: 30.0,
+            stability_window_seconds: 10.0,
+            max_breach_to_pause_seconds: 5.0,
+        }
+    }
+
+    fn sample_freshness_snapshot(
+        market_age: Option<f64>,
+        user_age: Option<f64>,
+        sampled_at_utc: &str,
+    ) -> FreshnessSnapshot {
+        FreshnessSnapshot {
+            market_data_age_seconds: market_age,
+            user_data_age_seconds: user_age,
+            sampled_at_utc: sampled_at_utc.to_string(),
+            correlation_id: "corr-freshness-001".to_string(),
+        }
+    }
+
+    fn sample_paused_freshness_state() -> FreshnessGateState {
+        FreshnessGateState {
+            pause_active: true,
+            reason_code: FreshnessGateReasonCode::StaleBreach.code().to_string(),
+            stale_breach_detected_at_utc: Some("2026-04-06T00:00:00Z".to_string()),
+            pause_activated_at_utc: Some("2026-04-06T00:00:00Z".to_string()),
+            recovery_window_started_at_utc: None,
+            last_evaluated_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn freshness_gate_boundary_29s_and_30s_remain_unpaused() {
+        let policy = sample_freshness_policy();
+        let snapshot = sample_freshness_snapshot(Some(29.0), Some(30.0), "2026-04-06T00:00:30Z");
+
+        let outcome = evaluate_freshness_gate(&snapshot, None, &policy)
+            .expect("boundary-safe snapshot should evaluate cleanly");
+
+        assert!(!outcome.pause_active);
+        assert!(!outcome.block_new_order_creation);
+        assert_eq!(
+            outcome.reason_code,
+            FreshnessGateReasonCode::BoundarySafe.code()
+        );
+        assert_eq!(outcome.transition, None);
+    }
+
+    #[test]
+    fn freshness_gate_pauses_immediately_when_age_exceeds_30s() {
+        let policy = sample_freshness_policy();
+        let snapshot = sample_freshness_snapshot(Some(31.0), Some(30.0), "2026-04-06T00:01:00Z");
+
+        let outcome = evaluate_freshness_gate(&snapshot, None, &policy)
+            .expect("stale breach should evaluate cleanly");
+
+        assert!(outcome.pause_active);
+        assert!(outcome.block_new_order_creation);
+        assert_eq!(
+            outcome.transition,
+            Some(FreshnessGateTransition::PauseActivated)
+        );
+        assert_eq!(
+            outcome.reason_code,
+            FreshnessGateReasonCode::StaleBreach.code()
+        );
+        assert!(
+            outcome
+                .breach_to_pause_latency_seconds
+                .is_some_and(|latency| latency <= 5.0)
+        );
+    }
+
+    #[test]
+    fn freshness_gate_missing_inputs_fail_closed_with_state_unavailable_reason() {
+        let policy = sample_freshness_policy();
+        let snapshot = sample_freshness_snapshot(None, Some(12.0), "2026-04-06T00:01:05Z");
+
+        let outcome = evaluate_freshness_gate(&snapshot, None, &policy).expect(
+            "missing freshness signal should still produce deterministic fail-closed outcome",
+        );
+
+        assert!(outcome.pause_active);
+        assert!(outcome.block_new_order_creation);
+        assert_eq!(
+            outcome.reason_code,
+            FreshnessGateReasonCode::StateUnavailable.code()
+        );
+        assert_eq!(
+            outcome.transition,
+            Some(FreshnessGateTransition::PauseActivated)
+        );
+    }
+
+    #[test]
+    fn freshness_gate_recovery_window_minus_one_stays_paused_and_window_unlocks() {
+        let policy = sample_freshness_policy();
+        let paused_state = sample_paused_freshness_state();
+
+        let pending_start_snapshot =
+            sample_freshness_snapshot(Some(30.0), Some(29.0), "2026-04-06T00:00:40Z");
+        let pending_start =
+            evaluate_freshness_gate(&pending_start_snapshot, Some(&paused_state), &policy)
+                .expect("fresh snapshot after pause should enter recovery_pending");
+        assert_eq!(
+            pending_start.transition,
+            Some(FreshnessGateTransition::RecoveryPending)
+        );
+        assert!(pending_start.pause_active);
+
+        let pending_state = pending_start.to_state();
+        let window_minus_one_snapshot =
+            sample_freshness_snapshot(Some(30.0), Some(30.0), "2026-04-06T00:00:49Z");
+        let window_minus_one =
+            evaluate_freshness_gate(&window_minus_one_snapshot, Some(&pending_state), &policy)
+                .expect("window-1s should remain paused");
+        assert_eq!(
+            window_minus_one.transition,
+            Some(FreshnessGateTransition::RecoveryPending)
+        );
+        assert!(window_minus_one.pause_active);
+
+        let confirmed_snapshot =
+            sample_freshness_snapshot(Some(29.0), Some(30.0), "2026-04-06T00:00:50Z");
+        let confirmed = evaluate_freshness_gate(
+            &confirmed_snapshot,
+            Some(&window_minus_one.to_state()),
+            &policy,
+        )
+        .expect("full recovery window should clear pause");
+        assert_eq!(
+            confirmed.transition,
+            Some(FreshnessGateTransition::RecoveryConfirmed)
+        );
+        assert!(!confirmed.pause_active);
+        assert!(!confirmed.block_new_order_creation);
+        assert_eq!(
+            confirmed.reason_code,
+            FreshnessGateReasonCode::RecoveryConfirmed.code()
+        );
+    }
+
+    #[test]
+    fn freshness_gate_event_conversion_preserves_machine_readable_fields() {
+        let policy = sample_freshness_policy();
+        let snapshot = sample_freshness_snapshot(Some(31.0), Some(31.0), "2026-04-06T00:01:10Z");
+        let outcome = evaluate_freshness_gate(&snapshot, None, &policy)
+            .expect("stale breach should evaluate");
+        let event = outcome
+            .to_event("freshness::event-1", &policy)
+            .expect("pause transition should emit an event payload");
+
+        assert_eq!(event.transition, FreshnessGateTransition::PauseActivated);
+        assert_eq!(
+            event.reason_code,
+            FreshnessGateReasonCode::StaleBreach.code()
+        );
+        assert!(event.pause_active);
+        assert!(event.block_new_order_creation);
+        assert!(validate_freshness_gate_event(&event).is_ok());
+    }
+
+    #[test]
+    fn freshness_gate_repause_after_recovery_uses_new_breach_timestamp() {
+        let policy = sample_freshness_policy();
+        let paused_state = sample_paused_freshness_state();
+        let pending_start_snapshot =
+            sample_freshness_snapshot(Some(30.0), Some(30.0), "2026-04-06T00:00:40Z");
+        let pending_start =
+            evaluate_freshness_gate(&pending_start_snapshot, Some(&paused_state), &policy)
+                .expect("fresh snapshot after pause should enter recovery_pending");
+        let confirmed_snapshot =
+            sample_freshness_snapshot(Some(30.0), Some(30.0), "2026-04-06T00:00:50Z");
+        let confirmed = evaluate_freshness_gate(
+            &confirmed_snapshot,
+            Some(&pending_start.to_state()),
+            &policy,
+        )
+        .expect("full recovery window should clear pause");
+        assert_eq!(
+            confirmed.transition,
+            Some(FreshnessGateTransition::RecoveryConfirmed)
+        );
+        assert!(!confirmed.pause_active);
+
+        let missing_signal_snapshot =
+            sample_freshness_snapshot(Some(0.5), None, "2026-04-06T00:00:51Z");
+        let repaused = evaluate_freshness_gate(
+            &missing_signal_snapshot,
+            Some(&confirmed.to_state()),
+            &policy,
+        )
+        .expect("missing signal after recovery should re-activate pause");
+        assert_eq!(
+            repaused.transition,
+            Some(FreshnessGateTransition::PauseActivated)
+        );
+        assert_eq!(
+            repaused.stale_breach_detected_at_utc.as_deref(),
+            Some("2026-04-06T00:00:51Z")
+        );
+        assert_eq!(
+            repaused.pause_activated_at_utc.as_deref(),
+            Some("2026-04-06T00:00:51Z")
+        );
+        assert!(
+            repaused
+                .breach_to_pause_latency_seconds
+                .is_some_and(|latency| latency <= policy.max_breach_to_pause_seconds)
+        );
+
+        let event = repaused
+            .to_event("freshness::event-2", &policy)
+            .expect("pause transition should emit an event payload");
+        assert!(validate_freshness_gate_event(&event).is_ok());
     }
 }

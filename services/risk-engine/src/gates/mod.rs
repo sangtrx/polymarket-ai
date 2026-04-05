@@ -1,4 +1,6 @@
-use domain::risk::{MarketClusterOverride, MarketPolicyReasonCode, UserStreamReasonCode};
+use domain::risk::{
+    FreshnessGateReasonCode, MarketClusterOverride, MarketPolicyReasonCode, UserStreamReasonCode,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +29,14 @@ pub struct OrderIntentGateDecision {
 pub trait RuntimePolicyStateReader: Send + Sync {
     fn cluster_override(&self, cluster_id: &str) -> Option<MarketClusterOverride>;
     fn user_stream_auth_block_active(&self) -> bool;
+    fn freshness_pause_reason_code(&self) -> Option<String>;
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryRuntimePolicyState {
     overrides: Arc<RwLock<BTreeMap<String, MarketClusterOverride>>>,
     auth_block_active: Arc<AtomicBool>,
+    freshness_pause_reason_code: Arc<RwLock<Option<String>>>,
 }
 
 impl InMemoryRuntimePolicyState {
@@ -49,6 +53,31 @@ impl InMemoryRuntimePolicyState {
     pub fn set_user_stream_auth_block(&self, is_active: bool) {
         self.auth_block_active.store(is_active, Ordering::SeqCst);
     }
+
+    pub fn set_freshness_pause(&self, is_active: bool, reason_code: &str) {
+        let mut freshness_pause_reason_code = self
+            .freshness_pause_reason_code
+            .write()
+            .expect("freshness pause runtime state should not be poisoned");
+        if is_active {
+            let normalized_reason_code = normalize_freshness_pause_reason(reason_code);
+            *freshness_pause_reason_code = Some(normalized_reason_code);
+        } else {
+            *freshness_pause_reason_code = None;
+        }
+    }
+}
+
+fn normalize_freshness_pause_reason(reason_code: &str) -> String {
+    let parsed = FreshnessGateReasonCode::parse(reason_code)
+        .unwrap_or(FreshnessGateReasonCode::StateUnavailable);
+    let normalized = match parsed {
+        FreshnessGateReasonCode::BoundarySafe | FreshnessGateReasonCode::RecoveryConfirmed => {
+            FreshnessGateReasonCode::StateUnavailable
+        }
+        other => other,
+    };
+    normalized.code().to_string()
 }
 
 impl RuntimePolicyStateReader for InMemoryRuntimePolicyState {
@@ -63,37 +92,47 @@ impl RuntimePolicyStateReader for InMemoryRuntimePolicyState {
     fn user_stream_auth_block_active(&self) -> bool {
         self.auth_block_active.load(Ordering::SeqCst)
     }
+
+    fn freshness_pause_reason_code(&self) -> Option<String> {
+        self.freshness_pause_reason_code
+            .read()
+            .expect("freshness pause runtime state should not be poisoned")
+            .clone()
+    }
 }
 
 pub fn evaluate_order_intent_gate<S: RuntimePolicyStateReader>(
     runtime_policy_state: &S,
     intent: &OrderIntent,
 ) -> OrderIntentGateDecision {
-    let (allowed, reason_code) = if runtime_policy_state.user_stream_auth_block_active() {
-        (false, UserStreamReasonCode::AuthExpired.code().to_string())
-    } else if intent.cluster_id.trim().is_empty() {
-        (
-            false,
-            MarketPolicyReasonCode::InvalidClusterId.code().to_string(),
-        )
-    } else {
-        match runtime_policy_state.cluster_override(&intent.cluster_id) {
-            Some(cluster_state) if cluster_state.is_enabled => (
-                true,
-                MarketPolicyReasonCode::MarketEligible.code().to_string(),
-            ),
-            Some(_) => (
+    let (allowed, reason_code) =
+        if let Some(freshness_reason_code) = runtime_policy_state.freshness_pause_reason_code() {
+            (false, freshness_reason_code)
+        } else if runtime_policy_state.user_stream_auth_block_active() {
+            (false, UserStreamReasonCode::AuthExpired.code().to_string())
+        } else if intent.cluster_id.trim().is_empty() {
+            (
                 false,
-                MarketPolicyReasonCode::ClusterDisabled.code().to_string(),
-            ),
-            None => (
-                false,
-                MarketPolicyReasonCode::PolicyStateUnavailable
-                    .code()
-                    .to_string(),
-            ),
-        }
-    };
+                MarketPolicyReasonCode::InvalidClusterId.code().to_string(),
+            )
+        } else {
+            match runtime_policy_state.cluster_override(&intent.cluster_id) {
+                Some(cluster_state) if cluster_state.is_enabled => (
+                    true,
+                    MarketPolicyReasonCode::MarketEligible.code().to_string(),
+                ),
+                Some(_) => (
+                    false,
+                    MarketPolicyReasonCode::ClusterDisabled.code().to_string(),
+                ),
+                None => (
+                    false,
+                    MarketPolicyReasonCode::PolicyStateUnavailable
+                        .code()
+                        .to_string(),
+                ),
+            }
+        };
 
     let decision = OrderIntentGateDecision {
         intent_id: intent.intent_id.clone(),
@@ -242,6 +281,54 @@ mod tests {
         assert_eq!(
             recovered.reason_code,
             MarketPolicyReasonCode::MarketEligible.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_denies_when_freshness_pause_is_active() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_freshness_pause(true, FreshnessGateReasonCode::StaleBreach.code());
+
+        let decision = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            FreshnessGateReasonCode::StaleBreach.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_recovery_unblocks_after_freshness_pause_clears() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_freshness_pause(true, FreshnessGateReasonCode::StaleBreach.code());
+
+        let blocked = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+        assert!(!blocked.allowed);
+
+        runtime_state.set_freshness_pause(false, FreshnessGateReasonCode::BoundarySafe.code());
+        let recovered = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+        assert!(recovered.allowed);
+        assert_eq!(
+            recovered.reason_code,
+            MarketPolicyReasonCode::MarketEligible.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_normalizes_non_pause_freshness_reasons_when_paused() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_freshness_pause(true, FreshnessGateReasonCode::BoundarySafe.code());
+
+        let decision = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            FreshnessGateReasonCode::StateUnavailable.code()
         );
     }
 }

@@ -1,3 +1,4 @@
+use super::freshness_gate::SharedFreshnessSignals;
 #[cfg(test)]
 use domain::risk::USER_STREAM_AUTH_STATE_PARTITION_KEY;
 use domain::risk::{
@@ -252,6 +253,7 @@ pub struct UserStreamIngestionRuntime<S: UserStreamStore> {
     store: S,
     config: UserStreamRuntimeConfig,
     state: UserStreamRuntimeState,
+    freshness_signals: Option<SharedFreshnessSignals>,
 }
 
 impl<S: UserStreamStore> UserStreamIngestionRuntime<S> {
@@ -260,7 +262,12 @@ impl<S: UserStreamStore> UserStreamIngestionRuntime<S> {
             store,
             config,
             state: UserStreamRuntimeState::default(),
+            freshness_signals: None,
         }
+    }
+
+    pub fn attach_freshness_signals(&mut self, signals: SharedFreshnessSignals) {
+        self.freshness_signals = Some(signals);
     }
 
     pub fn latency_slo_met(&self) -> bool {
@@ -361,6 +368,13 @@ impl<S: UserStreamStore> UserStreamIngestionRuntime<S> {
 
         match outcome.disposition {
             UserStreamPersistDisposition::Accepted => {
+                if let Some(signals) = self.freshness_signals.as_ref() {
+                    signals
+                        .record_user_update(&event.observed_at_utc)
+                        .map_err(|error| {
+                            UserStreamIngestionError::new(error.code, error.message)
+                        })?;
+                }
                 self.state
                     .latencies_seconds
                     .push(event.ingestion_latency_seconds);

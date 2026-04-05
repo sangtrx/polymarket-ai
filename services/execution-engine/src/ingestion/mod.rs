@@ -1,3 +1,4 @@
+pub mod freshness_gate;
 pub mod user_stream;
 
 use domain::risk::{
@@ -333,6 +334,7 @@ pub struct MarketStreamIngestionRuntime<S: MarketStreamStore> {
     store: S,
     config: MarketStreamRuntimeConfig,
     state: IngestionRuntimeState,
+    freshness_signals: Option<freshness_gate::SharedFreshnessSignals>,
 }
 
 impl<S: MarketStreamStore> MarketStreamIngestionRuntime<S> {
@@ -341,7 +343,12 @@ impl<S: MarketStreamStore> MarketStreamIngestionRuntime<S> {
             store,
             config,
             state: IngestionRuntimeState::default(),
+            freshness_signals: None,
         }
+    }
+
+    pub fn attach_freshness_signals(&mut self, signals: freshness_gate::SharedFreshnessSignals) {
+        self.freshness_signals = Some(signals);
     }
 
     pub fn latency_slo_met(&self) -> bool {
@@ -377,6 +384,11 @@ impl<S: MarketStreamStore> MarketStreamIngestionRuntime<S> {
                         None,
                     );
                     return Err(error);
+                }
+                if let Some(signals) = self.freshness_signals.as_ref() {
+                    signals
+                        .record_market_update(&tick.observed_at_utc)
+                        .map_err(|error| MarketIngestionError::new(error.code, error.message))?;
                 }
                 self.state
                     .latencies_seconds

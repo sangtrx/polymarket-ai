@@ -1,6 +1,7 @@
 pub mod approvals;
 pub mod audit;
 pub mod credential_rotation;
+pub mod freshness_gate;
 pub mod market_policy;
 pub mod market_stream;
 pub mod rbac;
