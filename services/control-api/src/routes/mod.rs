@@ -1,4 +1,6 @@
-use crate::middleware::{AuthenticatedActor, ControlApiState, require_authenticated_actor};
+use crate::middleware::{
+    AuthenticatedActor, ControlApiState, audit_append_failure_status, require_authenticated_actor,
+};
 use axum::{
     Router,
     extract::{Extension, State},
@@ -9,8 +11,11 @@ use axum::{
 };
 use domain::governance::{
     AuthorizationDecision, AuthorizationOutcome, AuthorizationReason, ControlAction,
+    PrivilegedAuditRecord,
 };
+use governance_service::audit::AuditAppendError;
 use serde::Serialize;
+use serde_json::json;
 
 pub fn app_router(state: ControlApiState) -> Router {
     let privileged_routes = Router::new().route(
@@ -40,6 +45,27 @@ pub async fn rebalance_portfolio(
         .evaluate(&actor, ControlAction::ExecuteControlPlaneAction);
 
     emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": "/control/rebalance",
+            "http_method": "POST",
+        }),
+    );
+
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        );
+    }
 
     if decision.outcome == AuthorizationOutcome::Allow {
         return (
@@ -80,6 +106,31 @@ pub async fn rebalance_portfolio(
             authentication_outcome: actor.authentication_outcome.as_str(),
             correlation_id: decision.correlation_id,
             timestamp_utc: decision.timestamp_utc,
+        }),
+    )
+        .into_response()
+}
+
+fn audit_append_failure_response(
+    audit_error: AuditAppendError,
+    action: String,
+    actor_id: String,
+    role: String,
+    authentication_outcome: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    (
+        audit_append_failure_status(audit_error.code),
+        axum::Json(ControlActionAuditFailure {
+            error_code: audit_error.code,
+            message: audit_error.message,
+            action,
+            actor_id,
+            role,
+            authentication_outcome,
+            correlation_id,
+            timestamp_utc,
         }),
     )
         .into_response()
@@ -162,6 +213,18 @@ pub struct ControlActionDenied {
     pub timestamp_utc: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ControlActionAuditFailure {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub authentication_outcome: &'static str,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,20 +237,78 @@ mod tests {
         http::HeaderMap,
         http::Request,
     };
-    use domain::governance::{AuthorizationDecision, AuthorizationEvaluator, ControlAction};
-    use std::sync::Arc;
+    use domain::governance::{
+        AuthorizationDecision, AuthorizationEvaluator, ControlAction, PrivilegedAuditOutcome,
+        PrivilegedAuditRecord,
+    };
+    use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
+    use std::sync::{Arc, Mutex};
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tower::ServiceExt;
 
     fn bearer_token(actor_id: &str, role: &str, expires_unix: i64) -> String {
         format!("Bearer {actor_id}:{role}:{expires_unix}")
     }
 
+    #[derive(Debug, Default)]
+    struct CapturingAuditAppender {
+        records: Mutex<Vec<PrivilegedAuditRecord>>,
+    }
+
+    impl CapturingAuditAppender {
+        fn snapshot(&self) -> Vec<PrivilegedAuditRecord> {
+            self.records
+                .lock()
+                .expect("captured audit records lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl PrivilegedAuditAppender for CapturingAuditAppender {
+        fn append_privileged_audit(
+            &self,
+            record: PrivilegedAuditRecord,
+        ) -> Result<(), AuditAppendError> {
+            self.records
+                .lock()
+                .expect("captured audit records lock should not be poisoned")
+                .push(record);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingAuditAppender {
+        code: &'static str,
+    }
+
+    impl PrivilegedAuditAppender for FailingAuditAppender {
+        fn append_privileged_audit(
+            &self,
+            _record: PrivilegedAuditRecord,
+        ) -> Result<(), AuditAppendError> {
+            let error = match self.code {
+                "audit_invalid_payload" => AuditAppendError::invalid_payload("invalid payload"),
+                "audit_append_constraint_violation" => {
+                    AuditAppendError::append_constraint_violation("append-only violation")
+                }
+                _ => AuditAppendError::persistence_unavailable("persistence unavailable"),
+            };
+            Err(error)
+        }
+    }
+
     fn test_app() -> Router {
+        test_app_with_audit_appender(Arc::new(CapturingAuditAppender::default()))
+    }
+
+    fn test_app_with_audit_appender(audit_appender: Arc<dyn PrivilegedAuditAppender>) -> Router {
         app_router(ControlApiState::new(
             Arc::new(GovernanceAuthorizationGuard::new(
                 AuthorizationEvaluator::default(),
             )),
             Arc::new(HeaderTokenAuthenticator),
+            audit_appender,
         ))
     }
 
@@ -237,6 +358,8 @@ mod tests {
         assert_eq!(payload["error"]["code"], "auth_missing_credentials");
         assert_eq!(payload["authentication_outcome"], "denied");
         assert_eq!(payload["correlation_id"], "corr-auth-missing-001");
+        assert_eq!(payload["actor_id"], "unauthenticated");
+        assert_eq!(payload["role"], "unknown_role");
         assert_eq!(
             payload["security_signal"]["name"],
             "unauthorized_privileged_auth_attempt_v1"
@@ -550,6 +673,9 @@ mod tests {
 
         assert_eq!(payload["error"]["code"], "auth_unknown_actor_context");
         assert_eq!(payload["authentication_outcome"], "denied");
+        assert_eq!(payload["actor_id"], "unauthenticated");
+        assert_eq!(payload["role"], "unknown_role");
+        assert_eq!(payload["correlation_id"], "unknown_correlation_id");
     }
 
     #[tokio::test]
@@ -695,6 +821,345 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn allow_path_appends_audit_record_with_required_traceability_contract() {
+        let audit_appender = Arc::new(CapturingAuditAppender::default());
+        let app = test_app_with_audit_appender(audit_appender.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-audit-allow-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let records = audit_appender.snapshot();
+        assert_eq!(
+            records.len(),
+            1,
+            "allow path should append exactly one record"
+        );
+
+        let record = &records[0];
+        assert_eq!(record.actor_id, "ops-1");
+        assert_eq!(record.role, "operational_control");
+        assert_eq!(record.action_type, "execute_control_plane_action");
+        assert_eq!(record.approval_reference, None);
+        assert_eq!(record.correlation_id, "corr-audit-allow-001");
+        assert_eq!(record.authentication_outcome, "authenticated");
+        assert_eq!(record.reason_code, "authorization_allowed");
+        assert_eq!(record.outcome, PrivilegedAuditOutcome::Allow);
+        assert_eq!(record.parameters["endpoint"], "/control/rebalance");
+        assert_eq!(record.parameters["http_method"], "POST");
+
+        let record_timestamp = OffsetDateTime::parse(&record.timestamp, &Rfc3339)
+            .expect("audit timestamp should be RFC3339 UTC");
+        let audit_latency_seconds = (OffsetDateTime::now_utc() - record_timestamp)
+            .whole_seconds()
+            .abs();
+        assert!(
+            audit_latency_seconds <= 5,
+            "audit record timestamp should be within FR32/NFR9 latency bounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_and_authentication_failure_paths_append_expected_audit_outcomes() {
+        let audit_appender = Arc::new(CapturingAuditAppender::default());
+        let app = test_app_with_audit_appender(audit_appender.clone());
+
+        let denied_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("analytics-reader", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-audit-deny-001")
+                    .body(Body::empty())
+                    .expect("deny request should build"),
+            )
+            .await
+            .expect("deny request should complete");
+        assert_eq!(denied_response.status(), StatusCode::FORBIDDEN);
+
+        let auth_failure_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header("x-correlation-id", "corr-audit-auth-deny-001")
+                    .body(Body::empty())
+                    .expect("auth-failure request should build"),
+            )
+            .await
+            .expect("auth-failure request should complete");
+        assert_eq!(auth_failure_response.status(), StatusCode::UNAUTHORIZED);
+
+        let records = audit_appender.snapshot();
+        assert_eq!(
+            records.len(),
+            2,
+            "deny and auth-failure paths should append one record each"
+        );
+
+        assert_eq!(
+            records[0].outcome,
+            PrivilegedAuditOutcome::AuthorizationDenied
+        );
+        assert_eq!(records[0].reason_code, "authorization_denied");
+        assert_eq!(
+            records[1].outcome,
+            PrivilegedAuditOutcome::AuthenticationDenied
+        );
+        assert_eq!(records[1].reason_code, "auth_missing_credentials");
+    }
+
+    #[tokio::test]
+    async fn allow_path_is_fail_closed_when_audit_append_is_unavailable() {
+        let app = test_app_with_audit_appender(Arc::new(FailingAuditAppender {
+            code: "audit_persistence_unavailable",
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-audit-fail-allow-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "audit_persistence_unavailable");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+        assert_eq!(payload["authentication_outcome"], "authenticated");
+    }
+
+    #[tokio::test]
+    async fn audit_invalid_payload_returns_explicit_machine_readable_error() {
+        let app = test_app_with_audit_appender(Arc::new(FailingAuditAppender {
+            code: "audit_invalid_payload",
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-audit-invalid-payload-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "audit_invalid_payload");
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_returns_explicit_audit_append_error_when_append_fails() {
+        let app = test_app_with_audit_appender(Arc::new(FailingAuditAppender {
+            code: "audit_append_constraint_violation",
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header("x-correlation-id", "corr-audit-auth-fail-append-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["code"],
+            "audit_append_constraint_violation"
+        );
+        assert_eq!(payload["action"], "execute_control_plane_action");
+        assert_eq!(payload["authentication_outcome"], "denied");
+    }
+
+    #[tokio::test]
+    async fn denied_path_returns_explicit_audit_append_error_when_append_fails() {
+        let app = test_app_with_audit_appender(Arc::new(FailingAuditAppender {
+            code: "audit_append_constraint_violation",
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("analytics-reader", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-audit-deny-append-fail-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "audit_append_constraint_violation");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+        assert_eq!(payload["actor_id"], "analytics-reader");
+        assert_eq!(payload["role"], "read_only_analytics");
+        assert_eq!(payload["authentication_outcome"], "authenticated");
+        assert_eq!(payload["correlation_id"], "corr-audit-deny-append-fail-001");
+    }
+
+    #[tokio::test]
+    async fn terminal_paths_append_redacted_records_with_nullable_approval_reference() {
+        let audit_appender = Arc::new(CapturingAuditAppender::default());
+        let app = test_app_with_audit_appender(audit_appender.clone());
+
+        let allow_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-audit-terminal-allow-001")
+                    .body(Body::empty())
+                    .expect("allow request should build"),
+            )
+            .await
+            .expect("allow request should complete");
+        assert_eq!(allow_response.status(), StatusCode::ACCEPTED);
+
+        let deny_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("analytics-reader", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-audit-terminal-deny-001")
+                    .body(Body::empty())
+                    .expect("deny request should build"),
+            )
+            .await
+            .expect("deny request should complete");
+        assert_eq!(deny_response.status(), StatusCode::FORBIDDEN);
+
+        let auth_failure_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header("x-correlation-id", "corr-audit-terminal-auth-deny-001")
+                    .body(Body::empty())
+                    .expect("auth-deny request should build"),
+            )
+            .await
+            .expect("auth-deny request should complete");
+        assert_eq!(auth_failure_response.status(), StatusCode::UNAUTHORIZED);
+
+        let records = audit_appender.snapshot();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].outcome, PrivilegedAuditOutcome::Allow);
+        assert_eq!(
+            records[1].outcome,
+            PrivilegedAuditOutcome::AuthorizationDenied
+        );
+        assert_eq!(
+            records[2].outcome,
+            PrivilegedAuditOutcome::AuthenticationDenied
+        );
+        assert_eq!(records[2].actor_id, "unauthenticated");
+        assert_eq!(records[2].role, "unknown_role");
+        assert_eq!(
+            records[2].correlation_id,
+            "corr-audit-terminal-auth-deny-001"
+        );
+
+        for record in records {
+            assert_eq!(record.action_type, "execute_control_plane_action");
+            assert_eq!(record.approval_reference, None);
+
+            let parameters = record
+                .parameters
+                .as_object()
+                .expect("audit parameters should always be a JSON object");
+            assert!(parameters.contains_key("endpoint"));
+            assert!(parameters.contains_key("http_method"));
+            assert!(
+                !parameters.keys().any(|key| key.contains("token")
+                    || key.contains("secret")
+                    || key == "authorization"),
+                "audit parameters must not include plaintext secret-like keys"
+            );
+            assert!(
+                !record.parameters.to_string().contains("Bearer "),
+                "audit parameters must never contain bearer tokens"
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct FailingAuthenticator;
 
@@ -734,6 +1199,7 @@ mod tests {
                 AuthorizationEvaluator::default(),
             )),
             Arc::new(FailingAuthenticator),
+            Arc::new(CapturingAuditAppender::default()),
         ));
 
         let response = app
@@ -770,6 +1236,7 @@ mod tests {
         let app = test_app_with_state(ControlApiState::new(
             Arc::new(PanicAuthorizationGuard),
             Arc::new(HeaderTokenAuthenticator),
+            Arc::new(CapturingAuditAppender::default()),
         ));
 
         let response = app

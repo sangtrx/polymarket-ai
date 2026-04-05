@@ -1,25 +1,26 @@
 # Test Automation Summary
 
 ## Story
-- 1-3-add-authenticated-control-middleware
+
+- 1-4-implement-immutable-privileged-audit-logging
 
 ## Generated Tests
 
 ### API Tests
-- [x] `services/control-api/src/routes/mod.rs` — `invalid_correlation_id_format_rejects_privileged_request_with_machine_readable_error` validates malformed `x-correlation-id` boundary rejection with explicit machine-readable auth error and alert-compatible security signal.
-- [x] `services/control-api/src/routes/mod.rs` — `authenticator_adapter_failure_is_fail_closed` verifies adapter failure remains fail-closed and returns `auth_verification_failed` without privileged side effects.
+
+- [x] `services/control-api/src/routes/mod.rs` — `denied_path_returns_explicit_audit_append_error_when_append_fails` validates authorization-denied terminal paths return explicit machine-readable audit append errors (`audit_append_constraint_violation`) instead of silently dropping privileged-action evidence.
 
 ### E2E Tests
-- [x] `services/control-api/src/routes/mod.rs` — `administrative_actions_role_allow_path_includes_timestamp_traceability` validates authenticated privileged happy path for administrative actors, including response traceability evidence.
-- [x] `services/control-api/src/routes/mod.rs` — `role_boundary_matrix_is_deterministic_for_control_rebalance` validates end-to-end privileged role-boundary determinism across read-only, operational-control, and administrative actors.
+
+- [x] `services/control-api/src/routes/mod.rs` — `terminal_paths_append_redacted_records_with_nullable_approval_reference` validates end-to-end allow/deny/auth-denial flows append immutable records with nullable `approval_reference` and secret-safe parameter boundaries.
 
 ## Coverage
-- API privileged authentication rejection boundaries covered: 9/9 (`missing_credentials`, `malformed_credentials`, `expired_credentials`, `invalid_credentials`, `unknown_actor_context` via invalid actor/correlation role context, and adapter `verification_failed` fail-closed path).
-- E2E privileged access workflows covered: 4/4 critical role outcomes (read-only denied, operational-control allowed, administrative-actions allowed, unauthenticated pre-execution rejection).
-- Traceability evidence coverage: denied and allowed payload paths validate actor, role, action, correlation, auth outcome, machine-readable error metadata, and RFC3339 UTC timestamps.
+
+- API terminal path coverage: 3/3 critical outcomes validated (`allow`, `authorization_denied`, `authentication_denied`) with append evidence on each path.
+- API append-failure handling coverage: 3/3 machine-readable failure classes validated across privileged outcomes (`audit_invalid_payload`, `audit_append_constraint_violation`, `audit_persistence_unavailable`).
+- UI features: N/A (story scope is control-plane API and governance audit persistence only).
 
 ## Execution Result
-- `cargo fmt --all` ✅
-- `npm run rust:lint` ✅
+
 - `cargo test -p control-api routes::tests::` ✅
-- `npm test` ✅
+- `npm run ci:rust` ✅

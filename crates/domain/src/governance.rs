@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -331,6 +332,93 @@ impl AuthorizationDecision {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegedAuditOutcome {
+    Allow,
+    AuthorizationDenied,
+    AuthenticationDenied,
+}
+
+impl PrivilegedAuditOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::AuthorizationDenied => "authorization_denied",
+            Self::AuthenticationDenied => "authentication_denied",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrivilegedAuditRecord {
+    pub actor_id: String,
+    pub role: String,
+    pub action_type: String,
+    pub parameters: Value,
+    pub approval_reference: Option<String>,
+    pub timestamp: String,
+    pub outcome: PrivilegedAuditOutcome,
+    pub reason_code: String,
+    pub authentication_outcome: String,
+    pub correlation_id: String,
+}
+
+impl PrivilegedAuditRecord {
+    pub fn from_authorization_decision(
+        decision: &AuthorizationDecision,
+        authentication_outcome: &str,
+        parameters: Value,
+    ) -> Self {
+        let outcome = match decision.outcome {
+            AuthorizationOutcome::Allow => PrivilegedAuditOutcome::Allow,
+            AuthorizationOutcome::Deny => PrivilegedAuditOutcome::AuthorizationDenied,
+        };
+
+        Self {
+            actor_id: decision.actor_id.clone(),
+            role: decision.role.clone(),
+            action_type: decision.action.clone(),
+            parameters,
+            approval_reference: None,
+            timestamp: decision.timestamp_utc.clone(),
+            outcome,
+            reason_code: decision.reason.code().to_string(),
+            authentication_outcome: authentication_outcome.to_string(),
+            correlation_id: decision.correlation_id.clone(),
+        }
+    }
+
+    pub fn from_authentication_denial(
+        actor_id: Option<&str>,
+        role: Option<&str>,
+        action_type: &str,
+        reason_code: &str,
+        correlation_id: &str,
+        timestamp: &str,
+        parameters: Value,
+    ) -> Self {
+        Self {
+            actor_id: actor_id
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("unauthenticated")
+                .to_string(),
+            role: role
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("unknown_role")
+                .to_string(),
+            action_type: action_type.to_string(),
+            parameters,
+            approval_reference: None,
+            timestamp: timestamp.to_string(),
+            outcome: PrivilegedAuditOutcome::AuthenticationDenied,
+            reason_code: reason_code.to_string(),
+            authentication_outcome: "denied".to_string(),
+            correlation_id: correlation_id.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthorizationRequest {
     pub actor_id: String,
@@ -422,6 +510,7 @@ fn timestamp_utc() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn canonical_matrix_has_expected_permissions_for_all_roles() {
@@ -609,5 +698,60 @@ mod tests {
 
         let parsed = OffsetDateTime::parse(&decision.timestamp_utc, &Rfc3339);
         assert!(parsed.is_ok(), "timestamp should be RFC3339 UTC");
+    }
+
+    #[test]
+    fn privileged_audit_record_maps_authorization_decision_context() {
+        let evaluator = AuthorizationEvaluator::default();
+        let decision = evaluator.evaluate(&AuthorizationRequest {
+            actor_id: "ops-user".to_string(),
+            role: "operational_control".to_string(),
+            action: "execute_control_plane_action".to_string(),
+            correlation_id: "corr-audit-map-001".to_string(),
+        });
+
+        let record = PrivilegedAuditRecord::from_authorization_decision(
+            &decision,
+            "authenticated",
+            json!({
+                "endpoint": "/control/rebalance",
+                "http_method": "POST",
+            }),
+        );
+
+        assert_eq!(record.actor_id, "ops-user");
+        assert_eq!(record.role, "operational_control");
+        assert_eq!(record.action_type, "execute_control_plane_action");
+        assert_eq!(record.approval_reference, None);
+        assert_eq!(record.authentication_outcome, "authenticated");
+        assert_eq!(record.reason_code, "authorization_allowed");
+        assert_eq!(record.outcome, PrivilegedAuditOutcome::Allow);
+        assert!(record.parameters.is_object());
+        let parsed = OffsetDateTime::parse(&record.timestamp, &Rfc3339);
+        assert!(parsed.is_ok(), "audit timestamp should be RFC3339 UTC");
+    }
+
+    #[test]
+    fn authentication_denial_audit_record_uses_safe_identity_defaults() {
+        let record = PrivilegedAuditRecord::from_authentication_denial(
+            None,
+            None,
+            "execute_control_plane_action",
+            "auth_missing_credentials",
+            "corr-auth-deny-audit-001",
+            "2026-04-04T23:59:59Z",
+            json!({
+                "endpoint": "/control/rebalance",
+                "http_method": "POST",
+            }),
+        );
+
+        assert_eq!(record.actor_id, "unauthenticated");
+        assert_eq!(record.role, "unknown_role");
+        assert_eq!(record.action_type, "execute_control_plane_action");
+        assert_eq!(record.reason_code, "auth_missing_credentials");
+        assert_eq!(record.timestamp, "2026-04-04T23:59:59Z");
+        assert_eq!(record.authentication_outcome, "denied");
+        assert_eq!(record.outcome, PrivilegedAuditOutcome::AuthenticationDenied);
     }
 }

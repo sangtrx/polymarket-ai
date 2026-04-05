@@ -74,13 +74,29 @@ Authentication denials return machine-readable envelope fields under `error.code
 
 ## Story 1.4 immutable audit handoff expectations
 
-Story 1.4 must append immutable audit records using authenticated identity context already emitted by the control-plane boundary:
+Story 1.4 appends immutable `audit_log_append` records using authenticated boundary context from the control API.
+
+Canonical audit payload contract:
 
 - `actor_id`
 - `role`
+- `action_type`
+- `parameters` (JSON object; sensitive keys redacted before append)
+- `approval_reference` (nullable until Story 1.5 dual-approval rollout)
+- `timestamp` (RFC3339 UTC)
+- `outcome` (`allow`, `authorization_denied`, `authentication_denied`)
+- `reason_code` (machine-readable auth/authz decision code)
 - `correlation_id`
 - `authentication_outcome`
-- auth/authorization decision codes
-- RFC3339 UTC decision timestamp
 
-The append pipeline should consume these authenticated context fields directly and must not re-introduce raw caller-supplied identity trust.
+Operational guardrails:
+
+1. Append-only immutability is enforced in schema with update/delete prevention triggers.
+2. Privileged allow paths are fail-closed if audit persistence cannot append.
+3. Audit append failures return explicit machine-readable error codes (`audit_invalid_payload`, `audit_persistence_unavailable`, `audit_append_constraint_violation`).
+4. Control-path telemetry and audit evidence include actor, role, action, outcome, reason, timestamp, and correlation metadata for QA/incident forensics.
+
+Story handoff dependencies:
+
+1. Story 1.5 should populate `approval_reference` for dual-approval workflows (never inferred in Story 1.4).
+2. Story 4 reporting/incident consumers should treat `audit_log_append` as immutable source-of-truth for privileged-action trace reconstruction.

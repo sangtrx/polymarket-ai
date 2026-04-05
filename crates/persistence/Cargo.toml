@@ -8,4 +8,6 @@ authors.workspace = true
 [dependencies]
 common = { path = "../common" }
 domain = { path = "../domain" }
+serde_json.workspace = true
 sqlx.workspace = true
+time.workspace = true

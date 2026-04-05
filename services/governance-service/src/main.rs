@@ -1,9 +1,5 @@
-mod approvals;
-mod audit;
-mod rbac;
-
 use common::time::timestamp_utc;
-use rbac::GovernanceAuthorizationService;
+use governance_service::rbac::GovernanceAuthorizationService;
 
 #[tokio::main]
 async fn main() {

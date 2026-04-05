@@ -1273,6 +1273,7 @@ dependencies = [
  "axum",
  "common",
  "domain",
+ "governance-service",
  "serde",
  "serde_json",
  "time",
@@ -1537,6 +1538,7 @@ name = "domain"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "time",
 ]
 
@@ -1956,6 +1958,8 @@ dependencies = [
  "common",
  "domain",
  "serde",
+ "serde_json",
+ "time",
  "tokio",
 ]
 
@@ -2841,7 +2845,9 @@ version = "0.1.0"
 dependencies = [
  "common",
  "domain",
+ "serde_json",
  "sqlx",
+ "time",
 ]
 
 [[package]]

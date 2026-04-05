@@ -7,8 +7,9 @@ use axum::{
 };
 use domain::governance::{
     AuthorizationDecision, AuthorizationEvaluator, AuthorizationRequest, ControlAction,
-    GovernanceRole,
+    GovernanceRole, PrivilegedAuditRecord,
 };
+use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -202,16 +203,19 @@ impl AuthorizationGuard for GovernanceAuthorizationGuard {
 pub struct ControlApiState {
     pub authorization_guard: Arc<dyn AuthorizationGuard>,
     pub authenticator: Arc<dyn Authenticator>,
+    pub audit_appender: Arc<dyn PrivilegedAuditAppender>,
 }
 
 impl ControlApiState {
     pub fn new(
         authorization_guard: Arc<dyn AuthorizationGuard>,
         authenticator: Arc<dyn Authenticator>,
+        audit_appender: Arc<dyn PrivilegedAuditAppender>,
     ) -> Self {
         Self {
             authorization_guard,
             authenticator,
+            audit_appender,
         }
     }
 }
@@ -241,9 +245,27 @@ pub async fn require_authenticated_actor(
         Err(error) => {
             let error = *error;
             let timestamp_utc = timestamp_utc();
-            let actor_id = error.actor_id.clone().unwrap_or_default();
-            let role = error.role.clone().unwrap_or_default();
-            let correlation_id = error.correlation_id.clone().unwrap_or_default();
+            let actor_id = error
+                .actor_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unauthenticated")
+                .to_string();
+            let role = error
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown_role")
+                .to_string();
+            let correlation_id = error
+                .correlation_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown_correlation_id")
+                .to_string();
             let decision_code = error.code.code();
 
             emit_authentication_telemetry(AuthenticationTelemetryEvent {
@@ -258,6 +280,37 @@ pub async fn require_authenticated_actor(
                 decision_code,
                 timestamp_utc: &timestamp_utc,
             });
+
+            let audit_record = PrivilegedAuditRecord::from_authentication_denial(
+                Some(&actor_id),
+                Some(&role),
+                ControlAction::ExecuteControlPlaneAction.as_str(),
+                decision_code,
+                &correlation_id,
+                &timestamp_utc,
+                json!({
+                    "endpoint": "/control/rebalance",
+                    "http_method": "POST",
+                    "decision_code": decision_code,
+                }),
+            );
+
+            if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+                return audit_append_failure_response(
+                    audit_error,
+                    AuditAppendFailureContext {
+                        action: ControlAction::ExecuteControlPlaneAction
+                            .as_str()
+                            .to_string(),
+                        actor_id,
+                        role,
+                        correlation_id,
+                        authentication_outcome: AuthenticationOutcome::Denied.as_str(),
+                        timestamp_utc,
+                        attempted_decision_code: Some(decision_code.to_string()),
+                    },
+                );
+            }
 
             (
                 error.code.status_code(),
@@ -283,6 +336,54 @@ pub async fn require_authenticated_actor(
                 .into_response()
         }
     }
+}
+
+pub(crate) fn audit_append_failure_status(code: &str) -> StatusCode {
+    match code {
+        "audit_invalid_payload" => StatusCode::BAD_REQUEST,
+        "audit_append_constraint_violation" => StatusCode::CONFLICT,
+        "audit_persistence_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn audit_append_failure_response(
+    audit_error: AuditAppendError,
+    context: AuditAppendFailureContext,
+) -> Response {
+    let details = context.attempted_decision_code.map(|decision_code| {
+        json!({
+            "attempted_decision_code": decision_code,
+        })
+    });
+
+    (
+        audit_append_failure_status(audit_error.code),
+        Json(AuditAppendFailureEnvelope {
+            error: AuditAppendFailureBody {
+                code: audit_error.code,
+                message: audit_error.message,
+                details,
+            },
+            action: context.action,
+            actor_id: context.actor_id,
+            role: context.role,
+            correlation_id: context.correlation_id,
+            authentication_outcome: context.authentication_outcome,
+            timestamp_utc: context.timestamp_utc,
+        }),
+    )
+        .into_response()
+}
+
+struct AuditAppendFailureContext {
+    action: String,
+    actor_id: String,
+    role: String,
+    correlation_id: String,
+    authentication_outcome: &'static str,
+    timestamp_utc: String,
+    attempted_decision_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +604,25 @@ struct AuthenticationSecuritySignal {
     severity: &'static str,
     alert_compatible: bool,
     alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditAppendFailureEnvelope {
+    error: AuditAppendFailureBody,
+    action: String,
+    actor_id: String,
+    role: String,
+    correlation_id: String,
+    authentication_outcome: &'static str,
+    timestamp_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditAppendFailureBody {
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
