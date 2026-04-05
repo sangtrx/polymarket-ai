@@ -1691,6 +1691,8 @@ dependencies = [
  "common",
  "domain",
  "polymarket-client-sdk",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -3451,6 +3453,8 @@ version = "0.1.0"
 dependencies = [
  "common",
  "domain",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

@@ -190,3 +190,25 @@ Governance continuity expectations during rotation:
 2. Rotation denial/failure paths are fail-closed; current credentials remain active.
 3. Rotation evidence includes actor, trigger type, credential scope, outcome/state, reason code, correlation id, timestamp, and rotation reference (when successful).
 4. Secret material is never accepted in metadata payloads or persisted records; only references/metadata are allowed.
+
+## Story 2.1 market policy profile + cluster toggle controls
+
+Story 2.1 introduces authenticated market policy mutation boundaries:
+
+1. `POST /control/market-policy/profiles/{cluster_id}`
+2. `POST /control/market-policy/clusters/{cluster_id}/toggle`
+
+Authorization requirements remain unchanged from prior privileged workflows:
+
+1. `operational_control` and `administrative_actions` may execute mutations.
+2. `read_only_analytics` remains deny-only for control-plane mutation actions.
+
+Deterministic machine-readable market policy reason/error codes include:
+
+- `market_policy_profile_updated`
+- `market_policy_cluster_enabled`
+- `market_policy_cluster_disabled_by_operator`
+- `market_policy_cluster_disabled`
+- `market_policy_invalid_payload`
+- `market_policy_state_unavailable`
+- `market_policy_persistence_unavailable`

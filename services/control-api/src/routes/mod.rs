@@ -15,6 +15,7 @@ use domain::governance::{
     CredentialRotationEvidence, CredentialRotationReasonCode, PrivilegedAuditOutcome,
     PrivilegedAuditRecord,
 };
+use domain::risk::{MarketPolicyReasonCode, MarketPolicyValidationIssue};
 use governance_service::approvals::{
     EvaluateApprovalExecutionInput, RecordApprovalVoteInput, SubmitApprovalRequestInput,
 };
@@ -22,6 +23,7 @@ use governance_service::audit::AuditAppendError;
 use governance_service::credentials::{
     TriggerEmergencyRotationInput, TriggerScheduledRotationInput,
 };
+use governance_service::market_policy::{ToggleMarketClusterInput, UpsertMarketPolicyProfileInput};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -63,12 +65,26 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let market_policy_routes = Router::new()
+        .route(
+            "/control/market-policy/profiles/{cluster_id}",
+            post(update_market_policy_profile),
+        )
+        .route(
+            "/control/market-policy/clusters/{cluster_id}/toggle",
+            post(toggle_market_policy_cluster),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
         .merge(privileged_routes)
         .merge(critical_routes)
         .merge(credential_rotation_routes)
+        .merge(market_policy_routes)
         .with_state(state)
 }
 
@@ -351,6 +367,89 @@ pub async fn trigger_emergency_credential_rotation(
     };
 
     credential_rotation_response(&state, &actor, decision, endpoint.to_string())
+}
+
+pub async fn update_market_policy_profile(
+    State(state): State<ControlApiState>,
+    Path(cluster_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<MarketPolicyProfilePayload>,
+) -> Response {
+    let endpoint = format!("/control/market-policy/profiles/{cluster_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision = match state
+        .market_policy_orchestrator
+        .upsert_market_policy_profile(UpsertMarketPolicyProfileInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            cluster_id,
+            min_liquidity_usd: payload.min_liquidity_usd,
+            max_spread_bps: payload.max_spread_bps,
+            min_reward_score: payload.min_reward_score,
+            max_exposure_pct_nav: payload.max_exposure_pct_nav,
+            correlation_id: actor.correlation_id.clone(),
+            updated_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return market_policy_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "market_policy_profile_update",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    market_policy_profile_response(&state, &actor, decision, endpoint)
+}
+
+pub async fn toggle_market_policy_cluster(
+    State(state): State<ControlApiState>,
+    Path(cluster_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<MarketClusterTogglePayload>,
+) -> Response {
+    let endpoint = format!("/control/market-policy/clusters/{cluster_id}/toggle");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision =
+        match state
+            .market_policy_orchestrator
+            .toggle_market_cluster(ToggleMarketClusterInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                cluster_id,
+                is_enabled: payload.is_enabled,
+                reason_code: payload.reason_code,
+                correlation_id: actor.correlation_id.clone(),
+                updated_at_utc: authorization.timestamp_utc.clone(),
+            }) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return market_policy_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "market_policy_cluster_toggle",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+
+    market_policy_cluster_toggle_response(&state, &actor, decision, endpoint)
 }
 
 fn authorize_critical_action(
@@ -778,6 +877,185 @@ fn credential_rotation_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn market_policy_profile_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: governance_service::market_policy::MarketPolicyProfileEvidence,
+    endpoint: String,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "market_policy_profile_update".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+            "cluster_id": decision.cluster_id,
+            "min_liquidity_usd": decision.min_liquidity_usd,
+            "max_spread_bps": decision.max_spread_bps,
+            "min_reward_score": decision.min_reward_score,
+            "max_exposure_pct_nav": decision.max_exposure_pct_nav,
+        }),
+        approval_reference: None,
+        timestamp: decision.updated_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: decision.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: decision.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "market_policy_profile_update".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.updated_at_utc,
+        );
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(MarketPolicyProfileDecisionResponse {
+            status: "accepted",
+            error_code: None,
+            message: None,
+            cluster_id: decision.cluster_id,
+            min_liquidity_usd: decision.min_liquidity_usd,
+            max_spread_bps: decision.max_spread_bps,
+            min_reward_score: decision.min_reward_score,
+            max_exposure_pct_nav: decision.max_exposure_pct_nav,
+            actor_id: decision.actor_id,
+            role: actor.role.clone(),
+            reason_code: decision.reason_code,
+            correlation_id: decision.correlation_id,
+            timestamp_utc: decision.updated_at_utc,
+            security_signal: None,
+        }),
+    )
+        .into_response()
+}
+
+fn market_policy_cluster_toggle_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: governance_service::market_policy::MarketClusterToggleEvidence,
+    endpoint: String,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "market_policy_cluster_toggle".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+            "cluster_id": decision.cluster_id,
+            "is_enabled": decision.is_enabled,
+        }),
+        approval_reference: None,
+        timestamp: decision.updated_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: decision.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: decision.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "market_policy_cluster_toggle".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.updated_at_utc,
+        );
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(MarketPolicyClusterToggleDecisionResponse {
+            status: "accepted",
+            error_code: None,
+            message: None,
+            cluster_id: decision.cluster_id,
+            is_enabled: decision.is_enabled,
+            actor_id: decision.actor_id,
+            role: actor.role.clone(),
+            reason_code: decision.reason_code,
+            correlation_id: decision.correlation_id,
+            timestamp_utc: decision.updated_at_utc,
+            security_signal: None,
+        }),
+    )
+        .into_response()
+}
+
+fn market_policy_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<MarketPolicyValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let security_signal = if error_code == "market_policy_unauthorized_role" {
+        Some(MarketPolicySecuritySignal {
+            name: "unauthorized_market_policy_mutation_attempt_v1",
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        market_policy_service_error_status(error_code),
+        axum::Json(MarketPolicyServiceErrorResponse {
+            error_code,
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| MarketPolicyFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+            security_signal,
+        }),
+    )
+        .into_response()
+}
+
+fn market_policy_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == MarketPolicyReasonCode::InvalidPayload.code()
+            || code == MarketPolicyReasonCode::InvalidClusterId.code()
+            || code == MarketPolicyReasonCode::InvalidThreshold.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        "market_policy_unauthorized_role" => StatusCode::FORBIDDEN,
+        "market_policy_constraint_violation" => StatusCode::CONFLICT,
+        code if code == MarketPolicyReasonCode::PersistenceUnavailable.code()
+            || code == "market_policy_query_failed"
+            || code == "market_policy_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn critical_approval_audit_outcome(
     outcome: ApprovalDecisionOutcome,
 ) -> Option<PrivilegedAuditOutcome> {
@@ -1072,6 +1350,20 @@ fn default_rotation_metadata() -> serde_json::Value {
     json!({})
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MarketPolicyProfilePayload {
+    pub min_liquidity_usd: f64,
+    pub max_spread_bps: f64,
+    pub min_reward_score: f64,
+    pub max_exposure_pct_nav: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarketClusterTogglePayload {
+    pub is_enabled: bool,
+    pub reason_code: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CredentialRotationDecisionResponse {
     pub status: &'static str,
@@ -1117,6 +1409,76 @@ pub struct CredentialRotationSecuritySignal {
     pub alert_target_seconds: u16,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MarketPolicyProfileDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub cluster_id: String,
+    pub min_liquidity_usd: f64,
+    pub max_spread_bps: f64,
+    pub min_reward_score: f64,
+    pub max_exposure_pct_nav: f64,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<MarketPolicySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarketPolicyClusterToggleDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub cluster_id: String,
+    pub is_enabled: bool,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<MarketPolicySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarketPolicyServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<MarketPolicyFieldError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<MarketPolicySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarketPolicyFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarketPolicySecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,7 +1495,15 @@ mod tests {
         AuthorizationDecision, AuthorizationEvaluator, ControlAction, PrivilegedAuditOutcome,
         PrivilegedAuditRecord,
     };
-    use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
+    use governance_service::{
+        approvals::GovernanceApprovalService,
+        audit::{AuditAppendError, PrivilegedAuditAppender},
+        credentials::CredentialRotationService,
+        market_policy::{
+            MarketClusterToggleEvidence, MarketPolicyOrchestrator, MarketPolicyProfileEvidence,
+            MarketPolicyServiceError, ToggleMarketClusterInput, UpsertMarketPolicyProfileInput,
+        },
+    };
     use std::sync::{Arc, Mutex};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tower::ServiceExt;
@@ -1206,6 +1576,86 @@ mod tests {
 
     fn test_app_with_state(state: ControlApiState) -> Router {
         app_router(state)
+    }
+
+    #[derive(Debug, Default)]
+    struct StubMarketPolicyOrchestrator {
+        profile_error: Option<(&'static str, &'static str)>,
+        toggle_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl MarketPolicyOrchestrator for StubMarketPolicyOrchestrator {
+        fn upsert_market_policy_profile(
+            &self,
+            input: UpsertMarketPolicyProfileInput,
+        ) -> Result<MarketPolicyProfileEvidence, MarketPolicyServiceError> {
+            if let Some((code, message)) = self.profile_error {
+                return Err(MarketPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            let normalized_cluster = input.cluster_id.trim().to_lowercase();
+            Ok(MarketPolicyProfileEvidence {
+                profile_id: format!("policy::{normalized_cluster}"),
+                cluster_id: normalized_cluster,
+                min_liquidity_usd: input.min_liquidity_usd,
+                max_spread_bps: input.max_spread_bps,
+                min_reward_score: input.min_reward_score,
+                max_exposure_pct_nav: input.max_exposure_pct_nav,
+                is_active: true,
+                actor_id: input.actor_id,
+                correlation_id: input.correlation_id,
+                reason_code: "market_policy_profile_updated".to_string(),
+                updated_at_utc: input.updated_at_utc,
+            })
+        }
+
+        fn toggle_market_cluster(
+            &self,
+            input: ToggleMarketClusterInput,
+        ) -> Result<MarketClusterToggleEvidence, MarketPolicyServiceError> {
+            if let Some((code, message)) = self.toggle_error {
+                return Err(MarketPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            let default_reason = if input.is_enabled {
+                "market_policy_cluster_enabled"
+            } else {
+                "market_policy_cluster_disabled_by_operator"
+            };
+            Ok(MarketClusterToggleEvidence {
+                cluster_id: input.cluster_id.trim().to_lowercase(),
+                is_enabled: input.is_enabled,
+                actor_id: input.actor_id,
+                correlation_id: input.correlation_id,
+                reason_code: input
+                    .reason_code
+                    .unwrap_or_else(|| default_reason.to_string()),
+                updated_at_utc: input.updated_at_utc,
+            })
+        }
+    }
+
+    fn test_app_with_market_policy_orchestrator(
+        market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
+    ) -> Router {
+        test_app_with_state(ControlApiState::with_all_orchestrators(
+            Arc::new(GovernanceAuthorizationGuard::new(
+                AuthorizationEvaluator::default(),
+            )),
+            Arc::new(HeaderTokenAuthenticator),
+            Arc::new(CapturingAuditAppender::default()),
+            Arc::new(GovernanceApprovalService::default()),
+            Arc::new(CredentialRotationService::default()),
+            market_policy_orchestrator,
+        ))
     }
 
     #[tokio::test]
@@ -3041,6 +3491,333 @@ mod tests {
             payload["reason_code"],
             "credential_rotation_runtime_unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn market_policy_profile_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/profiles/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "min_liquidity_usd":500.0,
+                            "max_spread_bps":2.5,
+                            "min_reward_score":0.2,
+                            "max_exposure_pct_nav":25.0
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn market_policy_profile_route_returns_machine_readable_success_evidence() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/profiles/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-profile-accept-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "min_liquidity_usd":500.0,
+                            "max_spread_bps":2.5,
+                            "min_reward_score":0.2,
+                            "max_exposure_pct_nav":25.0
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["cluster_id"], "cluster_alpha");
+        assert_eq!(payload["reason_code"], "market_policy_profile_updated");
+        assert_eq!(payload["actor_id"], "ops-1");
+        assert!(payload["error_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn market_policy_profile_route_rejects_invalid_threshold_payload_with_field_errors() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/profiles/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-invalid-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "min_liquidity_usd":500.0,
+                            "max_spread_bps":2.5,
+                            "min_reward_score":0.2,
+                            "max_exposure_pct_nav":100.1
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "market_policy_invalid_payload");
+        assert_eq!(payload["action"], "market_policy_profile_update");
+        assert_eq!(payload["field_errors"][0]["field"], "max_exposure_pct_nav");
+        assert!(payload["security_signal"].is_null());
+    }
+
+    #[tokio::test]
+    async fn market_policy_profile_route_surfaces_service_unavailable_machine_error() {
+        let app =
+            test_app_with_market_policy_orchestrator(Arc::new(StubMarketPolicyOrchestrator {
+                profile_error: Some((
+                    "market_policy_persistence_unavailable",
+                    "market policy repository unavailable",
+                )),
+                ..Default::default()
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/profiles/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-profile-failure-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "min_liquidity_usd":500.0,
+                            "max_spread_bps":2.5,
+                            "min_reward_score":0.2,
+                            "max_exposure_pct_nav":25.0
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            "market_policy_persistence_unavailable"
+        );
+        assert_eq!(payload["action"], "market_policy_profile_update");
+    }
+
+    #[tokio::test]
+    async fn market_policy_profile_route_surfaces_unknown_service_error_as_internal_server_error() {
+        let app =
+            test_app_with_market_policy_orchestrator(Arc::new(StubMarketPolicyOrchestrator {
+                profile_error: Some(("market_policy_unclassified_failure", "opaque failure")),
+                ..Default::default()
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/profiles/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-profile-failure-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "min_liquidity_usd":500.0,
+                            "max_spread_bps":2.5,
+                            "min_reward_score":0.2,
+                            "max_exposure_pct_nav":25.0
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "market_policy_unclassified_failure");
+        assert_eq!(payload["action"], "market_policy_profile_update");
+    }
+
+    #[tokio::test]
+    async fn market_policy_cluster_toggle_route_supports_runtime_state_updates_without_redeploy() {
+        let app = test_app();
+        let disable_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/clusters/cluster_alpha/toggle")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-toggle-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "is_enabled": false,
+                            "reason_code": "market_policy_cluster_disabled_by_operator"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(disable_response.status(), StatusCode::ACCEPTED);
+        let disable_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(disable_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            disable_payload["reason_code"],
+            "market_policy_cluster_disabled_by_operator"
+        );
+        assert_eq!(disable_payload["is_enabled"], false);
+
+        let enable_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/clusters/cluster_alpha/toggle")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-toggle-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "is_enabled": true,
+                            "reason_code": "market_policy_cluster_enabled"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(enable_response.status(), StatusCode::ACCEPTED);
+        let enable_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(enable_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            enable_payload["reason_code"],
+            "market_policy_cluster_enabled"
+        );
+        assert_eq!(enable_payload["is_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn market_policy_cluster_toggle_route_surfaces_conflict_machine_error() {
+        let app =
+            test_app_with_market_policy_orchestrator(Arc::new(StubMarketPolicyOrchestrator {
+                toggle_error: Some((
+                    "market_policy_constraint_violation",
+                    "active profile state prevents this toggle",
+                )),
+                ..Default::default()
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/clusters/cluster_alpha/toggle")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-policy-toggle-failure-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "is_enabled": false,
+                            "reason_code": "market_policy_cluster_disabled_by_operator"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "market_policy_constraint_violation");
+        assert_eq!(payload["action"], "market_policy_cluster_toggle");
     }
 
     #[derive(Debug)]
