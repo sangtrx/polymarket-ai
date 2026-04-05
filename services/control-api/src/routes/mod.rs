@@ -11,13 +11,17 @@ use axum::{
 };
 use domain::governance::{
     ApprovalDecisionEvidence, ApprovalDecisionOutcome, ApprovalReasonCode, AuthorizationDecision,
-    AuthorizationOutcome, AuthorizationReason, ControlAction, PrivilegedAuditOutcome,
+    AuthorizationOutcome, AuthorizationReason, ControlAction, CredentialRotationDecisionOutcome,
+    CredentialRotationEvidence, CredentialRotationReasonCode, PrivilegedAuditOutcome,
     PrivilegedAuditRecord,
 };
 use governance_service::approvals::{
     EvaluateApprovalExecutionInput, RecordApprovalVoteInput, SubmitApprovalRequestInput,
 };
 use governance_service::audit::AuditAppendError;
+use governance_service::credentials::{
+    TriggerEmergencyRotationInput, TriggerScheduledRotationInput,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -46,11 +50,25 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let credential_rotation_routes = Router::new()
+        .route(
+            "/control/credentials/rotation/scheduled",
+            post(trigger_scheduled_credential_rotation),
+        )
+        .route(
+            "/control/credentials/rotation/emergency",
+            post(trigger_emergency_credential_rotation),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
         .merge(privileged_routes)
         .merge(critical_routes)
+        .merge(credential_rotation_routes)
         .with_state(state)
 }
 
@@ -259,6 +277,82 @@ pub async fn execute_critical_action(
     critical_approval_response(&state, &actor, decision, endpoint, "execution_gate")
 }
 
+pub async fn trigger_scheduled_credential_rotation(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<ScheduledCredentialRotationPayload>,
+) -> Response {
+    let endpoint = "/control/credentials/rotation/scheduled";
+    let authorization = match authorize_critical_action(&state, &actor, endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision = match state
+        .credential_rotation_orchestrator
+        .trigger_scheduled_rotation(TriggerScheduledRotationInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            credential_scope: payload.credential_scope,
+            credential_reference: payload.credential_reference,
+            metadata: payload.metadata,
+            correlation_id: actor.correlation_id.clone(),
+            now_utc: authorization.timestamp_utc.clone(),
+            last_rotated_at_utc: payload.last_rotated_at_utc,
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return credential_rotation_service_error_response(
+                error.code,
+                error.message,
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint.to_string(),
+            );
+        }
+    };
+
+    credential_rotation_response(&state, &actor, decision, endpoint.to_string())
+}
+
+pub async fn trigger_emergency_credential_rotation(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<EmergencyCredentialRotationPayload>,
+) -> Response {
+    let endpoint = "/control/credentials/rotation/emergency";
+    let authorization = match authorize_critical_action(&state, &actor, endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision = match state
+        .credential_rotation_orchestrator
+        .trigger_emergency_rotation(TriggerEmergencyRotationInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            credential_scope: payload.credential_scope,
+            credential_reference: payload.credential_reference,
+            metadata: payload.metadata,
+            correlation_id: actor.correlation_id.clone(),
+            now_utc: authorization.timestamp_utc.clone(),
+            compromise_triggered_at_utc: payload.compromise_triggered_at_utc,
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return credential_rotation_service_error_response(
+                error.code,
+                error.message,
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint.to_string(),
+            );
+        }
+    };
+
+    credential_rotation_response(&state, &actor, decision, endpoint.to_string())
+}
+
 fn authorize_critical_action(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -437,6 +531,250 @@ fn critical_approval_response(
             }),
         )
             .into_response(),
+    }
+}
+
+fn credential_rotation_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: CredentialRotationEvidence,
+    endpoint: String,
+) -> Response {
+    if let Some(audit_outcome) = credential_rotation_audit_outcome(decision.outcome) {
+        let action_name = format!("credential_rotation_{}", decision.trigger_type.as_str());
+        let audit_record = PrivilegedAuditRecord {
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            action_type: action_name.clone(),
+            parameters: json!({
+                "endpoint": endpoint,
+                "http_method": "POST",
+                "trigger_type": decision.trigger_type.as_str(),
+                "credential_scope": decision.credential_scope,
+                "rotation_id": decision.rotation_id,
+            }),
+            approval_reference: if audit_outcome == PrivilegedAuditOutcome::Allow {
+                decision.rotation_reference.clone()
+            } else {
+                None
+            },
+            timestamp: decision
+                .completed_at_utc
+                .clone()
+                .unwrap_or_else(|| decision.initiated_at_utc.clone()),
+            outcome: audit_outcome,
+            reason_code: decision.reason_code.clone(),
+            authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+            correlation_id: decision.correlation_id.clone(),
+        };
+
+        if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+            return audit_append_failure_response(
+                audit_error,
+                action_name,
+                actor.actor_id.clone(),
+                actor.role.clone(),
+                actor.authentication_outcome.as_str(),
+                decision.correlation_id.clone(),
+                decision
+                    .completed_at_utc
+                    .clone()
+                    .unwrap_or_else(|| decision.initiated_at_utc.clone()),
+            );
+        }
+    }
+
+    match decision.outcome {
+        CredentialRotationDecisionOutcome::Allow => (
+            StatusCode::ACCEPTED,
+            axum::Json(CredentialRotationDecisionResponse {
+                status: "accepted",
+                error_code: None,
+                message: None,
+                trigger_type: decision.trigger_type.as_str().to_string(),
+                rotation_id: decision.rotation_id,
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                outcome: decision.outcome.as_str(),
+                state: decision.status.as_str(),
+                reason_code: decision.reason_code,
+                credential_scope: decision.credential_scope,
+                rotation_reference: decision.rotation_reference,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision
+                    .completed_at_utc
+                    .unwrap_or(decision.initiated_at_utc),
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        CredentialRotationDecisionOutcome::Pending => (
+            StatusCode::ACCEPTED,
+            axum::Json(CredentialRotationDecisionResponse {
+                status: "pending",
+                error_code: None,
+                message: None,
+                trigger_type: decision.trigger_type.as_str().to_string(),
+                rotation_id: decision.rotation_id,
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                outcome: decision.outcome.as_str(),
+                state: decision.status.as_str(),
+                reason_code: decision.reason_code,
+                credential_scope: decision.credential_scope,
+                rotation_reference: decision.rotation_reference,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.initiated_at_utc,
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        CredentialRotationDecisionOutcome::Deny => (
+            credential_rotation_denied_status(decision.reason_code.as_str()),
+            axum::Json(CredentialRotationDecisionResponse {
+                status: "denied",
+                error_code: Some(decision.reason_code.clone()),
+                message: Some(
+                    credential_rotation_reason_message(decision.reason_code.as_str()).to_string(),
+                ),
+                trigger_type: decision.trigger_type.as_str().to_string(),
+                rotation_id: decision.rotation_id,
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                outcome: decision.outcome.as_str(),
+                state: decision.status.as_str(),
+                reason_code: decision.reason_code,
+                credential_scope: decision.credential_scope,
+                rotation_reference: None,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision
+                    .completed_at_utc
+                    .unwrap_or(decision.initiated_at_utc),
+                security_signal: Some(CredentialRotationSecuritySignal {
+                    name: "unauthorized_privileged_credential_rotation_attempt_v1",
+                    severity: "high",
+                    alert_compatible: true,
+                    alert_target_seconds: 30,
+                }),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn credential_rotation_audit_outcome(
+    outcome: CredentialRotationDecisionOutcome,
+) -> Option<PrivilegedAuditOutcome> {
+    match outcome {
+        CredentialRotationDecisionOutcome::Allow => Some(PrivilegedAuditOutcome::Allow),
+        CredentialRotationDecisionOutcome::Deny => {
+            Some(PrivilegedAuditOutcome::AuthorizationDenied)
+        }
+        CredentialRotationDecisionOutcome::Pending => None,
+    }
+}
+
+fn credential_rotation_denied_status(reason_code: &str) -> StatusCode {
+    match reason_code {
+        code if code == CredentialRotationReasonCode::InvalidPayload.code()
+            || code == CredentialRotationReasonCode::MissingMetadata.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == CredentialRotationReasonCode::ProviderUnavailable.code()
+            || code == CredentialRotationReasonCode::RuntimeUnavailable.code() =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        code if code == CredentialRotationReasonCode::ScheduledNotDue.code() => {
+            StatusCode::CONFLICT
+        }
+        _ => StatusCode::FORBIDDEN,
+    }
+}
+
+fn credential_rotation_reason_message(reason_code: &str) -> &'static str {
+    match reason_code {
+        code if code == CredentialRotationReasonCode::ScheduledNotDue.code() => {
+            "scheduled rotation cadence is not yet due"
+        }
+        code if code == CredentialRotationReasonCode::EmergencyWindowExpired.code() => {
+            "emergency rotation window has expired"
+        }
+        code if code == CredentialRotationReasonCode::ReadinessAmbiguous.code() => {
+            "rotation readiness constraints are ambiguous and fail-closed"
+        }
+        code if code == CredentialRotationReasonCode::ProviderUnavailable.code() => {
+            "secret provider dependency unavailable during rotation"
+        }
+        code if code == CredentialRotationReasonCode::RuntimeUnavailable.code() => {
+            "runtime dependency unavailable during rotation"
+        }
+        code if code == CredentialRotationReasonCode::InvalidPayload.code() => {
+            "credential rotation payload is invalid"
+        }
+        code if code == CredentialRotationReasonCode::MissingMetadata.code() => {
+            "credential rotation metadata is missing required fields"
+        }
+        code if code == CredentialRotationReasonCode::UnauthorizedRole.code() => {
+            "actor role is not authorized for credential rotation workflow"
+        }
+        code if code == CredentialRotationReasonCode::SecretMaterialRejected.code() => {
+            "credential rotation payload appears to contain secret material"
+        }
+        _ => "credential rotation request was denied",
+    }
+}
+
+fn credential_rotation_service_error_response(
+    error_code: &'static str,
+    message: String,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    (
+        credential_rotation_service_error_status(error_code),
+        axum::Json(CredentialRotationServiceErrorResponse {
+            error_code,
+            message,
+            action: "credential_rotation_workflow".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            security_signal: Some(CredentialRotationSecuritySignal {
+                name: "unauthorized_privileged_credential_rotation_attempt_v1",
+                severity: "high",
+                alert_compatible: true,
+                alert_target_seconds: 30,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn credential_rotation_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == CredentialRotationReasonCode::InvalidPayload.code()
+            || code == CredentialRotationReasonCode::MissingMetadata.code()
+            || code == CredentialRotationReasonCode::SecretMaterialRejected.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == CredentialRotationReasonCode::UnauthorizedRole.code() => {
+            StatusCode::FORBIDDEN
+        }
+        "credential_rotation_duplicate_rotation_id"
+        | "credential_rotation_duplicate_reference"
+        | "credential_rotation_constraint_violation"
+        | "credential_rotation_invalid_state_transition" => StatusCode::CONFLICT,
+        "credential_rotation_not_found" => StatusCode::BAD_REQUEST,
+        "credential_rotation_persistence_unavailable"
+        | "credential_rotation_query_failed"
+        | "credential_rotation_row_decode_failed" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -706,6 +1044,73 @@ pub struct CriticalApprovalServiceErrorResponse {
 
 #[derive(Debug, Serialize)]
 pub struct CriticalApprovalSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScheduledCredentialRotationPayload {
+    pub credential_scope: String,
+    pub credential_reference: String,
+    pub last_rotated_at_utc: String,
+    #[serde(default = "default_rotation_metadata")]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmergencyCredentialRotationPayload {
+    pub credential_scope: String,
+    pub credential_reference: String,
+    pub compromise_triggered_at_utc: String,
+    #[serde(default = "default_rotation_metadata")]
+    pub metadata: serde_json::Value,
+}
+
+fn default_rotation_metadata() -> serde_json::Value {
+    json!({})
+}
+
+#[derive(Debug, Serialize)]
+pub struct CredentialRotationDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub trigger_type: String,
+    pub rotation_id: String,
+    pub actor_id: String,
+    pub role: String,
+    pub outcome: &'static str,
+    pub state: &'static str,
+    pub reason_code: String,
+    pub credential_scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_reference: Option<String>,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<CredentialRotationSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CredentialRotationServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<CredentialRotationSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CredentialRotationSecuritySignal {
     pub name: &'static str,
     pub severity: &'static str,
     pub alert_compatible: bool,
@@ -2060,6 +2465,581 @@ mod tests {
         assert!(
             !denied_records_with_reference,
             "denied critical approvals must not synthesize approval_reference values"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_route_returns_allow_with_machine_evidence() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/scheduled")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-scheduled-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "last_rotated_at_utc":"2025-12-01T00:00:00Z",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["outcome"], "allow");
+        assert_eq!(payload["state"], "succeeded");
+        assert_eq!(payload["reason_code"], "credential_rotation_allowed");
+        assert_eq!(payload["trigger_type"], "scheduled_cadence");
+        assert!(payload["rotation_reference"].is_string());
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_route_denies_not_due_boundary_with_machine_code() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/scheduled")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-scheduled-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "last_rotated_at_utc":"2026-01-07T00:00:01Z",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(
+            payload["reason_code"],
+            "credential_rotation_scheduled_not_due"
+        );
+        assert_eq!(
+            payload["error_code"],
+            "credential_rotation_scheduled_not_due"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_rotation_route_denies_expired_window() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/emergency")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-emergency-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "compromise_triggered_at_utc":"2026-04-05T00:00:00Z",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(
+            payload["reason_code"],
+            "credential_rotation_emergency_window_expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_rotation_route_returns_allow_with_machine_evidence() {
+        let compromise_triggered_at_utc = (OffsetDateTime::now_utc() - time::Duration::minutes(10))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting should succeed");
+        let request_body = format!(
+            r#"{{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "compromise_triggered_at_utc":"{compromise_triggered_at_utc}",
+                            "metadata":{{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }}
+                        }}"#
+        );
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/emergency")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-emergency-allow-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["outcome"], "allow");
+        assert_eq!(payload["state"], "succeeded");
+        assert_eq!(payload["reason_code"], "credential_rotation_allowed");
+        assert_eq!(payload["trigger_type"], "emergency_compromise");
+        assert!(payload["rotation_reference"].is_string());
+    }
+
+    #[tokio::test]
+    async fn emergency_rotation_route_returns_machine_error_for_invalid_payload() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/emergency")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-emergency-invalid-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "compromise_triggered_at_utc":"not-a-timestamp",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "credential_rotation_invalid_payload");
+        assert_eq!(payload["action"], "credential_rotation_workflow");
+    }
+
+    #[tokio::test]
+    async fn emergency_rotation_route_returns_machine_error_for_missing_metadata() {
+        let compromise_triggered_at_utc = (OffsetDateTime::now_utc() - time::Duration::minutes(10))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting should succeed");
+        let request_body = format!(
+            r#"{{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "compromise_triggered_at_utc":"{compromise_triggered_at_utc}"
+                        }}"#
+        );
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/emergency")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-emergency-metadata-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            "credential_rotation_missing_metadata"
+        );
+        assert_eq!(payload["action"], "credential_rotation_workflow");
+    }
+
+    #[tokio::test]
+    async fn emergency_rotation_route_reuses_authorization_guard_for_unauthorized_role() {
+        let compromise_triggered_at_utc = (OffsetDateTime::now_utc() - time::Duration::minutes(10))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting should succeed");
+        let request_body = format!(
+            r#"{{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "compromise_triggered_at_utc":"{compromise_triggered_at_utc}",
+                            "metadata":{{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }}
+                        }}"#
+        );
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/emergency")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-emergency-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn emergency_rotation_route_surfaces_provider_failure_machine_reason() {
+        let compromise_triggered_at_utc = (OffsetDateTime::now_utc() - time::Duration::minutes(10))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting should succeed");
+        let request_body = format!(
+            r#"{{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "compromise_triggered_at_utc":"{compromise_triggered_at_utc}",
+                            "metadata":{{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod",
+                                "force_provider_failure":true
+                            }}
+                        }}"#
+        );
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/emergency")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-emergency-provider-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(
+            payload["reason_code"],
+            "credential_rotation_provider_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_route_returns_machine_error_for_invalid_payload() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/scheduled")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-invalid-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "last_rotated_at_utc":"not-a-timestamp",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "credential_rotation_invalid_payload");
+        assert_eq!(payload["action"], "credential_rotation_workflow");
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_route_returns_machine_error_for_missing_metadata() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/scheduled")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-metadata-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "last_rotated_at_utc":"2025-12-01T00:00:00Z"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            "credential_rotation_missing_metadata"
+        );
+        assert_eq!(payload["action"], "credential_rotation_workflow");
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/scheduled")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "last_rotated_at_utc":"2025-12-01T00:00:00Z",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod"
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_route_surfaces_provider_failure_machine_reason() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/scheduled")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-provider-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "last_rotated_at_utc":"2025-12-01T00:00:00Z",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod",
+                                "force_provider_failure":true
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(
+            payload["reason_code"],
+            "credential_rotation_provider_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_route_surfaces_runtime_failure_machine_reason() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/credentials/rotation/scheduled")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rotation-runtime-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "credential_scope":"control_api",
+                            "credential_reference":"vault://control-api/prod",
+                            "last_rotated_at_utc":"2025-12-01T00:00:00Z",
+                            "metadata":{
+                                "crypto_posture_verified":true,
+                                "runtime_injection_mode":"runtime_only",
+                                "provider_ref":"vault://control-api/prod",
+                                "force_runtime_failure":true
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "denied");
+        assert_eq!(
+            payload["reason_code"],
+            "credential_rotation_runtime_unavailable"
         );
     }
 

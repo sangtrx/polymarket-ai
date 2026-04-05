@@ -7,6 +7,7 @@ use common::time::timestamp_utc;
 use domain::governance::AuthorizationEvaluator;
 use governance_service::approvals::GovernanceApprovalService;
 use governance_service::audit::{GovernanceAuditService, InMemoryAuditAppendPort};
+use governance_service::credentials::CredentialRotationService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ async fn main() {
         .await
         .expect("failed to connect to Postgres for approval persistence");
 
-    let state = ControlApiState::with_approval_orchestrator(
+    let state = ControlApiState::with_orchestrators(
         Arc::new(GovernanceAuthorizationGuard::new(
             AuthorizationEvaluator::default(),
         )),
@@ -29,7 +30,8 @@ async fn main() {
         Arc::new(GovernanceAuditService::new(Arc::new(
             InMemoryAuditAppendPort::default(),
         ))),
-        Arc::new(GovernanceApprovalService::postgres(pool)),
+        Arc::new(GovernanceApprovalService::postgres(pool.clone())),
+        Arc::new(CredentialRotationService::postgres(pool)),
     );
     let _app: Router = routes::app_router(state);
     println!("control-api bootstrap ready at {}", timestamp_utc());

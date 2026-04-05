@@ -20,3 +20,5 @@ apps/operator-console/out/
 .DS_Store
 .idea/
 .vscode/
+.scripts/bmad-auto/copilot/bmad-progress.log
+.scripts/bmad-auto/copilot/bmad-auto-config.yaml

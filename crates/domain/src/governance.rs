@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -810,6 +810,398 @@ fn parse_utc_timestamp(
     Ok(parsed)
 }
 
+const ROTATION_SCHEDULE_DUE_DAYS: i64 = 90;
+const ROTATION_EMERGENCY_DEADLINE_MINUTES: i64 = 30;
+const MAX_ROTATION_METADATA_DEPTH: usize = 8;
+const MAX_ROTATION_METADATA_TEXT_LEN: usize = 256;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRotationTrigger {
+    ScheduledCadence,
+    EmergencyCompromise,
+}
+
+impl CredentialRotationTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScheduledCadence => "scheduled_cadence",
+            Self::EmergencyCompromise => "emergency_compromise",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CredentialRotationContractError> {
+        match value {
+            "scheduled_cadence" => Ok(Self::ScheduledCadence),
+            "emergency_compromise" => Ok(Self::EmergencyCompromise),
+            _ => Err(CredentialRotationContractError::invalid_trigger(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRotationState {
+    Pending,
+    InProgress,
+    Succeeded,
+    Denied,
+    Failed,
+}
+
+impl CredentialRotationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Succeeded => "succeeded",
+            Self::Denied => "denied",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CredentialRotationContractError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "in_progress" => Ok(Self::InProgress),
+            "succeeded" => Ok(Self::Succeeded),
+            "denied" => Ok(Self::Denied),
+            "failed" => Ok(Self::Failed),
+            _ => Err(CredentialRotationContractError::invalid_state(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRotationDecisionOutcome {
+    Allow,
+    Deny,
+    Pending,
+}
+
+impl CredentialRotationDecisionOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Pending => "pending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRotationReasonCode {
+    RotationAllowed,
+    RotationPending,
+    ScheduledNotDue,
+    EmergencyWindowExpired,
+    UnauthorizedRole,
+    MissingMetadata,
+    InvalidPayload,
+    ProviderUnavailable,
+    RuntimeUnavailable,
+    ReadinessAmbiguous,
+    SecretMaterialRejected,
+    InvalidStateTransition,
+}
+
+impl CredentialRotationReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RotationAllowed => "credential_rotation_allowed",
+            Self::RotationPending => "credential_rotation_pending",
+            Self::ScheduledNotDue => "credential_rotation_scheduled_not_due",
+            Self::EmergencyWindowExpired => "credential_rotation_emergency_window_expired",
+            Self::UnauthorizedRole => "credential_rotation_unauthorized_role",
+            Self::MissingMetadata => "credential_rotation_missing_metadata",
+            Self::InvalidPayload => "credential_rotation_invalid_payload",
+            Self::ProviderUnavailable => "credential_rotation_provider_unavailable",
+            Self::RuntimeUnavailable => "credential_rotation_runtime_unavailable",
+            Self::ReadinessAmbiguous => "credential_rotation_readiness_ambiguous",
+            Self::SecretMaterialRejected => "credential_rotation_secret_material_rejected",
+            Self::InvalidStateTransition => "credential_rotation_invalid_state_transition",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CredentialRotationContractError> {
+        match value {
+            "credential_rotation_allowed" => Ok(Self::RotationAllowed),
+            "credential_rotation_pending" => Ok(Self::RotationPending),
+            "credential_rotation_scheduled_not_due" => Ok(Self::ScheduledNotDue),
+            "credential_rotation_emergency_window_expired" => Ok(Self::EmergencyWindowExpired),
+            "credential_rotation_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "credential_rotation_missing_metadata" => Ok(Self::MissingMetadata),
+            "credential_rotation_invalid_payload" => Ok(Self::InvalidPayload),
+            "credential_rotation_provider_unavailable" => Ok(Self::ProviderUnavailable),
+            "credential_rotation_runtime_unavailable" => Ok(Self::RuntimeUnavailable),
+            "credential_rotation_readiness_ambiguous" => Ok(Self::ReadinessAmbiguous),
+            "credential_rotation_secret_material_rejected" => Ok(Self::SecretMaterialRejected),
+            "credential_rotation_invalid_state_transition" => Ok(Self::InvalidStateTransition),
+            _ => Err(CredentialRotationContractError::invalid_reason(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CredentialRotationEvidence {
+    pub rotation_id: String,
+    pub actor_id: String,
+    pub trigger_type: CredentialRotationTrigger,
+    pub credential_scope: String,
+    pub credential_reference: String,
+    pub outcome: CredentialRotationDecisionOutcome,
+    pub status: CredentialRotationState,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub initiated_at_utc: String,
+    pub deadline_at_utc: Option<String>,
+    pub completed_at_utc: Option<String>,
+    pub rotation_reference: Option<String>,
+    pub metadata: Value,
+}
+
+impl CredentialRotationEvidence {
+    pub fn validate_contract(&self) -> Result<(), CredentialRotationContractError> {
+        validate_non_blank_rotation_field("rotation_id", &self.rotation_id)?;
+        validate_non_blank_rotation_field("actor_id", &self.actor_id)?;
+        validate_non_blank_rotation_field("credential_scope", &self.credential_scope)?;
+        validate_reference_like_field("credential_reference", &self.credential_reference)?;
+        validate_non_blank_rotation_field("correlation_id", &self.correlation_id)?;
+        CredentialRotationReasonCode::parse(&self.reason_code)?;
+        parse_rotation_utc_timestamp("initiated_at_utc", &self.initiated_at_utc)?;
+        if let Some(deadline) = &self.deadline_at_utc {
+            parse_rotation_utc_timestamp("deadline_at_utc", deadline)?;
+        }
+        if let Some(completed) = &self.completed_at_utc {
+            parse_rotation_utc_timestamp("completed_at_utc", completed)?;
+        }
+        if let Some(reference) = &self.rotation_reference {
+            validate_reference_like_field("rotation_reference", reference)?;
+        }
+        validate_rotation_metadata(&self.metadata)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialRotationContractError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl CredentialRotationContractError {
+    fn invalid_trigger(value: &str) -> Self {
+        Self {
+            code: "credential_rotation_invalid_trigger",
+            message: format!("unknown credential rotation trigger `{value}`"),
+        }
+    }
+
+    fn invalid_state(value: &str) -> Self {
+        Self {
+            code: "credential_rotation_invalid_state",
+            message: format!("unknown credential rotation state `{value}`"),
+        }
+    }
+
+    fn invalid_reason(value: &str) -> Self {
+        Self {
+            code: "credential_rotation_invalid_reason",
+            message: format!("unknown credential rotation reason `{value}`"),
+        }
+    }
+
+    fn invalid_timestamp(field: &str, value: &str) -> Self {
+        Self {
+            code: CredentialRotationReasonCode::InvalidPayload.code(),
+            message: format!("invalid RFC3339 UTC timestamp for `{field}`: `{value}`"),
+        }
+    }
+
+    fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: CredentialRotationReasonCode::InvalidPayload.code(),
+            message: message.into(),
+        }
+    }
+
+    fn missing_metadata(message: impl Into<String>) -> Self {
+        Self {
+            code: CredentialRotationReasonCode::MissingMetadata.code(),
+            message: message.into(),
+        }
+    }
+
+    fn secret_material(message: impl Into<String>) -> Self {
+        Self {
+            code: CredentialRotationReasonCode::SecretMaterialRejected.code(),
+            message: message.into(),
+        }
+    }
+}
+
+pub fn scheduled_rotation_due(
+    last_rotated_at_utc: &str,
+    now_utc: &str,
+) -> Result<bool, CredentialRotationContractError> {
+    let last_rotated = parse_rotation_utc_timestamp("last_rotated_at_utc", last_rotated_at_utc)?;
+    let now = parse_rotation_utc_timestamp("now_utc", now_utc)?;
+    if now < last_rotated {
+        return Err(CredentialRotationContractError::invalid_payload(
+            "`now_utc` cannot be earlier than `last_rotated_at_utc`",
+        ));
+    }
+    Ok(now - last_rotated >= Duration::days(ROTATION_SCHEDULE_DUE_DAYS))
+}
+
+pub fn emergency_rotation_within_deadline(
+    compromise_triggered_at_utc: &str,
+    completed_at_utc: &str,
+) -> Result<bool, CredentialRotationContractError> {
+    let triggered =
+        parse_rotation_utc_timestamp("compromise_triggered_at_utc", compromise_triggered_at_utc)?;
+    let completed = parse_rotation_utc_timestamp("completed_at_utc", completed_at_utc)?;
+    if completed < triggered {
+        return Err(CredentialRotationContractError::invalid_payload(
+            "`completed_at_utc` cannot be earlier than `compromise_triggered_at_utc`",
+        ));
+    }
+    Ok(completed - triggered <= Duration::minutes(ROTATION_EMERGENCY_DEADLINE_MINUTES))
+}
+
+pub fn emergency_rotation_deadline_utc(
+    compromise_triggered_at_utc: &str,
+) -> Result<String, CredentialRotationContractError> {
+    let triggered =
+        parse_rotation_utc_timestamp("compromise_triggered_at_utc", compromise_triggered_at_utc)?;
+    Ok(
+        (triggered + Duration::minutes(ROTATION_EMERGENCY_DEADLINE_MINUTES))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting for emergency deadline should succeed"),
+    )
+}
+
+pub fn validate_rotation_metadata(metadata: &Value) -> Result<(), CredentialRotationContractError> {
+    if !metadata.is_object() {
+        return Err(CredentialRotationContractError::missing_metadata(
+            "rotation metadata must be a JSON object",
+        ));
+    }
+    validate_metadata_value(metadata, 0)
+}
+
+fn validate_metadata_value(
+    value: &Value,
+    depth: usize,
+) -> Result<(), CredentialRotationContractError> {
+    if depth > MAX_ROTATION_METADATA_DEPTH {
+        return Err(CredentialRotationContractError::invalid_payload(
+            "rotation metadata exceeds maximum nesting depth",
+        ));
+    }
+
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key.trim().is_empty() {
+                    return Err(CredentialRotationContractError::missing_metadata(
+                        "rotation metadata keys cannot be blank",
+                    ));
+                }
+                if looks_like_secret_token(key) {
+                    return Err(CredentialRotationContractError::secret_material(format!(
+                        "rotation metadata key `{key}` is not allowed"
+                    )));
+                }
+                validate_metadata_value(child, depth + 1)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                validate_metadata_value(child, depth + 1)?;
+            }
+        }
+        Value::String(text) => {
+            validate_reference_like_field("metadata", text)?;
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
+    Ok(())
+}
+
+fn validate_non_blank_rotation_field(
+    field: &'static str,
+    value: &str,
+) -> Result<(), CredentialRotationContractError> {
+    if value.trim().is_empty() {
+        return Err(CredentialRotationContractError::invalid_payload(format!(
+            "{field} cannot be blank"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_reference_like_field(
+    field: &'static str,
+    value: &str,
+) -> Result<(), CredentialRotationContractError> {
+    let candidate = value.trim();
+    if candidate.is_empty() {
+        return Err(CredentialRotationContractError::invalid_payload(format!(
+            "{field} cannot be blank"
+        )));
+    }
+    if candidate.len() > MAX_ROTATION_METADATA_TEXT_LEN {
+        return Err(CredentialRotationContractError::invalid_payload(format!(
+            "{field} exceeds maximum supported length"
+        )));
+    }
+    if looks_like_secret_token(candidate) {
+        return Err(CredentialRotationContractError::secret_material(format!(
+            "{field} appears to contain secret material"
+        )));
+    }
+    if !candidate.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
+    }) {
+        return Err(CredentialRotationContractError::invalid_payload(format!(
+            "{field} must use reference-safe characters only"
+        )));
+    }
+    Ok(())
+}
+
+fn looks_like_secret_token(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    [
+        "api_key",
+        "authorization",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+        "credential_value",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn parse_rotation_utc_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<OffsetDateTime, CredentialRotationContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| CredentialRotationContractError::invalid_timestamp(field, value))?;
+    if parsed.offset() != time::UtcOffset::UTC {
+        return Err(CredentialRotationContractError::invalid_timestamp(
+            field, value,
+        ));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,5 +1496,73 @@ mod tests {
             reference,
             "apr_risk_limit_increase_req-42_ops-one_admin-two_1775347200"
         );
+    }
+
+    #[test]
+    fn scheduled_rotation_due_enforces_89_vs_90_day_boundary() {
+        assert!(
+            !scheduled_rotation_due("2026-01-01T00:00:00Z", "2026-03-31T00:00:00Z")
+                .expect("89-day boundary should evaluate")
+        );
+        assert!(
+            scheduled_rotation_due("2026-01-01T00:00:00Z", "2026-04-01T00:00:00Z")
+                .expect("90-day boundary should evaluate")
+        );
+    }
+
+    #[test]
+    fn emergency_rotation_deadline_enforces_30_minute_boundary() {
+        assert!(
+            emergency_rotation_within_deadline("2026-04-05T00:00:00Z", "2026-04-05T00:30:00Z")
+                .expect("30-minute deadline should evaluate")
+        );
+        assert!(
+            !emergency_rotation_within_deadline("2026-04-05T00:00:00Z", "2026-04-05T00:31:00Z")
+                .expect("31-minute deadline should evaluate")
+        );
+    }
+
+    #[test]
+    fn emergency_rotation_deadline_rejects_non_utc_inputs() {
+        let error =
+            emergency_rotation_within_deadline("2026-04-05T00:00:00+01:00", "2026-04-05T00:10:00Z")
+                .expect_err("non-UTC trigger timestamp must fail");
+        assert_eq!(error.code, "credential_rotation_invalid_payload");
+    }
+
+    #[test]
+    fn rotation_metadata_rejects_secret_like_fields() {
+        let error = validate_rotation_metadata(&json!({
+            "provider_secret": "abc123"
+        }))
+        .expect_err("secret-like metadata should fail");
+        assert_eq!(error.code, "credential_rotation_secret_material_rejected");
+    }
+
+    #[test]
+    fn credential_rotation_evidence_contract_requires_reference_safe_values() {
+        let evidence = CredentialRotationEvidence {
+            rotation_id: "rot-1".to_string(),
+            actor_id: "ops-1".to_string(),
+            trigger_type: CredentialRotationTrigger::ScheduledCadence,
+            credential_scope: "control_api".to_string(),
+            credential_reference: "vault://control-api/prod".to_string(),
+            outcome: CredentialRotationDecisionOutcome::Allow,
+            status: CredentialRotationState::Succeeded,
+            reason_code: CredentialRotationReasonCode::RotationAllowed
+                .code()
+                .to_string(),
+            correlation_id: "corr-rot-1".to_string(),
+            initiated_at_utc: "2026-04-05T00:00:00Z".to_string(),
+            deadline_at_utc: Some("2026-04-05T00:30:00Z".to_string()),
+            completed_at_utc: Some("2026-04-05T00:05:00Z".to_string()),
+            rotation_reference: Some("rotref://vault/control-api/42".to_string()),
+            metadata: json!({
+                "crypto_posture_verified": true,
+                "runtime_injection_mode": "runtime_only",
+                "provider_ref": "vault://team/control-api"
+            }),
+        };
+        assert!(evidence.validate_contract().is_ok());
     }
 }

@@ -1,9 +1,11 @@
 use common::time::timestamp_utc;
+use governance_service::credentials::CredentialRotationService;
 use governance_service::rbac::GovernanceAuthorizationService;
 
 #[tokio::main]
 async fn main() {
     let authorization_service = GovernanceAuthorizationService::default();
+    let _credential_rotation_service = CredentialRotationService::default();
     let bootstrap_decision = authorization_service.evaluate(
         "governance-bootstrap",
         "administrative_actions",

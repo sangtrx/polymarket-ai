@@ -150,3 +150,43 @@ Denied FR34 responses and telemetry must include alert-compatible security-signa
 - `alert_compatible = true`
 - `alert_target_seconds = 30`
 - `severity = high`
+
+## Story 1.6 credential rotation lifecycle and governance continuity
+
+Credential rotation remains a privileged control workflow and reuses authenticated RBAC gates from Stories 1.2-1.5.
+
+Rotation trigger paths:
+
+1. `scheduled_cadence` trigger for policy cadence checks (`>= 90 days` due threshold).
+2. `emergency_compromise` trigger for incident response (`<= 30 minutes` completion target from compromise signal).
+
+Credential rotation state machine:
+
+1. `pending` -> request accepted for policy evaluation.
+2. `in_progress` -> provider/runtime orchestration active.
+3. Terminal states:
+   - `succeeded` (rotation completed with non-null `rotation_reference`)
+   - `denied` (policy/readiness denied without cutover)
+   - `failed` (provider/runtime failure; fail-closed and no partial cutover)
+
+Deterministic machine-readable rotation reason codes:
+
+- `credential_rotation_allowed`
+- `credential_rotation_pending`
+- `credential_rotation_scheduled_not_due`
+- `credential_rotation_emergency_window_expired`
+- `credential_rotation_unauthorized_role`
+- `credential_rotation_missing_metadata`
+- `credential_rotation_invalid_payload`
+- `credential_rotation_provider_unavailable`
+- `credential_rotation_runtime_unavailable`
+- `credential_rotation_readiness_ambiguous`
+- `credential_rotation_secret_material_rejected`
+- `credential_rotation_invalid_state_transition`
+
+Governance continuity expectations during rotation:
+
+1. Existing authenticated control middleware and role checks stay enforced (no bypass mode).
+2. Rotation denial/failure paths are fail-closed; current credentials remain active.
+3. Rotation evidence includes actor, trigger type, credential scope, outcome/state, reason code, correlation id, timestamp, and rotation reference (when successful).
+4. Secret material is never accepted in metadata payloads or persisted records; only references/metadata are allowed.

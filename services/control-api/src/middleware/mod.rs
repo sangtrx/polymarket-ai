@@ -11,6 +11,7 @@ use domain::governance::{
 };
 use governance_service::approvals::{ApprovalOrchestrator, GovernanceApprovalService};
 use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
+use governance_service::credentials::{CredentialRotationOrchestrator, CredentialRotationService};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -206,6 +207,7 @@ pub struct ControlApiState {
     pub authenticator: Arc<dyn Authenticator>,
     pub audit_appender: Arc<dyn PrivilegedAuditAppender>,
     pub approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
+    pub credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
 }
 
 impl ControlApiState {
@@ -229,11 +231,28 @@ impl ControlApiState {
         audit_appender: Arc<dyn PrivilegedAuditAppender>,
         approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
     ) -> Self {
+        Self::with_orchestrators(
+            authorization_guard,
+            authenticator,
+            audit_appender,
+            approval_orchestrator,
+            Arc::new(CredentialRotationService::default()),
+        )
+    }
+
+    pub fn with_orchestrators(
+        authorization_guard: Arc<dyn AuthorizationGuard>,
+        authenticator: Arc<dyn Authenticator>,
+        audit_appender: Arc<dyn PrivilegedAuditAppender>,
+        approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
+        credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
+    ) -> Self {
         Self {
             authorization_guard,
             authenticator,
             audit_appender,
             approval_orchestrator,
+            credential_rotation_orchestrator,
         }
     }
 }
