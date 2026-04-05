@@ -5,10 +5,12 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 const MARKET_EXPOSURE_MIN_PCT_NAV: f64 = 0.0;
 const MARKET_EXPOSURE_MAX_PCT_NAV: f64 = 100.0;
 pub const MARKET_STREAM_LATENCY_TARGET_SECONDS: f64 = 2.0;
+pub const USER_STREAM_LATENCY_TARGET_SECONDS: f64 = 2.0;
 pub const MARKET_STREAM_BACKLOG_WARNING_SECONDS: f64 = 5.0;
 pub const MARKET_STREAM_BACKLOG_DEGRADED_SECONDS: f64 = 10.0;
 pub const MARKET_STREAM_BACKLOG_SUSTAINED_DURATION_SECONDS: f64 = 30.0;
 pub const MARKET_STREAM_MAX_DEPTH_LEVELS: usize = 5;
+pub const USER_STREAM_AUTH_STATE_PARTITION_KEY: &str = "__user_stream_auth_state__";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RiskLimit {
@@ -937,6 +939,526 @@ pub fn market_stream_tick_to_snapshot(
     })
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStreamEventKind {
+    Order,
+    Trade,
+}
+
+impl UserStreamEventKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Order => "order",
+            Self::Trade => "trade",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStreamEventStatus {
+    Placement,
+    Update,
+    Cancellation,
+    Matched,
+    Mined,
+    Confirmed,
+}
+
+impl UserStreamEventStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Placement => "placement",
+            Self::Update => "update",
+            Self::Cancellation => "cancellation",
+            Self::Matched => "matched",
+            Self::Mined => "mined",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStreamAuthState {
+    Authenticated,
+    AuthExpired,
+}
+
+impl UserStreamAuthState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authenticated => "authenticated",
+            Self::AuthExpired => "auth_expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, UserStreamContractError> {
+        match value {
+            "authenticated" => Ok(Self::Authenticated),
+            "auth_expired" => Ok(Self::AuthExpired),
+            _ => Err(UserStreamContractError::invalid_payload(format!(
+                "unknown user stream auth state `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStreamReasonCode {
+    EventAccepted,
+    DuplicateEvent,
+    OutOfOrderEvent,
+    EqualOffsetTieBreakAccepted,
+    EqualOffsetTieBreakRejected,
+    AuthExpired,
+    AuthRecoveredPendingEvent,
+    Authenticated,
+    PersistenceUnavailable,
+    StreamDisconnected,
+    InvalidPayload,
+    LatencySloBreached,
+}
+
+impl UserStreamReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::EventAccepted => "user_stream_event_accepted",
+            Self::DuplicateEvent => "user_stream_duplicate_event",
+            Self::OutOfOrderEvent => "user_stream_out_of_order_event",
+            Self::EqualOffsetTieBreakAccepted => "user_stream_equal_offset_tie_break_accepted",
+            Self::EqualOffsetTieBreakRejected => "user_stream_equal_offset_tie_break_rejected",
+            Self::AuthExpired => "user_stream_auth_expired",
+            Self::AuthRecoveredPendingEvent => "user_stream_auth_recovered_pending_event",
+            Self::Authenticated => "user_stream_authenticated",
+            Self::PersistenceUnavailable => "user_stream_persistence_unavailable",
+            Self::StreamDisconnected => "user_stream_disconnected",
+            Self::InvalidPayload => "user_stream_invalid_payload",
+            Self::LatencySloBreached => "user_stream_latency_slo_breached",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, UserStreamContractError> {
+        match value {
+            "user_stream_event_accepted" => Ok(Self::EventAccepted),
+            "user_stream_duplicate_event" => Ok(Self::DuplicateEvent),
+            "user_stream_out_of_order_event" => Ok(Self::OutOfOrderEvent),
+            "user_stream_equal_offset_tie_break_accepted" => Ok(Self::EqualOffsetTieBreakAccepted),
+            "user_stream_equal_offset_tie_break_rejected" => Ok(Self::EqualOffsetTieBreakRejected),
+            "user_stream_auth_expired" => Ok(Self::AuthExpired),
+            "user_stream_auth_recovered_pending_event" => Ok(Self::AuthRecoveredPendingEvent),
+            "user_stream_authenticated" => Ok(Self::Authenticated),
+            "user_stream_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            "user_stream_disconnected" => Ok(Self::StreamDisconnected),
+            "user_stream_invalid_payload" => Ok(Self::InvalidPayload),
+            "user_stream_latency_slo_breached" => Ok(Self::LatencySloBreached),
+            _ => Err(UserStreamContractError::invalid_payload(format!(
+                "unknown user stream reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserStreamEvent {
+    pub event_id: String,
+    pub event_kind: UserStreamEventKind,
+    pub event_status: UserStreamEventStatus,
+    pub market_id: String,
+    pub asset_id: String,
+    pub order_id: String,
+    pub trade_id: Option<String>,
+    pub partition_key: String,
+    pub idempotency_key: String,
+    pub event_offset: i64,
+    pub event_timestamp_utc: String,
+    pub observed_at_utc: String,
+    pub ingested_at_utc: String,
+    pub ingestion_latency_seconds: f64,
+    pub correlation_id: String,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderEventOffsetCursor {
+    pub partition_key: String,
+    pub last_event_id: String,
+    pub last_event_key: String,
+    pub last_event_offset: i64,
+    pub auth_state: UserStreamAuthState,
+    pub block_new_intents: bool,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserStreamAuthTransition {
+    pub transition_id: String,
+    pub transition_offset: i64,
+    pub auth_state: UserStreamAuthState,
+    pub block_new_intents: bool,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub observed_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserStreamValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserStreamContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<UserStreamValidationIssue>,
+}
+
+impl UserStreamContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<UserStreamValidationIssue>,
+    ) -> Self {
+        Self {
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserStreamOrderingDecision {
+    Accept { reason_code: &'static str },
+    Duplicate { reason_code: &'static str },
+    OutOfOrder { reason_code: &'static str },
+}
+
+pub fn normalize_user_stream_idempotency_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+pub fn user_stream_latency_slo_met(latencies_seconds: &[f64]) -> bool {
+    ingestion_latency_slo_met(latencies_seconds)
+}
+
+pub fn validate_user_stream_event(event: &UserStreamEvent) -> Result<(), UserStreamContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_user_stream_field(&mut field_errors, "event_id", &event.event_id);
+    validate_non_empty_user_stream_field(&mut field_errors, "market_id", &event.market_id);
+    validate_non_empty_user_stream_field(&mut field_errors, "asset_id", &event.asset_id);
+    validate_non_empty_user_stream_field(&mut field_errors, "order_id", &event.order_id);
+    validate_non_empty_user_stream_field(&mut field_errors, "partition_key", &event.partition_key);
+    validate_non_empty_user_stream_field(
+        &mut field_errors,
+        "idempotency_key",
+        &event.idempotency_key,
+    );
+    validate_non_empty_user_stream_field(
+        &mut field_errors,
+        "correlation_id",
+        &event.correlation_id,
+    );
+    validate_non_empty_user_stream_field(&mut field_errors, "reason_code", &event.reason_code);
+    validate_user_stream_timestamp_field(
+        &mut field_errors,
+        "event_timestamp_utc",
+        &event.event_timestamp_utc,
+    );
+    validate_user_stream_timestamp_field(
+        &mut field_errors,
+        "observed_at_utc",
+        &event.observed_at_utc,
+    );
+    validate_user_stream_timestamp_field(
+        &mut field_errors,
+        "ingested_at_utc",
+        &event.ingested_at_utc,
+    );
+    validate_non_negative_user_stream_offset(&mut field_errors, "event_offset", event.event_offset);
+    validate_non_negative_user_stream_value(
+        &mut field_errors,
+        "ingestion_latency_seconds",
+        event.ingestion_latency_seconds,
+    );
+
+    if event.event_kind == UserStreamEventKind::Trade
+        && event
+            .trade_id
+            .as_ref()
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    {
+        field_errors.push(UserStreamValidationIssue {
+            field: "trade_id",
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: "trade events require non-empty trade_id".to_string(),
+        });
+    }
+    if event.event_kind == UserStreamEventKind::Order
+        && event
+            .trade_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+    {
+        field_errors.push(UserStreamValidationIssue {
+            field: "trade_id",
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: "order events cannot carry blank trade_id".to_string(),
+        });
+    }
+    if UserStreamReasonCode::parse(&event.reason_code).is_err() {
+        field_errors.push(UserStreamValidationIssue {
+            field: "reason_code",
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known user stream reason".to_string(),
+        });
+    }
+    if let (Ok(event_ts), Ok(observed_at), Ok(ingested_at)) = (
+        parse_utc_timestamp(&event.event_timestamp_utc),
+        parse_utc_timestamp(&event.observed_at_utc),
+        parse_utc_timestamp(&event.ingested_at_utc),
+    ) {
+        if observed_at < event_ts {
+            field_errors.push(UserStreamValidationIssue {
+                field: "observed_at_utc",
+                code: UserStreamReasonCode::InvalidPayload.code(),
+                message: "observed_at_utc cannot be earlier than event_timestamp_utc".to_string(),
+            });
+        }
+        if ingested_at < observed_at {
+            field_errors.push(UserStreamValidationIssue {
+                field: "ingested_at_utc",
+                code: UserStreamReasonCode::InvalidPayload.code(),
+                message: "ingested_at_utc cannot be earlier than observed_at_utc".to_string(),
+            });
+        }
+    }
+
+    if !field_errors.is_empty() {
+        return Err(UserStreamContractError::invalid_payload_with_issues(
+            "user stream event payload is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_order_event_offset_cursor(
+    cursor: &OrderEventOffsetCursor,
+) -> Result<(), UserStreamContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_user_stream_field(&mut field_errors, "partition_key", &cursor.partition_key);
+    validate_non_empty_user_stream_field(&mut field_errors, "last_event_id", &cursor.last_event_id);
+    validate_non_empty_user_stream_field(
+        &mut field_errors,
+        "last_event_key",
+        &cursor.last_event_key,
+    );
+    validate_non_empty_user_stream_field(&mut field_errors, "reason_code", &cursor.reason_code);
+    validate_non_empty_user_stream_field(
+        &mut field_errors,
+        "correlation_id",
+        &cursor.correlation_id,
+    );
+    validate_user_stream_timestamp_field(
+        &mut field_errors,
+        "updated_at_utc",
+        &cursor.updated_at_utc,
+    );
+    validate_non_negative_user_stream_offset(
+        &mut field_errors,
+        "last_event_offset",
+        cursor.last_event_offset,
+    );
+    if UserStreamReasonCode::parse(&cursor.reason_code).is_err() {
+        field_errors.push(UserStreamValidationIssue {
+            field: "reason_code",
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known user stream reason".to_string(),
+        });
+    }
+    if cursor.auth_state == UserStreamAuthState::AuthExpired && !cursor.block_new_intents {
+        field_errors.push(UserStreamValidationIssue {
+            field: "block_new_intents",
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: "auth_expired state must set block_new_intents to true".to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(UserStreamContractError::invalid_payload_with_issues(
+            "order event offset cursor is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_user_stream_auth_transition(
+    transition: &UserStreamAuthTransition,
+) -> Result<(), UserStreamContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_user_stream_field(
+        &mut field_errors,
+        "transition_id",
+        &transition.transition_id,
+    );
+    validate_non_empty_user_stream_field(&mut field_errors, "reason_code", &transition.reason_code);
+    validate_non_empty_user_stream_field(
+        &mut field_errors,
+        "correlation_id",
+        &transition.correlation_id,
+    );
+    validate_user_stream_timestamp_field(
+        &mut field_errors,
+        "observed_at_utc",
+        &transition.observed_at_utc,
+    );
+    validate_non_negative_user_stream_offset(
+        &mut field_errors,
+        "transition_offset",
+        transition.transition_offset,
+    );
+    if UserStreamReasonCode::parse(&transition.reason_code).is_err() {
+        field_errors.push(UserStreamValidationIssue {
+            field: "reason_code",
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known user stream reason".to_string(),
+        });
+    }
+    if transition.auth_state == UserStreamAuthState::AuthExpired && !transition.block_new_intents {
+        field_errors.push(UserStreamValidationIssue {
+            field: "block_new_intents",
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: "auth_expired transitions must enforce block_new_intents=true".to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(UserStreamContractError::invalid_payload_with_issues(
+            "user stream auth transition is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn evaluate_user_stream_ordering(
+    cursor: Option<&OrderEventOffsetCursor>,
+    event: &UserStreamEvent,
+) -> Result<UserStreamOrderingDecision, UserStreamContractError> {
+    validate_user_stream_event(event)?;
+    if let Some(cursor) = cursor {
+        validate_order_event_offset_cursor(cursor)?;
+        if event.event_offset < cursor.last_event_offset {
+            return Ok(UserStreamOrderingDecision::OutOfOrder {
+                reason_code: UserStreamReasonCode::OutOfOrderEvent.code(),
+            });
+        }
+        if event.event_offset > cursor.last_event_offset {
+            return Ok(UserStreamOrderingDecision::Accept {
+                reason_code: UserStreamReasonCode::EventAccepted.code(),
+            });
+        }
+
+        let normalized_event_key = normalize_user_stream_idempotency_key(&event.idempotency_key);
+        let normalized_cursor_key = normalize_user_stream_idempotency_key(&cursor.last_event_key);
+        if normalized_event_key == normalized_cursor_key {
+            return Ok(UserStreamOrderingDecision::Duplicate {
+                reason_code: UserStreamReasonCode::DuplicateEvent.code(),
+            });
+        }
+        if normalized_event_key > normalized_cursor_key {
+            return Ok(UserStreamOrderingDecision::Accept {
+                reason_code: UserStreamReasonCode::EqualOffsetTieBreakAccepted.code(),
+            });
+        }
+        return Ok(UserStreamOrderingDecision::OutOfOrder {
+            reason_code: UserStreamReasonCode::EqualOffsetTieBreakRejected.code(),
+        });
+    }
+
+    Ok(UserStreamOrderingDecision::Accept {
+        reason_code: UserStreamReasonCode::EventAccepted.code(),
+    })
+}
+
+fn validate_non_empty_user_stream_field(
+    field_errors: &mut Vec<UserStreamValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(UserStreamValidationIssue {
+            field,
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_non_negative_user_stream_offset(
+    field_errors: &mut Vec<UserStreamValidationIssue>,
+    field: &'static str,
+    value: i64,
+) {
+    if value < 0 {
+        field_errors.push(UserStreamValidationIssue {
+            field,
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be greater than or equal to 0"),
+        });
+    }
+}
+
+fn validate_non_negative_user_stream_value(
+    field_errors: &mut Vec<UserStreamValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(UserStreamValidationIssue {
+            field,
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite"),
+        });
+    } else if value < 0.0 {
+        field_errors.push(UserStreamValidationIssue {
+            field,
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be greater than or equal to 0"),
+        });
+    }
+}
+
+fn validate_user_stream_timestamp_field(
+    field_errors: &mut Vec<UserStreamValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(UserStreamValidationIssue {
+            field,
+            code: UserStreamReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
 fn validate_non_empty_stream_field(
     field_errors: &mut Vec<MarketStreamValidationIssue>,
     field: &'static str,
@@ -1471,5 +1993,153 @@ mod tests {
                 .iter()
                 .any(|issue| issue.field == "reason_code")
         );
+    }
+
+    fn sample_user_stream_event() -> UserStreamEvent {
+        UserStreamEvent {
+            event_id: "order::order-1::100".to_string(),
+            event_kind: UserStreamEventKind::Order,
+            event_status: UserStreamEventStatus::Placement,
+            market_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            asset_id:
+                "106585164761922456203746651621390029417453862034640469075081961934906147433548"
+                    .to_string(),
+            order_id: "order-1".to_string(),
+            trade_id: None,
+            partition_key: "order-1".to_string(),
+            idempotency_key: "order-1::100::placement".to_string(),
+            event_offset: 100,
+            event_timestamp_utc: "2026-04-06T00:00:00Z".to_string(),
+            observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
+            ingested_at_utc: "2026-04-06T00:00:01Z".to_string(),
+            ingestion_latency_seconds: 1.0,
+            correlation_id: "corr-user-stream-001".to_string(),
+            reason_code: UserStreamReasonCode::EventAccepted.code().to_string(),
+        }
+    }
+
+    fn sample_user_stream_cursor() -> OrderEventOffsetCursor {
+        OrderEventOffsetCursor {
+            partition_key: "order-1".to_string(),
+            last_event_id: "order::order-1::100".to_string(),
+            last_event_key: "order-1::100::placement".to_string(),
+            last_event_offset: 100,
+            auth_state: UserStreamAuthState::Authenticated,
+            block_new_intents: false,
+            reason_code: UserStreamReasonCode::EventAccepted.code().to_string(),
+            correlation_id: "corr-user-stream-001".to_string(),
+            updated_at_utc: "2026-04-06T00:00:01Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn user_stream_event_validation_rejects_non_utc_timestamp() {
+        let mut event = sample_user_stream_event();
+        event.event_timestamp_utc = "2026-04-06T00:00:00+01:00".to_string();
+        let error =
+            validate_user_stream_event(&event).expect_err("non-UTC timestamp should be rejected");
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "event_timestamp_utc")
+        );
+    }
+
+    #[test]
+    fn user_stream_ordering_classifies_duplicate_equal_offset_events() {
+        let event = sample_user_stream_event();
+        let cursor = sample_user_stream_cursor();
+        let decision = evaluate_user_stream_ordering(Some(&cursor), &event)
+            .expect("equal offset + same key should classify as duplicate");
+        assert_eq!(
+            decision,
+            UserStreamOrderingDecision::Duplicate {
+                reason_code: UserStreamReasonCode::DuplicateEvent.code(),
+            }
+        );
+    }
+
+    #[test]
+    fn user_stream_ordering_rejects_lower_offset_events() {
+        let mut event = sample_user_stream_event();
+        event.event_offset = 99;
+        let cursor = sample_user_stream_cursor();
+        let decision = evaluate_user_stream_ordering(Some(&cursor), &event)
+            .expect("lower offset should classify as out-of-order");
+        assert_eq!(
+            decision,
+            UserStreamOrderingDecision::OutOfOrder {
+                reason_code: UserStreamReasonCode::OutOfOrderEvent.code(),
+            }
+        );
+    }
+
+    #[test]
+    fn user_stream_ordering_equal_offset_tie_break_is_deterministic() {
+        let mut event = sample_user_stream_event();
+        event.idempotency_key = "order-1::100::update".to_string();
+        let mut cursor = sample_user_stream_cursor();
+        cursor.last_event_key = "order-1::100::placement".to_string();
+        let accepted = evaluate_user_stream_ordering(Some(&cursor), &event)
+            .expect("lexically larger key should win equal-offset tie-break");
+        assert_eq!(
+            accepted,
+            UserStreamOrderingDecision::Accept {
+                reason_code: UserStreamReasonCode::EqualOffsetTieBreakAccepted.code(),
+            }
+        );
+
+        cursor.last_event_key = "order-1::100::zzz".to_string();
+        let rejected = evaluate_user_stream_ordering(Some(&cursor), &event)
+            .expect("lexically smaller key should be rejected for equal-offset tie-break");
+        assert_eq!(
+            rejected,
+            UserStreamOrderingDecision::OutOfOrder {
+                reason_code: UserStreamReasonCode::EqualOffsetTieBreakRejected.code(),
+            }
+        );
+    }
+
+    #[test]
+    fn user_stream_auth_transition_enforces_fail_closed_auth_expired_block() {
+        let transition = UserStreamAuthTransition {
+            transition_id: "transition-1".to_string(),
+            transition_offset: 1,
+            auth_state: UserStreamAuthState::AuthExpired,
+            block_new_intents: false,
+            reason_code: UserStreamReasonCode::AuthExpired.code().to_string(),
+            correlation_id: "corr-auth-001".to_string(),
+            observed_at_utc: "2026-04-06T00:00:01Z".to_string(),
+        };
+        let error = validate_user_stream_auth_transition(&transition)
+            .expect_err("auth_expired transition must enforce block_new_intents=true");
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "block_new_intents")
+        );
+    }
+
+    #[test]
+    fn user_stream_normalize_idempotency_key_trims_and_lowercases() {
+        assert_eq!(
+            normalize_user_stream_idempotency_key("  Order-1::100::PLACEMENT  "),
+            "order-1::100::placement"
+        );
+    }
+
+    #[test]
+    fn user_stream_latency_slo_uses_99th_percentile_boundary() {
+        let mut passing = vec![1.4; 100];
+        passing[99] = USER_STREAM_LATENCY_TARGET_SECONDS;
+        assert!(user_stream_latency_slo_met(&passing));
+
+        let mut failing = vec![1.4; 100];
+        failing[98] = USER_STREAM_LATENCY_TARGET_SECONDS + 0.1;
+        failing[99] = USER_STREAM_LATENCY_TARGET_SECONDS + 0.2;
+        assert!(!user_stream_latency_slo_met(&failing));
     }
 }

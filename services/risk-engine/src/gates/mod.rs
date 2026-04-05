@@ -1,6 +1,7 @@
-use domain::risk::{MarketClusterOverride, MarketPolicyReasonCode};
+use domain::risk::{MarketClusterOverride, MarketPolicyReasonCode, UserStreamReasonCode};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,11 +26,13 @@ pub struct OrderIntentGateDecision {
 
 pub trait RuntimePolicyStateReader: Send + Sync {
     fn cluster_override(&self, cluster_id: &str) -> Option<MarketClusterOverride>;
+    fn user_stream_auth_block_active(&self) -> bool;
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryRuntimePolicyState {
     overrides: Arc<RwLock<BTreeMap<String, MarketClusterOverride>>>,
+    auth_block_active: Arc<AtomicBool>,
 }
 
 impl InMemoryRuntimePolicyState {
@@ -42,6 +45,10 @@ impl InMemoryRuntimePolicyState {
                 override_state,
             );
     }
+
+    pub fn set_user_stream_auth_block(&self, is_active: bool) {
+        self.auth_block_active.store(is_active, Ordering::SeqCst);
+    }
 }
 
 impl RuntimePolicyStateReader for InMemoryRuntimePolicyState {
@@ -52,21 +59,39 @@ impl RuntimePolicyStateReader for InMemoryRuntimePolicyState {
             .get(&cluster_id.trim().to_ascii_lowercase())
             .cloned()
     }
+
+    fn user_stream_auth_block_active(&self) -> bool {
+        self.auth_block_active.load(Ordering::SeqCst)
+    }
 }
 
 pub fn evaluate_order_intent_gate<S: RuntimePolicyStateReader>(
     runtime_policy_state: &S,
     intent: &OrderIntent,
 ) -> OrderIntentGateDecision {
-    let reason = if intent.cluster_id.trim().is_empty() {
-        MarketPolicyReasonCode::InvalidClusterId
+    let (allowed, reason_code) = if runtime_policy_state.user_stream_auth_block_active() {
+        (false, UserStreamReasonCode::AuthExpired.code().to_string())
+    } else if intent.cluster_id.trim().is_empty() {
+        (
+            false,
+            MarketPolicyReasonCode::InvalidClusterId.code().to_string(),
+        )
     } else {
         match runtime_policy_state.cluster_override(&intent.cluster_id) {
-            Some(cluster_state) if cluster_state.is_enabled => {
-                MarketPolicyReasonCode::MarketEligible
-            }
-            Some(_) => MarketPolicyReasonCode::ClusterDisabled,
-            None => MarketPolicyReasonCode::PolicyStateUnavailable,
+            Some(cluster_state) if cluster_state.is_enabled => (
+                true,
+                MarketPolicyReasonCode::MarketEligible.code().to_string(),
+            ),
+            Some(_) => (
+                false,
+                MarketPolicyReasonCode::ClusterDisabled.code().to_string(),
+            ),
+            None => (
+                false,
+                MarketPolicyReasonCode::PolicyStateUnavailable
+                    .code()
+                    .to_string(),
+            ),
         }
     };
 
@@ -74,8 +99,8 @@ pub fn evaluate_order_intent_gate<S: RuntimePolicyStateReader>(
         intent_id: intent.intent_id.clone(),
         market_id: intent.market_id.clone(),
         cluster_id: intent.cluster_id.clone(),
-        allowed: reason == MarketPolicyReasonCode::MarketEligible,
-        reason_code: reason.code().to_string(),
+        allowed,
+        reason_code,
         correlation_id: intent.correlation_id.clone(),
         decided_at_utc: intent.requested_at_utc.clone(),
     };
@@ -185,6 +210,38 @@ mod tests {
         assert_eq!(
             decision.reason_code,
             MarketPolicyReasonCode::PolicyStateUnavailable.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_denies_when_user_stream_auth_block_is_active() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_user_stream_auth_block(true);
+
+        let decision = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            UserStreamReasonCode::AuthExpired.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_recovery_unblocks_after_auth_block_clears() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        runtime_state.set_user_stream_auth_block(true);
+        let blocked = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+        assert!(!blocked.allowed);
+
+        runtime_state.set_user_stream_auth_block(false);
+        let recovered = evaluate_order_intent_gate(&runtime_state, &sample_intent());
+        assert!(recovered.allowed);
+        assert_eq!(
+            recovered.reason_code,
+            MarketPolicyReasonCode::MarketEligible.code()
         );
     }
 }

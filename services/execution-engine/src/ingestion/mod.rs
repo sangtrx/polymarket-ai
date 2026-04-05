@@ -1,3 +1,5 @@
+pub mod user_stream;
+
 use domain::risk::{
     MARKET_STREAM_BACKLOG_DEGRADED_SECONDS, MarketDepthLevel, MarketStatus, MarketStreamHealth,
     MarketStreamHealthStatus, MarketStreamReasonCode, MarketStreamTick, QuarantinedMarketEvent,
