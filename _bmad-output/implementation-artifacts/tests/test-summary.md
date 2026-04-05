@@ -2,31 +2,27 @@
 
 ## Story
 
-- 2-1-configure-market-universe-policy-engine
+- 2-2-ingest-market-stream-with-latency-guarantees
 
 ## Generated Tests
 
 ### API Tests
 
-- [x] `services/control-api/src/routes/mod.rs` — `market_policy_profile_route_returns_machine_readable_success_evidence` validates profile update happy-path acceptance and machine-readable evidence (`accepted`, `market_policy_profile_updated`).
-- [x] `services/control-api/src/routes/mod.rs` — `market_policy_profile_route_surfaces_service_unavailable_machine_error` validates explicit `503` propagation for persistence-unavailable profile update failures.
-- [x] `services/control-api/src/routes/mod.rs` — `market_policy_profile_route_surfaces_unknown_service_error_as_internal_server_error` validates explicit `500` fallback mapping for unclassified orchestration failures.
-- [x] `services/control-api/src/routes/mod.rs` — `market_policy_cluster_toggle_route_surfaces_conflict_machine_error` validates explicit `409` conflict behavior for cluster-toggle constraint violations.
-- [x] Existing route tests for unauthorized/invalid payload and runtime toggle transitions remain active for `/control/market-policy/profiles/{cluster_id}` and `/control/market-policy/clusters/{cluster_id}/toggle`.
+- [x] Not applicable for this story scope (no new HTTP/API route surface in Story 2.2 ingestion runtime).
 
 ### E2E Tests
 
-- [x] Existing deterministic gate-level E2E in `services/risk-engine/src/gates/mod.rs` validates runtime cluster toggle transitions without process restart (`order_intent_gate_blocks_new_intents_after_runtime_toggle_without_restart`).
-- [x] UI E2E not applicable (story scope is backend domain/persistence/governance/risk/control-api policy workflows).
+- [x] `services/execution-engine/src/ingestion/mod.rs` — `heartbeat_timeout_transitions_stream_health_to_degraded` validates heartbeat-gap boundary handling and degraded-mode reason-code transition (`market_stream_heartbeat_timeout`).
+- [x] `services/execution-engine/src/ingestion/mod.rs` — `record_stream_disconnect_persists_degraded_reason_code` validates explicit disconnect evidence persistence (`market_stream_disconnected`) with correlation metadata.
+- [x] `services/execution-engine/src/ingestion/mod.rs` — `accepted_tick_persistence_failure_surfaces_machine_readable_reason` validates fail-closed machine-readable persistence failure propagation (`market_stream_persistence_unavailable`).
+- [x] Existing runtime critical-flow tests remain active: `normal_load_path_meets_latency_target_boundary`, `malformed_payloads_are_quarantined_without_crashing_following_events`, and `burst_backlog_enters_degraded_mode_after_sustained_threshold`.
 
 ## Coverage
 
-- Market-policy control API endpoints: 2/2 covered with accepted-path and fail-closed machine-error scenarios.
-- Market-policy profile route scenarios: 5/5 covered (accepted, invalid payload `400`, unauthorized `403`, persistence unavailable `503`, unclassified failure `500`).
-- Cluster-toggle route scenarios: 3/3 covered (disable/enable accepted transitions + conflict `409`).
-- Runtime intent-gate behavior: 3/3 covered (enabled allow, runtime disable block, missing-state fail-closed).
+- Ingestion runtime critical flows: 6/6 covered (normal latency, quarantine continuity, burst backlog degradation, heartbeat-timeout degradation, disconnect degradation evidence, persistence-failure propagation).
+- Story-specific API endpoints: 0/0 applicable in Story 2.2 scope.
 
 ## Execution Result
 
-- `npm run qa:test:story-2-1` ✅
-- `npm run ci:rust` ✅
+- `npm run qa:test:story-2-2` ✅
+- `npm run rust:fmt && npm run rust:lint && npm run rust:build` ✅

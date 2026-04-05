@@ -3,24 +3,28 @@ mod orders;
 mod reconciliation;
 
 use common::time::timestamp_utc;
-use domain::risk::MarketSnapshot;
+use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
 async fn main() {
-    let bootstrap_policy_state = ingestion::IngestionPolicyState::default();
-    let bootstrap_snapshot = MarketSnapshot {
-        market_id: "bootstrap_market".to_string(),
-        cluster_id: "bootstrap_cluster".to_string(),
-        liquidity_depth_usd: 0.0,
-        spread_bps: 0.0,
-        reward_score: 0.0,
-        projected_exposure_pct_nav: 0.0,
-        observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
-    };
-    let _bootstrap_decision = bootstrap_policy_state.evaluate_market_snapshot(
-        &bootstrap_snapshot,
-        "execution-bootstrap-correlation",
-        "2026-04-06T00:00:00Z",
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for durable market stream persistence");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("failed to connect to Postgres for market stream ingestion");
+
+    let config = ingestion::MarketStreamRuntimeConfig::from_env()
+        .expect("execution market stream runtime configuration is invalid");
+    let store = ingestion::PostgresMarketStreamStore::new(pool);
+    let mut runtime = ingestion::MarketStreamIngestionRuntime::new(store, config);
+
+    println!(
+        "execution-engine market-stream bootstrap ready at {}",
+        timestamp_utc()
     );
-    println!("execution-engine bootstrap ready at {}", timestamp_utc());
+    if let Err(error) = ingestion::run_polymarket_ws_ingestion(&mut runtime).await {
+        panic!("execution-engine market-stream runtime halted fail-closed: {error}");
+    }
 }
