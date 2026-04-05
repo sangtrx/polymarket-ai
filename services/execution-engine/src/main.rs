@@ -4,6 +4,7 @@ mod reconciliation;
 
 use common::time::timestamp_utc;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -44,7 +45,10 @@ async fn main() {
         let user_store = ingestion::user_stream::PostgresUserStreamStore::new(pool.clone());
         let mut user_runtime =
             ingestion::user_stream::UserStreamIngestionRuntime::new(user_store, user_config);
+        let orders_store = orders::PostgresOrderLifecycleStore::new(pool.clone());
+        let orders_runtime = Arc::new(orders::OrderLifecycleRuntime::new(orders_store));
         user_runtime.attach_freshness_signals(freshness_signals.clone());
+        user_runtime.attach_order_lifecycle_port(orders_runtime);
         println!(
             "execution-engine market/user-stream/freshness bootstrap ready at {}",
             timestamp_utc()

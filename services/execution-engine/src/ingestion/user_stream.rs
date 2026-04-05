@@ -1,4 +1,5 @@
 use super::freshness_gate::SharedFreshnessSignals;
+use crate::orders::OrderLifecycleUpdatePort;
 #[cfg(test)]
 use domain::risk::USER_STREAM_AUTH_STATE_PARTITION_KEY;
 use domain::risk::{
@@ -27,8 +28,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::{Duration, sleep};
 
@@ -254,6 +256,7 @@ pub struct UserStreamIngestionRuntime<S: UserStreamStore> {
     config: UserStreamRuntimeConfig,
     state: UserStreamRuntimeState,
     freshness_signals: Option<SharedFreshnessSignals>,
+    order_lifecycle_port: Option<Arc<dyn OrderLifecycleUpdatePort>>,
 }
 
 impl<S: UserStreamStore> UserStreamIngestionRuntime<S> {
@@ -263,11 +266,16 @@ impl<S: UserStreamStore> UserStreamIngestionRuntime<S> {
             config,
             state: UserStreamRuntimeState::default(),
             freshness_signals: None,
+            order_lifecycle_port: None,
         }
     }
 
     pub fn attach_freshness_signals(&mut self, signals: SharedFreshnessSignals) {
         self.freshness_signals = Some(signals);
+    }
+
+    pub fn attach_order_lifecycle_port(&mut self, port: Arc<dyn OrderLifecycleUpdatePort>) {
+        self.order_lifecycle_port = Some(port);
     }
 
     pub fn latency_slo_met(&self) -> bool {
@@ -371,6 +379,13 @@ impl<S: UserStreamStore> UserStreamIngestionRuntime<S> {
                 if let Some(signals) = self.freshness_signals.as_ref() {
                     signals
                         .record_user_update(&event.observed_at_utc)
+                        .map_err(|error| {
+                            UserStreamIngestionError::new(error.code, error.message)
+                        })?;
+                }
+                if let Some(port) = self.order_lifecycle_port.as_ref() {
+                    port.apply_user_stream_event(&event)
+                        .await
                         .map_err(|error| {
                             UserStreamIngestionError::new(error.code, error.message)
                         })?;
@@ -1355,6 +1370,46 @@ impl UserStreamStore for InMemoryUserStreamStore {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    #[derive(Default)]
+    struct RecordingOrderLifecyclePort {
+        events: Arc<Mutex<Vec<UserStreamEvent>>>,
+    }
+
+    impl RecordingOrderLifecyclePort {
+        fn events(&self) -> Vec<UserStreamEvent> {
+            self.events
+                .lock()
+                .expect("order lifecycle recording list should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl OrderLifecycleUpdatePort for RecordingOrderLifecyclePort {
+        fn apply_user_stream_event<'a>(
+            &'a self,
+            event: &'a UserStreamEvent,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(), crate::orders::OrderLifecycleRuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .map_err(|_| crate::orders::OrderLifecycleRuntimeError {
+                        code: UserStreamReasonCode::PersistenceUnavailable.code(),
+                        message: "order lifecycle recording state is poisoned".to_string(),
+                    })?
+                    .push(event.clone());
+                Ok(())
+            })
+        }
+    }
 
     fn sample_config() -> UserStreamRuntimeConfig {
         UserStreamRuntimeConfig {
@@ -1444,6 +1499,8 @@ mod tests {
     async fn duplicates_and_out_of_order_events_are_ignored_without_state_regression() {
         let store = InMemoryUserStreamStore::default();
         let mut runtime = UserStreamIngestionRuntime::new(store.clone(), sample_config());
+        let order_lifecycle_port = Arc::new(RecordingOrderLifecyclePort::default());
+        runtime.attach_order_lifecycle_port(order_lifecycle_port.clone());
         let start = 1_775_404_800_000_i64;
 
         let accepted = runtime
@@ -1529,6 +1586,65 @@ mod tests {
         );
         assert_eq!(cursor.correlation_id, second_accepted.correlation_id);
         assert_eq!(cursor.updated_at_utc, rfc3339_from_millis(start + 3_200));
+
+        let lifecycle_events = order_lifecycle_port.events();
+        assert_eq!(lifecycle_events.len(), 2);
+        assert_eq!(lifecycle_events[0].event_offset, start);
+        assert_eq!(lifecycle_events[1].event_offset, start + 2_000);
+    }
+
+    #[tokio::test]
+    async fn order_lifecycle_integration_preserves_canonical_state_when_duplicates_arrive() {
+        let store = InMemoryUserStreamStore::default();
+        let mut runtime = UserStreamIngestionRuntime::new(store.clone(), sample_config());
+        let order_store = crate::orders::InMemoryOrderLifecycleStore::default();
+        let order_runtime = Arc::new(crate::orders::OrderLifecycleRuntime::new(order_store));
+        runtime.attach_order_lifecycle_port(order_runtime.clone());
+        let start = 1_775_404_800_000_i64;
+
+        runtime
+            .process_order_message(
+                &sample_order_message("order-lifecycle-1", start),
+                &rfc3339_from_millis(start + 1_100),
+            )
+            .await
+            .expect("initial order event should be accepted");
+        runtime
+            .process_order_message(
+                &sample_order_message("order-lifecycle-1", start),
+                &rfc3339_from_millis(start + 1_200),
+            )
+            .await
+            .expect("duplicate event should be ignored");
+        runtime
+            .process_order_message(
+                &sample_order_message("order-lifecycle-1", start - 1_000),
+                &rfc3339_from_millis(start + 1_300),
+            )
+            .await
+            .expect("out-of-order event should be ignored");
+        runtime
+            .process_order_message(
+                &sample_order_message("order-lifecycle-1", start + 2_000),
+                &rfc3339_from_millis(start + 3_100),
+            )
+            .await
+            .expect("newer event should be accepted");
+
+        let order = order_runtime
+            .hydrate_order("order-lifecycle-1")
+            .await
+            .expect("order lifecycle load should succeed")
+            .expect("order lifecycle projection should exist");
+        assert_eq!(order.state, domain::order::OrderLifecycleState::Live);
+
+        let transitions = order_runtime
+            .replay_order("order-lifecycle-1")
+            .await
+            .expect("order lifecycle replay should succeed");
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0].transition_sequence, 1);
+        assert_eq!(transitions[1].transition_sequence, 2);
     }
 
     #[tokio::test]
@@ -1572,6 +1688,55 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_status, UserStreamEventStatus::Matched);
         assert_eq!(events[1].event_status, UserStreamEventStatus::Cancellation);
+    }
+
+    #[tokio::test]
+    async fn process_order_message_rejects_unsupported_venue_state_without_side_effects() {
+        let store = InMemoryUserStreamStore::default();
+        let mut runtime = UserStreamIngestionRuntime::new(store.clone(), sample_config());
+        let order_lifecycle_port = Arc::new(RecordingOrderLifecyclePort::default());
+        runtime.attach_order_lifecycle_port(order_lifecycle_port.clone());
+        let event_offset = 1_775_404_800_000_i64;
+
+        let mut unsupported_status =
+            sample_order_message_with_status_only("order-unsupported-state", event_offset, "LIVE");
+        unsupported_status.msg_type = None;
+        unsupported_status.status = Some(OrderStatusType::Unknown("HALTED_UNKNOWN".to_string()));
+
+        let error = runtime
+            .process_order_message(
+                &unsupported_status,
+                &rfc3339_from_millis(event_offset + 1_100),
+            )
+            .await
+            .expect_err("unsupported venue state should fail closed");
+        assert_eq!(error.code, UserStreamReasonCode::InvalidPayload.code());
+        assert!(error.message.contains("unsupported order status"));
+        assert!(store.events().is_empty());
+        assert!(store.cursor_for_partition("order-unsupported-state").is_none());
+        assert!(order_lifecycle_port.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_order_message_rejects_unsupported_message_type_without_side_effects() {
+        let store = InMemoryUserStreamStore::default();
+        let mut runtime = UserStreamIngestionRuntime::new(store.clone(), sample_config());
+        let order_lifecycle_port = Arc::new(RecordingOrderLifecyclePort::default());
+        runtime.attach_order_lifecycle_port(order_lifecycle_port.clone());
+        let event_offset = 1_775_404_801_000_i64;
+
+        let mut unsupported_type = sample_order_message("order-unsupported-type", event_offset);
+        unsupported_type.msg_type = Some(OrderMessageType::Unknown("AUCTION".to_string()));
+
+        let error = runtime
+            .process_order_message(&unsupported_type, &rfc3339_from_millis(event_offset + 1_100))
+            .await
+            .expect_err("unsupported venue message type should fail closed");
+        assert_eq!(error.code, UserStreamReasonCode::InvalidPayload.code());
+        assert!(error.message.contains("unsupported order message type"));
+        assert!(store.events().is_empty());
+        assert!(store.cursor_for_partition("order-unsupported-type").is_none());
+        assert!(order_lifecycle_port.events().is_empty());
     }
 
     #[tokio::test]

@@ -631,7 +631,11 @@ mod tests {
             .await
             .expect_err("non-UTC sample timestamp should fail closed");
         assert_eq!(error.code, FreshnessGateReasonCode::InvalidPayload.code());
-        assert!(error.message.contains("freshness timestamps must use UTC `Z` offset"));
+        assert!(
+            error
+                .message
+                .contains("freshness timestamps must use UTC `Z` offset")
+        );
     }
 
     #[tokio::test]
@@ -655,7 +659,11 @@ mod tests {
             error.code,
             FreshnessGateReasonCode::PersistenceUnavailable.code()
         );
-        assert!(error.message.contains("forced freshness gate persistence failure"));
+        assert!(
+            error
+                .message
+                .contains("forced freshness gate persistence failure")
+        );
     }
 
     #[tokio::test]
