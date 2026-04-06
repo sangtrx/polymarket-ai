@@ -2,10 +2,12 @@
 
 use crate::limits::{RuntimeRiskLimitStateReader, evaluate_risk_limit_state_snapshot};
 use crate::safe_state::{
-    DrawdownProtectiveModeSignal, NoopSafeStateSignals, RuntimeSafeStateSignalPort,
+    DrawdownProtectiveModeSignal, EmergencySafeStateSignal, NoopSafeStateSignals,
+    RuntimeSafeStateSignalPort,
 };
 use domain::reconciliation::ReconciliationReasonCode;
 use domain::risk::{
+    EmergencyControlAction, EmergencyControlReasonCode, EmergencyControlTriggerSource,
     FreshnessGateReasonCode, MarketClusterOverride, MarketEligibilityOutcome, MarketPolicyProfile,
     MarketPolicyReasonCode, MarketSnapshot, MarketStreamHealthStatus, PreTradeDecisionOutcome,
     PreTradeGateDecision, PreTradeGateDimension, PreTradeGateResult, PreTradeReasonCode,
@@ -726,6 +728,9 @@ fn finalize_pretrade_decision<P: RuntimeSafeStateSignalPort>(
             triggered_at_utc: decision.evaluated_at_utc.clone(),
         });
     }
+    if let Some(emergency_signal) = map_pretrade_reason_to_emergency_signal(&decision) {
+        safe_state_port.signal_emergency_safe_state(emergency_signal);
+    }
     decision
 }
 
@@ -1069,6 +1074,43 @@ fn map_market_eligibility_reason_to_pretrade(reason_code: &str) -> PreTradeReaso
     }
 }
 
+fn map_pretrade_reason_to_emergency_signal(
+    decision: &PreTradeGateDecision,
+) -> Option<EmergencySafeStateSignal> {
+    if decision.outcome != PreTradeDecisionOutcome::Deny {
+        return None;
+    }
+
+    let pretrade_reason = PreTradeReasonCode::parse(&decision.reason_code).ok()?;
+    let (trigger_source, reason_code) = match pretrade_reason {
+        PreTradeReasonCode::FreshnessStaleBreach => (
+            EmergencyControlTriggerSource::StaleFeed,
+            EmergencyControlReasonCode::StaleFeedTriggered.code(),
+        ),
+        PreTradeReasonCode::ReconciliationCriticalHalt => (
+            EmergencyControlTriggerSource::ReconciliationCritical,
+            EmergencyControlReasonCode::ReconciliationCriticalTriggered.code(),
+        ),
+        PreTradeReasonCode::FreshnessStateUnavailable
+        | PreTradeReasonCode::StreamHealthStateUnavailable
+        | PreTradeReasonCode::RiskLimitStateUnavailable
+        | PreTradeReasonCode::StrategyApprovalUnavailable
+        | PreTradeReasonCode::VenueEligibilityUnavailable => (
+            EmergencyControlTriggerSource::ControlUncertainty,
+            EmergencyControlReasonCode::ControlUncertaintyTriggered.code(),
+        ),
+        _ => return None,
+    };
+
+    Some(EmergencySafeStateSignal {
+        action: EmergencyControlAction::Pause,
+        trigger_source,
+        reason_code: reason_code.to_string(),
+        correlation_id: decision.correlation_id.clone(),
+        triggered_at_utc: decision.evaluated_at_utc.clone(),
+    })
+}
+
 fn build_pretrade_gate_result(
     gate: PreTradeGateDimension,
     passed: bool,
@@ -1171,8 +1213,8 @@ mod tests {
     use crate::limits::InMemoryRiskLimitState;
     use crate::safe_state::InMemorySafeStateSignals;
     use domain::risk::{
-        MarketPolicyProfile, MarketSnapshot, PreTradeDecisionOutcome, PreTradeGateDimension,
-        PreTradeReasonCode,
+        EmergencyControlReasonCode, EmergencyControlTriggerSource, MarketPolicyProfile,
+        MarketSnapshot, PreTradeDecisionOutcome, PreTradeGateDimension, PreTradeReasonCode,
         RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode, RiskLimitScope,
         RiskScopeLimit,
     };
@@ -1624,8 +1666,12 @@ mod tests {
         let mut intent = sample_intent();
         intent.market_id = "missing_market".to_string();
 
-        let decision =
-            evaluate_order_intent_gate_with_limit_state(&runtime_state, &limit_state, &intent, "default");
+        let decision = evaluate_order_intent_gate_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &intent,
+            "default",
+        );
 
         assert!(!decision.allowed);
         assert_eq!(
@@ -1670,6 +1716,116 @@ mod tests {
             latest_signal.reason_code,
             PreTradeReasonCode::DrawdownStopTriggered.code()
         );
+        assert!(safe_state_signals.latest_emergency_signal().is_none());
+    }
+
+    #[test]
+    fn stale_feed_gate_failure_publishes_automatic_emergency_safe_state_signal() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        runtime_state.set_freshness_pause(true, FreshnessGateReasonCode::StaleBreach.code());
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        let safe_state_signals = InMemorySafeStateSignals::default();
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state_and_safe_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+            &safe_state_signals,
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::FreshnessStaleBreach.code()
+        );
+
+        let emergency_signal = safe_state_signals
+            .latest_emergency_signal()
+            .expect("stale-feed failures should publish emergency safe-state signals");
+        assert_eq!(
+            emergency_signal.trigger_source,
+            EmergencyControlTriggerSource::StaleFeed
+        );
+        assert_eq!(
+            emergency_signal.reason_code,
+            EmergencyControlReasonCode::StaleFeedTriggered.code()
+        );
+    }
+
+    #[test]
+    fn reconciliation_halt_failure_publishes_automatic_emergency_safe_state_signal() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        runtime_state
+            .set_reconciliation_halt(true, ReconciliationReasonCode::CriticalMismatch.code());
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        let safe_state_signals = InMemorySafeStateSignals::default();
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state_and_safe_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+            &safe_state_signals,
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::ReconciliationCriticalHalt.code()
+        );
+
+        let emergency_signal = safe_state_signals
+            .latest_emergency_signal()
+            .expect("critical reconciliation failures should publish emergency safe-state signals");
+        assert_eq!(
+            emergency_signal.trigger_source,
+            EmergencyControlTriggerSource::ReconciliationCritical
+        );
+        assert_eq!(
+            emergency_signal.reason_code,
+            EmergencyControlReasonCode::ReconciliationCriticalTriggered.code()
+        );
+    }
+
+    #[test]
+    fn unavailable_runtime_state_publishes_control_uncertainty_emergency_signal() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        runtime_state.clear_stream_health_state();
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        let safe_state_signals = InMemorySafeStateSignals::default();
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state_and_safe_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+            &safe_state_signals,
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::StreamHealthStateUnavailable.code()
+        );
+
+        let emergency_signal = safe_state_signals
+            .latest_emergency_signal()
+            .expect("missing runtime dependencies should publish control-uncertainty signals");
+        assert_eq!(
+            emergency_signal.trigger_source,
+            EmergencyControlTriggerSource::ControlUncertainty
+        );
+        assert_eq!(
+            emergency_signal.reason_code,
+            EmergencyControlReasonCode::ControlUncertaintyTriggered.code()
+        );
     }
 
     #[test]
@@ -1687,7 +1843,10 @@ mod tests {
         );
 
         assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
-        assert_eq!(decision.reason_code, PreTradeReasonCode::InvalidPayload.code());
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::InvalidPayload.code()
+        );
         assert_eq!(decision.evaluated_at_utc, intent.requested_at_utc);
     }
 
@@ -1706,7 +1865,10 @@ mod tests {
         );
 
         assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
-        assert_eq!(decision.reason_code, PreTradeReasonCode::InvalidPayload.code());
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::InvalidPayload.code()
+        );
         assert_eq!(
             decision.evaluated_at_utc,
             FALLBACK_PRETRADE_EVALUATED_AT_UTC
@@ -1733,7 +1895,10 @@ mod tests {
         );
 
         assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
-        assert_eq!(decision.reason_code, PreTradeReasonCode::InvalidPayload.code());
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::InvalidPayload.code()
+        );
         assert!(!decision.protective_mode_active);
         assert_eq!(decision.gate_results.len(), 1);
         assert_eq!(

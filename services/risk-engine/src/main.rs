@@ -5,7 +5,8 @@ mod safe_state;
 use common::time::timestamp_utc;
 use domain::reconciliation::ReconciliationReasonCode;
 use domain::risk::{
-    MarketPolicyReasonCode, MarketSnapshot, PreTradeReasonCode, RiskLimitReasonCode,
+    EmergencyControlMode, MarketPolicyReasonCode, MarketSnapshot, PreTradeReasonCode,
+    RiskLimitReasonCode,
 };
 use persistence::postgres::freshness_gate::load_latest_freshness_gate_event;
 use persistence::postgres::market_policy::{
@@ -18,6 +19,7 @@ use persistence::postgres::pretrade_gate::{
 use persistence::postgres::risk_limits::{
     load_active_risk_limit_profile_bundle, load_pending_risk_limit_profile_bundles,
 };
+use persistence::postgres::safety_controls::load_current_effective_safety_mode;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::future::Future;
 use std::pin::Pin;
@@ -242,6 +244,7 @@ async fn hydrate_runtime_state_from_sources(
     hydrate_latest_stream_health_state(runtime_policy_state, &pool, config).await;
     hydrate_latest_limit_state(runtime_limit_state, &pool, config).await;
     hydrate_latest_market_policy_state(runtime_policy_state, &pool, config).await;
+    hydrate_latest_safety_mode_state(runtime_policy_state, &pool).await;
     Some(pool)
 }
 
@@ -355,6 +358,36 @@ async fn hydrate_latest_market_policy_state(
         Err(error) => {
             println!("risk-engine bootstrap could not hydrate market cluster override: {error}");
         }
+    }
+}
+
+async fn hydrate_latest_safety_mode_state(
+    runtime_policy_state: &gates::InMemoryRuntimePolicyState,
+    pool: &PgPool,
+) {
+    match load_current_effective_safety_mode(pool).await {
+        Ok(Some(mode)) => apply_safety_mode_containment(runtime_policy_state, mode.resulting_mode),
+        Ok(None) => {
+            runtime_policy_state.set_user_stream_auth_block(true);
+            println!(
+                "risk-engine bootstrap found no effective safety mode, preserving fail-closed containment"
+            );
+        }
+        Err(error) => {
+            runtime_policy_state.set_user_stream_auth_block(true);
+            println!(
+                "risk-engine bootstrap could not hydrate safety mode, preserving fail-closed containment: {error}"
+            );
+        }
+    }
+}
+
+fn apply_safety_mode_containment(
+    runtime_policy_state: &gates::InMemoryRuntimePolicyState,
+    mode: EmergencyControlMode,
+) {
+    if mode == EmergencyControlMode::Paused {
+        runtime_policy_state.set_user_stream_auth_block(true);
     }
 }
 
@@ -544,6 +577,41 @@ mod tests {
         assert_eq!(
             decision_store.persisted_intent_ids(),
             vec!["live-intent-002".to_string()]
+        );
+    }
+
+    #[test]
+    fn paused_mode_forces_fail_closed_user_stream_auth_block() {
+        let runtime_policy_state = gates::InMemoryRuntimePolicyState::default();
+        runtime_policy_state.set_user_stream_auth_block(false);
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Paused);
+        assert!(
+            gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+        );
+    }
+
+    #[test]
+    fn normal_and_reduce_only_modes_preserve_existing_user_stream_auth_block_state() {
+        let runtime_policy_state = gates::InMemoryRuntimePolicyState::default();
+
+        runtime_policy_state.set_user_stream_auth_block(false);
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Normal);
+        assert!(
+            !gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+        );
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::ReduceOnly);
+        assert!(
+            !gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+        );
+
+        runtime_policy_state.set_user_stream_auth_block(true);
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Normal);
+        assert!(
+            gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+        );
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::ReduceOnly);
+        assert!(
+            gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
         );
     }
 }

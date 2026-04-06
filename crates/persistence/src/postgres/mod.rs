@@ -9,6 +9,7 @@ pub mod pretrade_gate;
 pub mod rbac;
 pub mod reconciliation;
 pub mod risk_limits;
+pub mod safety_controls;
 pub mod user_stream;
 
 pub fn migration_namespace() -> &'static str {

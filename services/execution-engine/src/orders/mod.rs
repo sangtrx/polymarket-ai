@@ -6,7 +6,8 @@ use domain::order::{
     normalize_order_idempotency_key, normalize_order_submission_idempotency_key,
 };
 use domain::risk::{
-    PreTradeDecisionOutcome, PreTradeReasonCode, UserStreamEvent, UserStreamEventStatus,
+    EmergencyControlMode, EmergencyControlReasonCode, PreTradeDecisionOutcome, PreTradeReasonCode,
+    UserStreamEvent, UserStreamEventStatus,
 };
 use persistence::postgres::orders::{
     OrderLifecyclePersistDisposition, OrderLifecyclePersistOutcome, OrderLifecyclePersistenceError,
@@ -16,6 +17,7 @@ use persistence::postgres::orders::{
 use persistence::postgres::pretrade_gate::{
     PreTradeGatePersistenceError, load_latest_pretrade_gate_decision_by_intent,
 };
+use persistence::postgres::safety_controls::load_current_effective_safety_mode;
 use serde::Serialize;
 use sqlx::PgPool;
 use std::error::Error;
@@ -192,6 +194,77 @@ impl RiskAdjudicationPort for PostgresRiskAdjudicationPort {
     }
 }
 
+pub trait EmergencyControlModePort: Send + Sync {
+    fn load_current_mode<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<EmergencyControlMode, OrderLifecycleRuntimeError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+#[derive(Debug, Default)]
+pub struct DefaultEmergencyControlModePort;
+
+impl EmergencyControlModePort for DefaultEmergencyControlModePort {
+    fn load_current_mode<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<EmergencyControlMode, OrderLifecycleRuntimeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(EmergencyControlMode::Normal) })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresEmergencyControlModePort {
+    pool: PgPool,
+}
+
+impl PostgresEmergencyControlModePort {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl EmergencyControlModePort for PostgresEmergencyControlModePort {
+    fn load_current_mode<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<EmergencyControlMode, OrderLifecycleRuntimeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mode = load_current_effective_safety_mode(&self.pool)
+                .await
+                .map_err(|error| {
+                    OrderLifecycleRuntimeError::new(
+                        EmergencyControlReasonCode::OrchestrationUnavailable.code(),
+                        format!("failed to load emergency safety mode: {error}"),
+                    )
+                })?
+                .map(|evidence| evidence.resulting_mode)
+                .ok_or_else(|| {
+                    OrderLifecycleRuntimeError::new(
+                        EmergencyControlReasonCode::OrchestrationUnavailable.code(),
+                        "no effective emergency safety mode found; refusing submit path open by default",
+                    )
+                })?;
+            Ok(mode)
+        })
+    }
+}
+
 pub trait OrderLifecycleStore: Send + Sync {
     fn persist_transition<'a>(
         &'a self,
@@ -361,6 +434,20 @@ pub struct BatchCancelOrderRequest {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyCancelAllCommand {
+    pub market_id: String,
+    pub correlation_id: String,
+    pub requested_at_utc: String,
+    pub orders: Vec<EmergencyCancelOrderRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyCancelOrderRequest {
+    pub order_id: String,
+    pub mode: OrderMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchCancelOutcomeKind {
     Canceled,
@@ -401,6 +488,7 @@ pub trait OrderLifecycleUpdatePort: Send + Sync {
 pub struct OrderLifecycleRuntime<S: OrderLifecycleStore> {
     store: S,
     risk_adjudication_port: Arc<dyn RiskAdjudicationPort>,
+    emergency_mode_port: Arc<dyn EmergencyControlModePort>,
     pretrade_adjudication_timeout: Duration,
 }
 
@@ -409,6 +497,7 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
         Self {
             store,
             risk_adjudication_port: Arc::new(UnavailableRiskAdjudicationPort),
+            emergency_mode_port: Arc::new(DefaultEmergencyControlModePort),
             pretrade_adjudication_timeout: Duration::from_millis(
                 DEFAULT_PRETRADE_ADJUDICATION_TIMEOUT_MS,
             ),
@@ -420,9 +509,24 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
         risk_adjudication_port: Arc<dyn RiskAdjudicationPort>,
         pretrade_adjudication_timeout: Duration,
     ) -> Self {
+        Self::with_runtime_ports(
+            store,
+            risk_adjudication_port,
+            Arc::new(DefaultEmergencyControlModePort),
+            pretrade_adjudication_timeout,
+        )
+    }
+
+    pub fn with_runtime_ports(
+        store: S,
+        risk_adjudication_port: Arc<dyn RiskAdjudicationPort>,
+        emergency_mode_port: Arc<dyn EmergencyControlModePort>,
+        pretrade_adjudication_timeout: Duration,
+    ) -> Self {
         Self {
             store,
             risk_adjudication_port,
+            emergency_mode_port,
             pretrade_adjudication_timeout,
         }
     }
@@ -437,6 +541,7 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
             &command.correlation_id,
             &command.requested_at_utc,
         )?;
+        self.enforce_emergency_mode_for_submit(&command).await?;
         let adjudication_request = PreTradeAdjudicationRequest {
             order_id: command.order_id.clone(),
             market_id: command.market_id.clone(),
@@ -606,6 +711,33 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
         Ok(outcomes)
     }
 
+    pub async fn cancel_all_orders(
+        &self,
+        command: EmergencyCancelAllCommand,
+    ) -> Result<Vec<BatchCancelOrderOutcome>, OrderLifecycleRuntimeError> {
+        let batch_idempotency_key = format!(
+            "emergency-cancel-all::{}::{}",
+            normalize_order_idempotency_key(&command.correlation_id),
+            compact_timestamp_token(&command.requested_at_utc)
+        );
+        self.batch_cancel(BatchCancelCommand {
+            market_id: command.market_id,
+            correlation_id: command.correlation_id,
+            requested_at_utc: command.requested_at_utc,
+            batch_idempotency_key,
+            orders: command
+                .orders
+                .into_iter()
+                .map(|order| BatchCancelOrderRequest {
+                    order_id: order.order_id,
+                    mode: order.mode,
+                    idempotency_key: None,
+                })
+                .collect(),
+        })
+        .await
+    }
+
     pub async fn hydrate_order(
         &self,
         order_id: &str,
@@ -666,6 +798,44 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
             .await?;
 
         Ok(outcome)
+    }
+
+    async fn enforce_emergency_mode_for_submit(
+        &self,
+        command: &SubmitOrderCommand,
+    ) -> Result<(), OrderLifecycleRuntimeError> {
+        let mode = self
+            .emergency_mode_port
+            .load_current_mode()
+            .await
+            .inspect_err(|error| emit_emergency_submit_deny_telemetry(command, error.code))?;
+
+        match mode {
+            EmergencyControlMode::Normal => Ok(()),
+            EmergencyControlMode::Paused => {
+                let reason_code = EmergencyControlReasonCode::PauseActive.code();
+                emit_emergency_submit_deny_telemetry(command, reason_code);
+                Err(OrderLifecycleRuntimeError::new(
+                    reason_code,
+                    format!(
+                        "submit denied for `{}` because emergency mode is paused",
+                        command.order_id
+                    ),
+                ))
+            }
+            EmergencyControlMode::ReduceOnly if command.mode != OrderMode::ReduceOnly => {
+                let reason_code = EmergencyControlReasonCode::ReduceOnlyActive.code();
+                emit_emergency_submit_deny_telemetry(command, reason_code);
+                Err(OrderLifecycleRuntimeError::new(
+                    reason_code,
+                    format!(
+                        "submit denied for `{}` because emergency mode requires reduce_only orders",
+                        command.order_id
+                    ),
+                ))
+            }
+            EmergencyControlMode::ReduceOnly => Ok(()),
+        }
     }
 
     async fn adjudicate_submit_order_request(
@@ -874,10 +1044,7 @@ fn fallback_event_id(event_name: &str, order_id: &str, timestamp_utc: &str) -> S
     format!("{event_name}::{order_id}::{compact_timestamp}")
 }
 
-fn emit_pretrade_submit_deny_telemetry(
-    request: &PreTradeAdjudicationRequest,
-    reason_code: &str,
-) {
+fn emit_pretrade_submit_deny_telemetry(request: &PreTradeAdjudicationRequest, reason_code: &str) {
     let deny_event_id = fallback_event_id(
         "execution_order_lifecycle_submit_pretrade_deny_v1",
         &request.order_id,
@@ -894,6 +1061,26 @@ fn emit_pretrade_submit_deny_telemetry(
         to_state: None,
         reason_code,
         timestamp_utc: &request.requested_at_utc,
+    });
+}
+
+fn emit_emergency_submit_deny_telemetry(command: &SubmitOrderCommand, reason_code: &str) {
+    let deny_event_id = fallback_event_id(
+        "execution_order_lifecycle_submit_emergency_deny_v1",
+        &command.order_id,
+        &command.requested_at_utc,
+    );
+    emit_order_lifecycle_telemetry(OrderLifecycleTelemetryEvent {
+        event_name: "execution_order_lifecycle_submit_emergency_deny_v1",
+        event_id: &deny_event_id,
+        outcome: "deny",
+        correlation_id: &command.correlation_id,
+        order_id: &command.order_id,
+        market_id: &command.market_id,
+        from_state: None,
+        to_state: None,
+        reason_code,
+        timestamp_utc: &command.requested_at_utc,
     });
 }
 
@@ -1355,6 +1542,62 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct PausedEmergencyControlModePort;
+
+    impl EmergencyControlModePort for PausedEmergencyControlModePort {
+        fn load_current_mode<'a>(
+            &'a self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<EmergencyControlMode, OrderLifecycleRuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(EmergencyControlMode::Paused) })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ReduceOnlyEmergencyControlModePort;
+
+    impl EmergencyControlModePort for ReduceOnlyEmergencyControlModePort {
+        fn load_current_mode<'a>(
+            &'a self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<EmergencyControlMode, OrderLifecycleRuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(EmergencyControlMode::ReduceOnly) })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct UnavailableEmergencyControlModePort;
+
+    impl EmergencyControlModePort for UnavailableEmergencyControlModePort {
+        fn load_current_mode<'a>(
+            &'a self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<EmergencyControlMode, OrderLifecycleRuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Err(OrderLifecycleRuntimeError::new(
+                    EmergencyControlReasonCode::OrchestrationUnavailable.code(),
+                    "emergency mode lookup unavailable",
+                ))
+            })
+        }
+    }
+
     #[tokio::test]
     async fn submit_order_with_allowed_pretrade_adjudication_preserves_lifecycle_behavior() {
         let store = InMemoryOrderLifecycleStore::default();
@@ -1484,6 +1727,128 @@ mod tests {
             .await
             .expect("hydrate should succeed");
         assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_denied_when_emergency_mode_is_paused() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_runtime_ports(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Arc::new(PausedEmergencyControlModePort),
+            Duration::from_millis(100),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-emergency-paused"))
+            .await
+            .expect_err("paused emergency mode must fail submit path closed");
+
+        assert_eq!(error.code, EmergencyControlReasonCode::PauseActive.code());
+        let hydrated = runtime
+            .hydrate_order("order-emergency-paused")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_denied_when_emergency_mode_is_paused_for_reduce_only_order() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_runtime_ports(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Arc::new(PausedEmergencyControlModePort),
+            Duration::from_millis(100),
+        );
+
+        let mut command = sample_submit_command("order-emergency-paused-reduce-only");
+        command.mode = OrderMode::ReduceOnly;
+        let error = runtime
+            .submit_order(command)
+            .await
+            .expect_err("paused emergency mode must block reduce-only submit paths");
+
+        assert_eq!(error.code, EmergencyControlReasonCode::PauseActive.code());
+        let hydrated = runtime
+            .hydrate_order("order-emergency-paused-reduce-only")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_denied_when_reduce_only_mode_receives_limit_order() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_runtime_ports(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Arc::new(ReduceOnlyEmergencyControlModePort),
+            Duration::from_millis(100),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-emergency-reduce-only-deny"))
+            .await
+            .expect_err("reduce-only mode must deny non-reduce-only submits");
+
+        assert_eq!(
+            error.code,
+            EmergencyControlReasonCode::ReduceOnlyActive.code()
+        );
+        let hydrated = runtime
+            .hydrate_order("order-emergency-reduce-only-deny")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_allows_reduce_only_orders_when_emergency_mode_is_reduce_only() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_runtime_ports(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Arc::new(ReduceOnlyEmergencyControlModePort),
+            Duration::from_millis(100),
+        );
+
+        let mut command = sample_submit_command("order-emergency-reduce-only-allow");
+        command.mode = OrderMode::ReduceOnly;
+        let outcome = runtime
+            .submit_order(command)
+            .await
+            .expect("reduce-only mode should allow reduce-only submissions");
+
+        assert_eq!(
+            outcome.disposition,
+            OrderLifecycleCommandDisposition::Applied
+        );
+        assert_eq!(
+            outcome.reason_code,
+            OrderLifecycleReasonCode::SubmissionAccepted.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_order_fails_closed_when_emergency_mode_lookup_is_unavailable() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_runtime_ports(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Arc::new(UnavailableEmergencyControlModePort),
+            Duration::from_millis(100),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-emergency-mode-unavailable"))
+            .await
+            .expect_err("unavailable emergency mode dependency must fail closed");
+
+        assert_eq!(
+            error.code,
+            EmergencyControlReasonCode::OrchestrationUnavailable.code()
+        );
     }
 
     #[test]
@@ -1831,5 +2196,67 @@ mod tests {
         assert_eq!(retry_attempt[0].idempotency_key, retry_safe_key);
         assert_eq!(first_attempt[1].idempotency_key, terminal_key);
         assert_eq!(retry_attempt[1].idempotency_key, terminal_key);
+    }
+
+    #[tokio::test]
+    async fn emergency_cancel_all_reuses_batch_cancel_lifecycle_and_preserves_outcomes() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
+
+        runtime
+            .submit_order(sample_submit_command("order-cancel-all-1"))
+            .await
+            .expect("submit should succeed");
+        runtime
+            .submit_order(sample_submit_command("order-cancel-all-2"))
+            .await
+            .expect("submit should succeed");
+
+        let outcomes = runtime
+            .cancel_all_orders(EmergencyCancelAllCommand {
+                market_id: "market-1".to_string(),
+                correlation_id: "corr-emergency-cancel-all-001".to_string(),
+                requested_at_utc: "2026-04-06T00:00:30Z".to_string(),
+                orders: vec![
+                    EmergencyCancelOrderRequest {
+                        order_id: "order-cancel-all-1".to_string(),
+                        mode: OrderMode::Limit,
+                    },
+                    EmergencyCancelOrderRequest {
+                        order_id: "order-cancel-all-2".to_string(),
+                        mode: OrderMode::Limit,
+                    },
+                ],
+            })
+            .await
+            .expect("cancel-all should fan out through batch-cancel path");
+
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].outcome, BatchCancelOutcomeKind::Canceled);
+        assert_eq!(outcomes[1].outcome, BatchCancelOutcomeKind::Canceled);
+        assert_eq!(
+            outcomes[0].reason_code,
+            OrderLifecycleReasonCode::BatchCancelAccepted.code()
+        );
+        assert_eq!(
+            outcomes[1].reason_code,
+            OrderLifecycleReasonCode::BatchCancelAccepted.code()
+        );
+        let first = runtime
+            .hydrate_order("order-cancel-all-1")
+            .await
+            .expect("hydrate should succeed")
+            .expect("order should exist");
+        let second = runtime
+            .hydrate_order("order-cancel-all-2")
+            .await
+            .expect("hydrate should succeed")
+            .expect("order should exist");
+        assert_eq!(first.state, OrderLifecycleState::Canceled);
+        assert_eq!(second.state, OrderLifecycleState::Canceled);
     }
 }

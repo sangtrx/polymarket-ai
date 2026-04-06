@@ -14,6 +14,7 @@ use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
 use governance_service::credentials::{CredentialRotationOrchestrator, CredentialRotationService};
 use governance_service::market_policy::{MarketPolicyOrchestrator, MarketPolicyService};
 use governance_service::risk_limits::{RiskLimitOrchestrator, RiskLimitService};
+use governance_service::safety_controls::{SafetyControlOrchestrator, SafetyControlService};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -212,6 +213,7 @@ pub struct ControlApiState {
     pub credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
     pub market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
+    pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
 }
 
 impl ControlApiState {
@@ -259,9 +261,11 @@ impl ControlApiState {
             credential_rotation_orchestrator,
             Arc::new(MarketPolicyService::default()),
             Arc::new(RiskLimitService::default()),
+            Arc::new(SafetyControlService::default()),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_all_orchestrators(
         authorization_guard: Arc<dyn AuthorizationGuard>,
         authenticator: Arc<dyn Authenticator>,
@@ -270,6 +274,7 @@ impl ControlApiState {
         credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
         market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
         risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
+        safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
     ) -> Self {
         Self {
             authorization_guard,
@@ -279,6 +284,7 @@ impl ControlApiState {
             credential_rotation_orchestrator,
             market_policy_orchestrator,
             risk_limit_orchestrator,
+            safety_control_orchestrator,
         }
     }
 }

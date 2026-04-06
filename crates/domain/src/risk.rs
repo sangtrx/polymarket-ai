@@ -16,6 +16,9 @@ pub const USER_STREAM_AUTH_STATE_PARTITION_KEY: &str = "__user_stream_auth_state
 pub const FRESHNESS_STALE_THRESHOLD_SECONDS: f64 = 30.0;
 pub const FRESHNESS_RECOVERY_STABILITY_WINDOW_SECONDS: f64 = 10.0;
 pub const FRESHNESS_MAX_BREACH_TO_PAUSE_SECONDS: f64 = 5.0;
+pub const EMERGENCY_CONTROL_ACK_MAX_SECONDS: f64 = 1.0;
+pub const EMERGENCY_CONTROL_STATE_REFLECTION_MAX_SECONDS: f64 = 5.0;
+pub const EMERGENCY_CONTROL_SAFE_STATE_MAX_SECONDS: f64 = 5.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RiskLimit {
@@ -2976,6 +2979,602 @@ fn compact_utc_timestamp_token(value: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyControlAction {
+    Pause,
+    ReduceOnly,
+    CancelAll,
+}
+
+impl EmergencyControlAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::ReduceOnly => "reduce_only",
+            Self::CancelAll => "cancel_all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, EmergencyControlContractError> {
+        match value {
+            "pause" => Ok(Self::Pause),
+            "reduce_only" => Ok(Self::ReduceOnly),
+            "cancel_all" => Ok(Self::CancelAll),
+            _ => Err(EmergencyControlContractError::invalid_payload(format!(
+                "unknown emergency control action `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyControlSource {
+    Manual,
+    Automatic,
+}
+
+impl EmergencyControlSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Automatic => "automatic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, EmergencyControlContractError> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "automatic" => Ok(Self::Automatic),
+            _ => Err(EmergencyControlContractError::invalid_payload(format!(
+                "unknown emergency control source `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyControlTriggerSource {
+    OperatorCommand,
+    StaleFeed,
+    ReconciliationCritical,
+    ControlUncertainty,
+}
+
+impl EmergencyControlTriggerSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OperatorCommand => "operator_command",
+            Self::StaleFeed => "stale_feed",
+            Self::ReconciliationCritical => "reconciliation_critical",
+            Self::ControlUncertainty => "control_uncertainty",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, EmergencyControlContractError> {
+        match value {
+            "operator_command" => Ok(Self::OperatorCommand),
+            "stale_feed" => Ok(Self::StaleFeed),
+            "reconciliation_critical" => Ok(Self::ReconciliationCritical),
+            "control_uncertainty" => Ok(Self::ControlUncertainty),
+            _ => Err(EmergencyControlContractError::invalid_payload(format!(
+                "unknown emergency trigger source `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyControlMode {
+    Normal,
+    Paused,
+    ReduceOnly,
+}
+
+impl EmergencyControlMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Paused => "paused",
+            Self::ReduceOnly => "reduce_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, EmergencyControlContractError> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "paused" => Ok(Self::Paused),
+            "reduce_only" => Ok(Self::ReduceOnly),
+            _ => Err(EmergencyControlContractError::invalid_payload(format!(
+                "unknown emergency control mode `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyControlReasonCode {
+    PauseActivated,
+    PauseActive,
+    ReduceOnlyActivated,
+    ReduceOnlyActive,
+    CancelAllAccepted,
+    StaleFeedTriggered,
+    ReconciliationCriticalTriggered,
+    ControlUncertaintyTriggered,
+    PersistenceUnavailable,
+    OrchestrationUnavailable,
+    UnauthorizedRole,
+    NotFound,
+    InvalidPayload,
+}
+
+impl EmergencyControlReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::PauseActivated => "emergency_control_pause_activated",
+            Self::PauseActive => "emergency_control_pause_active",
+            Self::ReduceOnlyActivated => "emergency_control_reduce_only_activated",
+            Self::ReduceOnlyActive => "emergency_control_reduce_only_active",
+            Self::CancelAllAccepted => "emergency_control_cancel_all_accepted",
+            Self::StaleFeedTriggered => "emergency_control_stale_feed_triggered",
+            Self::ReconciliationCriticalTriggered => {
+                "emergency_control_reconciliation_critical_triggered"
+            }
+            Self::ControlUncertaintyTriggered => "emergency_control_control_uncertainty_triggered",
+            Self::PersistenceUnavailable => "emergency_control_persistence_unavailable",
+            Self::OrchestrationUnavailable => "emergency_control_orchestration_unavailable",
+            Self::UnauthorizedRole => "emergency_control_unauthorized_role",
+            Self::NotFound => "emergency_control_not_found",
+            Self::InvalidPayload => "emergency_control_invalid_payload",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, EmergencyControlContractError> {
+        match value {
+            "emergency_control_pause_activated" => Ok(Self::PauseActivated),
+            "emergency_control_pause_active" => Ok(Self::PauseActive),
+            "emergency_control_reduce_only_activated" => Ok(Self::ReduceOnlyActivated),
+            "emergency_control_reduce_only_active" => Ok(Self::ReduceOnlyActive),
+            "emergency_control_cancel_all_accepted" => Ok(Self::CancelAllAccepted),
+            "emergency_control_stale_feed_triggered" => Ok(Self::StaleFeedTriggered),
+            "emergency_control_reconciliation_critical_triggered" => {
+                Ok(Self::ReconciliationCriticalTriggered)
+            }
+            "emergency_control_control_uncertainty_triggered" => {
+                Ok(Self::ControlUncertaintyTriggered)
+            }
+            "emergency_control_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            "emergency_control_orchestration_unavailable" => Ok(Self::OrchestrationUnavailable),
+            "emergency_control_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "emergency_control_not_found" => Ok(Self::NotFound),
+            "emergency_control_invalid_payload" => Ok(Self::InvalidPayload),
+            _ => Err(EmergencyControlContractError::invalid_payload(format!(
+                "unknown emergency control reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmergencyControlValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmergencyControlContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<EmergencyControlValidationIssue>,
+}
+
+impl EmergencyControlContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<EmergencyControlValidationIssue>,
+    ) -> Self {
+        Self {
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmergencyControlCommand {
+    pub action_id: String,
+    pub action: EmergencyControlAction,
+    pub source: EmergencyControlSource,
+    pub trigger_source: EmergencyControlTriggerSource,
+    pub actor_id: Option<String>,
+    pub actor_role: Option<String>,
+    pub correlation_id: String,
+    pub requested_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SafetyControlActionRecord {
+    pub action_id: String,
+    pub source: EmergencyControlSource,
+    pub action: EmergencyControlAction,
+    pub trigger_source: EmergencyControlTriggerSource,
+    pub actor_id: Option<String>,
+    pub actor_role: Option<String>,
+    pub resulting_mode: EmergencyControlMode,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub audit_reference: String,
+    pub dedupe_key: String,
+    pub requested_at_utc: String,
+    pub acknowledged_at_utc: String,
+    pub effective_at_utc: String,
+    pub completed_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EmergencyControlLatencyEvaluation {
+    pub acknowledgement_latency_seconds: f64,
+    pub state_reflection_latency_seconds: f64,
+    pub acknowledgement_within_boundary: bool,
+    pub state_reflection_within_boundary: bool,
+}
+
+pub fn normalize_emergency_control_identifier(raw: &str) -> String {
+    normalize_pretrade_identifier(raw)
+}
+
+pub fn emergency_mode_allows_order_mode(
+    mode: EmergencyControlMode,
+    order_mode: crate::order::OrderMode,
+) -> bool {
+    match mode {
+        EmergencyControlMode::Normal => true,
+        EmergencyControlMode::Paused => false,
+        EmergencyControlMode::ReduceOnly => {
+            matches!(order_mode, crate::order::OrderMode::ReduceOnly)
+        }
+    }
+}
+
+pub fn stale_feed_triggers_safe_state(
+    feed_age_seconds: f64,
+) -> Result<bool, EmergencyControlContractError> {
+    if !feed_age_seconds.is_finite() || feed_age_seconds < 0.0 {
+        return Err(EmergencyControlContractError::invalid_payload(
+            "feed_age_seconds must be finite and greater than or equal to 0",
+        ));
+    }
+    Ok(feed_age_seconds > FRESHNESS_STALE_THRESHOLD_SECONDS)
+}
+
+pub fn evaluate_emergency_control_latency_boundaries(
+    acknowledgement_latency_seconds: f64,
+    state_reflection_latency_seconds: f64,
+) -> Result<EmergencyControlLatencyEvaluation, EmergencyControlContractError> {
+    if !acknowledgement_latency_seconds.is_finite() || acknowledgement_latency_seconds < 0.0 {
+        return Err(EmergencyControlContractError::invalid_payload(
+            "acknowledgement_latency_seconds must be finite and greater than or equal to 0",
+        ));
+    }
+    if !state_reflection_latency_seconds.is_finite() || state_reflection_latency_seconds < 0.0 {
+        return Err(EmergencyControlContractError::invalid_payload(
+            "state_reflection_latency_seconds must be finite and greater than or equal to 0",
+        ));
+    }
+    Ok(EmergencyControlLatencyEvaluation {
+        acknowledgement_latency_seconds,
+        state_reflection_latency_seconds,
+        acknowledgement_within_boundary: acknowledgement_latency_seconds
+            <= EMERGENCY_CONTROL_ACK_MAX_SECONDS,
+        state_reflection_within_boundary: state_reflection_latency_seconds
+            <= EMERGENCY_CONTROL_STATE_REFLECTION_MAX_SECONDS,
+    })
+}
+
+pub fn validate_emergency_control_command(
+    command: &EmergencyControlCommand,
+) -> Result<(), EmergencyControlContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_emergency_field(&mut field_errors, "action_id", &command.action_id);
+    validate_non_empty_emergency_field(
+        &mut field_errors,
+        "correlation_id",
+        &command.correlation_id,
+    );
+    validate_emergency_timestamp_field(
+        &mut field_errors,
+        "requested_at_utc",
+        &command.requested_at_utc,
+    );
+    validate_normalized_emergency_identifier(&mut field_errors, "action_id", &command.action_id);
+    validate_normalized_emergency_identifier(
+        &mut field_errors,
+        "correlation_id",
+        &command.correlation_id,
+    );
+
+    match command.source {
+        EmergencyControlSource::Manual => {
+            if command.trigger_source != EmergencyControlTriggerSource::OperatorCommand {
+                field_errors.push(EmergencyControlValidationIssue {
+                    field: "trigger_source",
+                    code: EmergencyControlReasonCode::InvalidPayload.code(),
+                    message: "manual controls must use trigger_source `operator_command`"
+                        .to_string(),
+                });
+            }
+            validate_optional_non_empty_emergency_field(
+                &mut field_errors,
+                "actor_id",
+                &command.actor_id,
+            );
+            validate_optional_non_empty_emergency_field(
+                &mut field_errors,
+                "actor_role",
+                &command.actor_role,
+            );
+        }
+        EmergencyControlSource::Automatic => {
+            if command.trigger_source == EmergencyControlTriggerSource::OperatorCommand {
+                field_errors.push(EmergencyControlValidationIssue {
+                    field: "trigger_source",
+                    code: EmergencyControlReasonCode::InvalidPayload.code(),
+                    message: "automatic controls must use non-manual trigger source".to_string(),
+                });
+            }
+        }
+    }
+
+    if !field_errors.is_empty() {
+        return Err(EmergencyControlContractError::invalid_payload_with_issues(
+            "emergency control command payload is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_safety_control_action_record(
+    record: &SafetyControlActionRecord,
+) -> Result<(), EmergencyControlContractError> {
+    let command = EmergencyControlCommand {
+        action_id: record.action_id.clone(),
+        action: record.action,
+        source: record.source,
+        trigger_source: record.trigger_source,
+        actor_id: record.actor_id.clone(),
+        actor_role: record.actor_role.clone(),
+        correlation_id: record.correlation_id.clone(),
+        requested_at_utc: record.requested_at_utc.clone(),
+    };
+    validate_emergency_control_command(&command)?;
+
+    let mut field_errors = Vec::new();
+    validate_non_empty_emergency_field(&mut field_errors, "reason_code", &record.reason_code);
+    validate_non_empty_emergency_field(
+        &mut field_errors,
+        "audit_reference",
+        &record.audit_reference,
+    );
+    validate_non_empty_emergency_field(&mut field_errors, "dedupe_key", &record.dedupe_key);
+    validate_emergency_timestamp_field(
+        &mut field_errors,
+        "acknowledged_at_utc",
+        &record.acknowledged_at_utc,
+    );
+    validate_emergency_timestamp_field(
+        &mut field_errors,
+        "effective_at_utc",
+        &record.effective_at_utc,
+    );
+    validate_emergency_timestamp_field(
+        &mut field_errors,
+        "completed_at_utc",
+        &record.completed_at_utc,
+    );
+    validate_normalized_emergency_identifier(&mut field_errors, "dedupe_key", &record.dedupe_key);
+    if EmergencyControlReasonCode::parse(&record.reason_code).is_err() {
+        field_errors.push(EmergencyControlValidationIssue {
+            field: "reason_code",
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known emergency control reason".to_string(),
+        });
+    }
+
+    match record.action {
+        EmergencyControlAction::Pause if record.resulting_mode != EmergencyControlMode::Paused => {
+            field_errors.push(EmergencyControlValidationIssue {
+                field: "resulting_mode",
+                code: EmergencyControlReasonCode::InvalidPayload.code(),
+                message: "pause actions must set resulting_mode to `paused`".to_string(),
+            });
+        }
+        EmergencyControlAction::ReduceOnly
+            if record.resulting_mode != EmergencyControlMode::ReduceOnly =>
+        {
+            field_errors.push(EmergencyControlValidationIssue {
+                field: "resulting_mode",
+                code: EmergencyControlReasonCode::InvalidPayload.code(),
+                message: "reduce-only actions must set resulting_mode to `reduce_only`".to_string(),
+            });
+        }
+        EmergencyControlAction::CancelAll
+            if record.resulting_mode != EmergencyControlMode::Paused =>
+        {
+            field_errors.push(EmergencyControlValidationIssue {
+                field: "resulting_mode",
+                code: EmergencyControlReasonCode::InvalidPayload.code(),
+                message: "cancel-all actions must set resulting_mode to `paused`".to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    if record.source == EmergencyControlSource::Automatic
+        && record.resulting_mode != EmergencyControlMode::Paused
+    {
+        field_errors.push(EmergencyControlValidationIssue {
+            field: "resulting_mode",
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: "automatic triggers must transition to `paused` mode".to_string(),
+        });
+    }
+
+    match emergency_timestamp_delta_seconds(&record.requested_at_utc, &record.acknowledged_at_utc) {
+        Ok(acknowledgement_latency_seconds) => {
+            if acknowledgement_latency_seconds > EMERGENCY_CONTROL_ACK_MAX_SECONDS {
+                field_errors.push(EmergencyControlValidationIssue {
+                    field: "acknowledged_at_utc",
+                    code: EmergencyControlReasonCode::InvalidPayload.code(),
+                    message: format!(
+                        "acknowledgement latency must be <= {EMERGENCY_CONTROL_ACK_MAX_SECONDS}s"
+                    ),
+                });
+            }
+        }
+        Err(error) => field_errors.extend(error.field_errors),
+    }
+
+    match emergency_timestamp_delta_seconds(&record.requested_at_utc, &record.effective_at_utc) {
+        Ok(reflection_latency_seconds) => {
+            if reflection_latency_seconds > EMERGENCY_CONTROL_STATE_REFLECTION_MAX_SECONDS {
+                field_errors.push(EmergencyControlValidationIssue {
+                    field: "effective_at_utc",
+                    code: EmergencyControlReasonCode::InvalidPayload.code(),
+                    message: format!(
+                        "state reflection latency must be <= {EMERGENCY_CONTROL_STATE_REFLECTION_MAX_SECONDS}s"
+                    ),
+                });
+            }
+            if record.source == EmergencyControlSource::Automatic
+                && reflection_latency_seconds > EMERGENCY_CONTROL_SAFE_STATE_MAX_SECONDS
+            {
+                field_errors.push(EmergencyControlValidationIssue {
+                    field: "effective_at_utc",
+                    code: EmergencyControlReasonCode::InvalidPayload.code(),
+                    message: format!(
+                        "automatic safe-state transition latency must be <= {EMERGENCY_CONTROL_SAFE_STATE_MAX_SECONDS}s"
+                    ),
+                });
+            }
+        }
+        Err(error) => field_errors.extend(error.field_errors),
+    }
+
+    if emergency_timestamp_delta_seconds(&record.effective_at_utc, &record.completed_at_utc)
+        .is_err()
+    {
+        field_errors.push(EmergencyControlValidationIssue {
+            field: "completed_at_utc",
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: "completed_at_utc must be greater than or equal to effective_at_utc"
+                .to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(EmergencyControlContractError::invalid_payload_with_issues(
+            "safety control action record is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_empty_emergency_field(
+    field_errors: &mut Vec<EmergencyControlValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(EmergencyControlValidationIssue {
+            field,
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_optional_non_empty_emergency_field(
+    field_errors: &mut Vec<EmergencyControlValidationIssue>,
+    field: &'static str,
+    value: &Option<String>,
+) {
+    if value
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(|candidate| candidate.is_empty())
+    {
+        field_errors.push(EmergencyControlValidationIssue {
+            field,
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: format!("{field} is required"),
+        });
+    }
+}
+
+fn validate_emergency_timestamp_field(
+    field_errors: &mut Vec<EmergencyControlValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(EmergencyControlValidationIssue {
+            field,
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
+fn validate_normalized_emergency_identifier(
+    field_errors: &mut Vec<EmergencyControlValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if normalize_emergency_control_identifier(value) != value {
+        field_errors.push(EmergencyControlValidationIssue {
+            field,
+            code: EmergencyControlReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be normalized (trimmed lowercase)"),
+        });
+    }
+}
+
+fn emergency_timestamp_delta_seconds(
+    from_utc: &str,
+    to_utc: &str,
+) -> Result<f64, EmergencyControlContractError> {
+    let start = parse_utc_timestamp(from_utc).map_err(|_| {
+        EmergencyControlContractError::invalid_payload("from_utc must be an RFC3339 UTC timestamp")
+    })?;
+    let end = parse_utc_timestamp(to_utc).map_err(|_| {
+        EmergencyControlContractError::invalid_payload("to_utc must be an RFC3339 UTC timestamp")
+    })?;
+    let delta_seconds = (end - start).as_seconds_f64();
+    if !delta_seconds.is_finite() || delta_seconds < 0.0 {
+        return Err(EmergencyControlContractError::invalid_payload(
+            "timestamp ordering must be monotonically increasing",
+        ));
+    }
+    Ok(delta_seconds)
+}
+
 fn validate_non_negative_freshness_age(
     field_errors: &mut Vec<FreshnessGateValidationIssue>,
     field: &'static str,
@@ -4511,5 +5110,141 @@ mod tests {
                 .iter()
                 .any(|issue| issue.field == "protective_mode_active")
         );
+    }
+
+    #[test]
+    fn emergency_control_reason_code_parse_round_trip_is_deterministic() {
+        let codes = [
+            EmergencyControlReasonCode::PauseActivated,
+            EmergencyControlReasonCode::ReduceOnlyActivated,
+            EmergencyControlReasonCode::CancelAllAccepted,
+            EmergencyControlReasonCode::StaleFeedTriggered,
+            EmergencyControlReasonCode::ReconciliationCriticalTriggered,
+            EmergencyControlReasonCode::ControlUncertaintyTriggered,
+        ];
+
+        for code in codes {
+            let parsed = EmergencyControlReasonCode::parse(code.code())
+                .expect("known emergency control reason should parse");
+            assert_eq!(parsed, code);
+        }
+    }
+
+    #[test]
+    fn emergency_control_latency_boundaries_are_inclusive_and_deterministic() {
+        let boundary = evaluate_emergency_control_latency_boundaries(1.0, 5.0)
+            .expect("inclusive emergency boundaries should pass");
+        assert!(boundary.acknowledgement_within_boundary);
+        assert!(boundary.state_reflection_within_boundary);
+
+        let exceeded = evaluate_emergency_control_latency_boundaries(1.01, 5.01)
+            .expect("finite latency values should evaluate deterministically");
+        assert!(!exceeded.acknowledgement_within_boundary);
+        assert!(!exceeded.state_reflection_within_boundary);
+    }
+
+    #[test]
+    fn emergency_control_stale_feed_trigger_threshold_is_strictly_greater_than_30s() {
+        assert!(
+            !stale_feed_triggers_safe_state(30.0)
+                .expect("boundary threshold evaluation should succeed")
+        );
+        assert!(
+            stale_feed_triggers_safe_state(30.0001)
+                .expect("values above threshold should trigger safe-state")
+        );
+    }
+
+    #[test]
+    fn emergency_control_command_validation_requires_manual_actor_fields() {
+        let error = validate_emergency_control_command(&EmergencyControlCommand {
+            action_id: "emergency::001".to_string(),
+            action: EmergencyControlAction::Pause,
+            source: EmergencyControlSource::Manual,
+            trigger_source: EmergencyControlTriggerSource::OperatorCommand,
+            actor_id: None,
+            actor_role: None,
+            correlation_id: "corr-emergency-001".to_string(),
+            requested_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        })
+        .expect_err("manual controls without actor metadata must fail");
+        assert_eq!(
+            error.code,
+            EmergencyControlReasonCode::InvalidPayload.code()
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "actor_id")
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "actor_role")
+        );
+    }
+
+    #[test]
+    fn emergency_control_action_record_validates_required_evidence_fields_and_latency() {
+        let valid = SafetyControlActionRecord {
+            action_id: "emergency::pause::001".to_string(),
+            source: EmergencyControlSource::Manual,
+            action: EmergencyControlAction::Pause,
+            trigger_source: EmergencyControlTriggerSource::OperatorCommand,
+            actor_id: Some("ops-1".to_string()),
+            actor_role: Some("operational_control".to_string()),
+            resulting_mode: EmergencyControlMode::Paused,
+            reason_code: EmergencyControlReasonCode::PauseActivated
+                .code()
+                .to_string(),
+            correlation_id: "corr-emergency-002".to_string(),
+            audit_reference: "audit::emergency::001".to_string(),
+            dedupe_key: "manual::pause::corr-emergency-002".to_string(),
+            requested_at_utc: "2026-04-06T00:00:00Z".to_string(),
+            acknowledged_at_utc: "2026-04-06T00:00:01Z".to_string(),
+            effective_at_utc: "2026-04-06T00:00:05Z".to_string(),
+            completed_at_utc: "2026-04-06T00:00:05Z".to_string(),
+        };
+        assert!(validate_safety_control_action_record(&valid).is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.audit_reference = "   ".to_string();
+        invalid.acknowledged_at_utc = "2026-04-06T00:00:02Z".to_string();
+        let error = validate_safety_control_action_record(&invalid)
+            .expect_err("missing evidence and boundary violations must fail");
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "audit_reference")
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "acknowledged_at_utc")
+        );
+    }
+
+    #[test]
+    fn emergency_control_mode_compatibility_respects_reduce_only_vs_limit() {
+        assert!(emergency_mode_allows_order_mode(
+            EmergencyControlMode::Normal,
+            crate::order::OrderMode::Limit,
+        ));
+        assert!(!emergency_mode_allows_order_mode(
+            EmergencyControlMode::Paused,
+            crate::order::OrderMode::ReduceOnly,
+        ));
+        assert!(!emergency_mode_allows_order_mode(
+            EmergencyControlMode::ReduceOnly,
+            crate::order::OrderMode::Limit,
+        ));
+        assert!(emergency_mode_allows_order_mode(
+            EmergencyControlMode::ReduceOnly,
+            crate::order::OrderMode::ReduceOnly,
+        ));
     }
 }

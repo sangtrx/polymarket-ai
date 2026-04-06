@@ -16,8 +16,9 @@ use domain::governance::{
     PrivilegedAuditRecord,
 };
 use domain::risk::{
-    MarketPolicyReasonCode, MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope,
-    RiskLimitValidationIssue,
+    EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
+    MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue,
+    SafetyControlActionRecord,
 };
 use governance_service::approvals::{
     EvaluateApprovalExecutionInput, RecordApprovalVoteInput, SubmitApprovalRequestInput,
@@ -31,6 +32,7 @@ use governance_service::risk_limits::{
     PendingRiskLimitProfilesInput, RiskLimitProfileMutationEvidence, RiskLimitRuleInput,
     UpsertRiskLimitProfileInput,
 };
+use governance_service::safety_controls::ExecuteManualSafetyControlInput;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -98,6 +100,24 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let emergency_control_routes = Router::new()
+        .route("/control/emergency/pause", post(trigger_emergency_pause))
+        .route(
+            "/control/emergency/reduce-only",
+            post(trigger_emergency_reduce_only),
+        )
+        .route(
+            "/control/emergency/cancel-all",
+            post(trigger_emergency_cancel_all),
+        )
+        .route(
+            "/control/emergency/actions/{action_id}",
+            get(get_emergency_control_action_result),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -106,6 +126,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(credential_rotation_routes)
         .merge(market_policy_routes)
         .merge(risk_limit_routes)
+        .merge(emergency_control_routes)
         .with_state(state)
 }
 
@@ -637,6 +658,137 @@ pub async fn list_pending_risk_limit_profiles(
         pending,
         authorization.timestamp_utc,
         endpoint,
+    )
+}
+
+pub async fn trigger_emergency_pause(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<EmergencyControlPayload>,
+) -> Response {
+    trigger_manual_emergency_control(
+        &state,
+        &actor,
+        payload,
+        EmergencyControlAction::Pause,
+        "/control/emergency/pause".to_string(),
+        "emergency_control_pause",
+    )
+}
+
+pub async fn trigger_emergency_reduce_only(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<EmergencyControlPayload>,
+) -> Response {
+    trigger_manual_emergency_control(
+        &state,
+        &actor,
+        payload,
+        EmergencyControlAction::ReduceOnly,
+        "/control/emergency/reduce-only".to_string(),
+        "emergency_control_reduce_only",
+    )
+}
+
+pub async fn trigger_emergency_cancel_all(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<EmergencyControlPayload>,
+) -> Response {
+    trigger_manual_emergency_control(
+        &state,
+        &actor,
+        payload,
+        EmergencyControlAction::CancelAll,
+        "/control/emergency/cancel-all".to_string(),
+        "emergency_control_cancel_all",
+    )
+}
+
+pub async fn get_emergency_control_action_result(
+    State(state): State<ControlApiState>,
+    Path(action_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/emergency/actions/{action_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let result = match state
+        .safety_control_orchestrator
+        .get_action_result(&action_id)
+    {
+        Ok(record) => record,
+        Err(error) => {
+            return emergency_control_service_error_response(
+                error.code,
+                error.message,
+                "emergency_control_action_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    emergency_control_action_response(
+        &state,
+        &actor,
+        result,
+        endpoint,
+        "emergency_control_action_query",
+        "GET",
+        StatusCode::OK,
+    )
+}
+
+fn trigger_manual_emergency_control(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    payload: EmergencyControlPayload,
+    action: EmergencyControlAction,
+    endpoint: String,
+    action_type: &'static str,
+) -> Response {
+    let authorization = match authorize_critical_action(state, actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let result = match state.safety_control_orchestrator.execute_manual_control(
+        ExecuteManualSafetyControlInput {
+            action,
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+            audit_reference: payload.audit_reference,
+        },
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            return emergency_control_service_error_response(
+                error.code,
+                error.message,
+                action_type,
+                actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    emergency_control_action_response(
+        state,
+        actor,
+        result,
+        endpoint,
+        action_type,
+        "POST",
+        StatusCode::ACCEPTED,
     )
 }
 
@@ -1491,6 +1643,126 @@ fn risk_limit_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn emergency_control_action_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    record: SafetyControlActionRecord,
+    endpoint: String,
+    action_type: &'static str,
+    http_method: &'static str,
+    status: StatusCode,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action_type.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "action_id": record.action_id.clone(),
+            "action": record.action.as_str(),
+            "source": record.source.as_str(),
+            "trigger_source": record.trigger_source.as_str(),
+            "resulting_mode": record.resulting_mode.as_str(),
+        }),
+        approval_reference: if record.audit_reference.is_empty() {
+            None
+        } else {
+            Some(record.audit_reference.clone())
+        },
+        timestamp: record.completed_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: record.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: record.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action_type.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            record.correlation_id.clone(),
+            record.completed_at_utc,
+        );
+    }
+
+    (
+        status,
+        axum::Json(EmergencyControlDecisionResponse {
+            status: "accepted",
+            error_code: None,
+            message: None,
+            action_id: record.action_id,
+            action: record.action.as_str().to_string(),
+            source: record.source.as_str().to_string(),
+            trigger_source: record.trigger_source.as_str().to_string(),
+            resulting_mode: record.resulting_mode.as_str().to_string(),
+            reason_code: record.reason_code,
+            actor_id: record.actor_id,
+            actor_role: record.actor_role,
+            correlation_id: record.correlation_id,
+            timestamp_utc: record.completed_at_utc,
+            audit_reference: if record.audit_reference.is_empty() {
+                None
+            } else {
+                Some(record.audit_reference)
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn emergency_control_service_error_response(
+    error_code: &'static str,
+    message: String,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    (
+        emergency_control_service_error_status(error_code),
+        axum::Json(EmergencyControlServiceErrorResponse {
+            error_code,
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+        }),
+    )
+        .into_response()
+}
+
+fn emergency_control_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == EmergencyControlReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == EmergencyControlReasonCode::UnauthorizedRole.code() => {
+            StatusCode::FORBIDDEN
+        }
+        code if code == EmergencyControlReasonCode::NotFound.code() => StatusCode::NOT_FOUND,
+        "emergency_control_constraint_violation" | "safety_control_constraint_violation" => {
+            StatusCode::CONFLICT
+        }
+        code if code == EmergencyControlReasonCode::PersistenceUnavailable.code()
+            || code == EmergencyControlReasonCode::OrchestrationUnavailable.code()
+            || code == "emergency_control_query_failed"
+            || code == "emergency_control_row_decode_failed"
+            || code == "safety_control_query_failed"
+            || code == "safety_control_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn critical_approval_audit_outcome(
     outcome: ApprovalDecisionOutcome,
 ) -> Option<PrivilegedAuditOutcome> {
@@ -1829,6 +2101,12 @@ pub struct RiskLimitProfilePayload {
     pub approval_request_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EmergencyControlPayload {
+    #[serde(default)]
+    pub audit_reference: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CredentialRotationDecisionResponse {
     pub status: &'static str,
@@ -2022,6 +2300,41 @@ pub struct RiskLimitSecuritySignal {
     pub alert_target_seconds: u16,
 }
 
+#[derive(Debug, Serialize)]
+pub struct EmergencyControlDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub action_id: String,
+    pub action: String,
+    pub source: String,
+    pub trigger_source: String,
+    pub resulting_mode: String,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_role: Option<String>,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmergencyControlServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2038,6 +2351,10 @@ mod tests {
         AuthorizationDecision, AuthorizationEvaluator, ControlAction, PrivilegedAuditOutcome,
         PrivilegedAuditRecord,
     };
+    use domain::risk::{
+        EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
+        EmergencyControlTriggerSource,
+    };
     use governance_service::{
         approvals::GovernanceApprovalService,
         audit::{AuditAppendError, PrivilegedAuditAppender},
@@ -2049,6 +2366,11 @@ mod tests {
         risk_limits::{
             PendingRiskLimitProfilesInput, RiskLimitOrchestrator, RiskLimitProfileMutationEvidence,
             RiskLimitService, RiskLimitServiceError, UpsertRiskLimitProfileInput,
+        },
+        safety_controls::{
+            EffectiveSafetyControlModeEvidence, ExecuteManualSafetyControlInput,
+            HandleAutomaticSafetyTriggerInput, SafetyControlOrchestrator, SafetyControlService,
+            SafetyControlServiceError,
         },
     };
     use std::sync::{Arc, Mutex};
@@ -2265,6 +2587,145 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct StubSafetyControlOrchestrator {
+        manual_error: Option<(&'static str, &'static str)>,
+        query_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl SafetyControlOrchestrator for StubSafetyControlOrchestrator {
+        fn execute_manual_control(
+            &self,
+            input: ExecuteManualSafetyControlInput,
+        ) -> Result<SafetyControlActionRecord, SafetyControlServiceError> {
+            if let Some((code, message)) = self.manual_error {
+                return Err(SafetyControlServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            let (resulting_mode, reason_code) = match input.action {
+                EmergencyControlAction::Pause => (
+                    EmergencyControlMode::Paused,
+                    EmergencyControlReasonCode::PauseActivated
+                        .code()
+                        .to_string(),
+                ),
+                EmergencyControlAction::ReduceOnly => (
+                    EmergencyControlMode::ReduceOnly,
+                    EmergencyControlReasonCode::ReduceOnlyActivated
+                        .code()
+                        .to_string(),
+                ),
+                EmergencyControlAction::CancelAll => (
+                    EmergencyControlMode::Paused,
+                    EmergencyControlReasonCode::CancelAllAccepted
+                        .code()
+                        .to_string(),
+                ),
+            };
+
+            Ok(SafetyControlActionRecord {
+                action_id: format!("action::{}", input.action.as_str()),
+                source: EmergencyControlSource::Manual,
+                action: input.action,
+                trigger_source: EmergencyControlTriggerSource::OperatorCommand,
+                actor_id: Some(input.actor_id),
+                actor_role: Some(input.actor_role),
+                resulting_mode,
+                reason_code,
+                correlation_id: input.correlation_id,
+                audit_reference: input
+                    .audit_reference
+                    .unwrap_or_else(|| "audit::manual".to_string()),
+                dedupe_key: "dedupe::manual".to_string(),
+                requested_at_utc: input.requested_at_utc.clone(),
+                acknowledged_at_utc: input.requested_at_utc.clone(),
+                effective_at_utc: input.requested_at_utc.clone(),
+                completed_at_utc: input.requested_at_utc,
+            })
+        }
+
+        fn handle_automatic_trigger(
+            &self,
+            input: HandleAutomaticSafetyTriggerInput,
+        ) -> Result<SafetyControlActionRecord, SafetyControlServiceError> {
+            Ok(SafetyControlActionRecord {
+                action_id: format!("action::auto::{}", input.trigger_source.as_str()),
+                source: EmergencyControlSource::Automatic,
+                action: EmergencyControlAction::Pause,
+                trigger_source: input.trigger_source,
+                actor_id: None,
+                actor_role: None,
+                resulting_mode: EmergencyControlMode::Paused,
+                reason_code: EmergencyControlReasonCode::StaleFeedTriggered
+                    .code()
+                    .to_string(),
+                correlation_id: input.correlation_id,
+                audit_reference: "audit::automatic".to_string(),
+                dedupe_key: "dedupe::automatic".to_string(),
+                requested_at_utc: input.requested_at_utc.clone(),
+                acknowledged_at_utc: input.requested_at_utc.clone(),
+                effective_at_utc: input.requested_at_utc.clone(),
+                completed_at_utc: input.requested_at_utc,
+            })
+        }
+
+        fn get_action_result(
+            &self,
+            action_id: &str,
+        ) -> Result<SafetyControlActionRecord, SafetyControlServiceError> {
+            if let Some((code, message)) = self.query_error {
+                return Err(SafetyControlServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            Ok(SafetyControlActionRecord {
+                action_id: action_id.to_string(),
+                source: EmergencyControlSource::Automatic,
+                action: EmergencyControlAction::Pause,
+                trigger_source: EmergencyControlTriggerSource::StaleFeed,
+                actor_id: None,
+                actor_role: None,
+                resulting_mode: EmergencyControlMode::Paused,
+                reason_code: EmergencyControlReasonCode::StaleFeedTriggered
+                    .code()
+                    .to_string(),
+                correlation_id: "corr-emergency-query-001".to_string(),
+                audit_reference: "audit::query".to_string(),
+                dedupe_key: "dedupe::query".to_string(),
+                requested_at_utc: "2026-01-01T00:00:00Z".to_string(),
+                acknowledged_at_utc: "2026-01-01T00:00:01Z".to_string(),
+                effective_at_utc: "2026-01-01T00:00:02Z".to_string(),
+                completed_at_utc: "2026-01-01T00:00:03Z".to_string(),
+            })
+        }
+
+        fn get_action_result_by_correlation(
+            &self,
+            _correlation_id: &str,
+        ) -> Result<Option<SafetyControlActionRecord>, SafetyControlServiceError> {
+            Ok(None)
+        }
+
+        fn get_current_mode(
+            &self,
+        ) -> Result<Option<EffectiveSafetyControlModeEvidence>, SafetyControlServiceError> {
+            Ok(Some(EffectiveSafetyControlModeEvidence {
+                action_id: "action::mode".to_string(),
+                correlation_id: "corr-emergency-mode-001".to_string(),
+                resulting_mode: EmergencyControlMode::Paused.as_str().to_string(),
+                reason_code: EmergencyControlReasonCode::PauseActive.code().to_string(),
+                effective_at_utc: "2026-01-01T00:00:00Z".to_string(),
+            }))
+        }
+    }
+
     fn test_app_with_market_policy_orchestrator(
         market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     ) -> Router {
@@ -2278,6 +2739,7 @@ mod tests {
             Arc::new(CredentialRotationService::default()),
             market_policy_orchestrator,
             Arc::new(RiskLimitService::default()),
+            Arc::new(SafetyControlService::default()),
         ))
     }
 
@@ -2294,6 +2756,24 @@ mod tests {
             Arc::new(CredentialRotationService::default()),
             Arc::new(StubMarketPolicyOrchestrator::default()),
             risk_limit_orchestrator,
+            Arc::new(SafetyControlService::default()),
+        ))
+    }
+
+    fn test_app_with_safety_control_orchestrator(
+        safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
+    ) -> Router {
+        test_app_with_state(ControlApiState::with_all_orchestrators(
+            Arc::new(GovernanceAuthorizationGuard::new(
+                AuthorizationEvaluator::default(),
+            )),
+            Arc::new(HeaderTokenAuthenticator),
+            Arc::new(CapturingAuditAppender::default()),
+            Arc::new(GovernanceApprovalService::default()),
+            Arc::new(CredentialRotationService::default()),
+            Arc::new(StubMarketPolicyOrchestrator::default()),
+            Arc::new(RiskLimitService::default()),
+            safety_control_orchestrator,
         ))
     }
 
@@ -4693,7 +5173,10 @@ mod tests {
             .iter()
             .find(|record| record.action_type == "execute_control_plane_action")
             .expect("authorization audit record should exist");
-        assert_eq!(auth_record.parameters["endpoint"], "/control/risk-limits/pending");
+        assert_eq!(
+            auth_record.parameters["endpoint"],
+            "/control/risk-limits/pending"
+        );
         assert_eq!(auth_record.parameters["http_method"], "GET");
     }
 
@@ -4749,6 +5232,279 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "risk_limit_persistence_unavailable");
         assert_eq!(payload["action"], "risk_limit_profile_update");
+    }
+
+    #[tokio::test]
+    async fn emergency_pause_route_returns_machine_readable_accepted_evidence() {
+        let app = test_app_with_safety_control_orchestrator(Arc::new(
+            StubSafetyControlOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/emergency/pause")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-emergency-pause-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"audit_reference":"ticket-123"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action"], "pause");
+        assert_eq!(payload["source"], "manual");
+        assert_eq!(payload["trigger_source"], "operator_command");
+        assert_eq!(payload["resulting_mode"], "paused");
+        assert_eq!(payload["reason_code"], "emergency_control_pause_activated");
+        assert_eq!(payload["actor_id"], "ops-1");
+        assert_eq!(payload["actor_role"], "operational_control");
+        assert_eq!(payload["audit_reference"], "ticket-123");
+    }
+
+    #[tokio::test]
+    async fn emergency_reduce_only_route_returns_reduce_only_mode_evidence() {
+        let app = test_app_with_safety_control_orchestrator(Arc::new(
+            StubSafetyControlOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/emergency/reduce-only")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-emergency-reduce-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"audit_reference":"ticket-456"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["action"], "reduce_only");
+        assert_eq!(payload["resulting_mode"], "reduce_only");
+        assert_eq!(
+            payload["reason_code"],
+            "emergency_control_reduce_only_activated"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_pause_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/emergency/pause")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-emergency-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"audit_reference":"ticket-unauthorized"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn emergency_pause_route_surfaces_malformed_payload_machine_error() {
+        let app =
+            test_app_with_safety_control_orchestrator(Arc::new(StubSafetyControlOrchestrator {
+                manual_error: Some((
+                    EmergencyControlReasonCode::InvalidPayload.code(),
+                    "request payload failed validation",
+                )),
+                ..Default::default()
+            }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/emergency/pause")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-emergency-invalid-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"audit_reference":"ticket-invalid"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "emergency_control_invalid_payload");
+        assert_eq!(payload["action"], "emergency_control_pause");
+    }
+
+    #[tokio::test]
+    async fn emergency_cancel_all_route_surfaces_service_unavailable_machine_error() {
+        let app =
+            test_app_with_safety_control_orchestrator(Arc::new(StubSafetyControlOrchestrator {
+                manual_error: Some((
+                    EmergencyControlReasonCode::OrchestrationUnavailable.code(),
+                    "execution containment unavailable",
+                )),
+                ..Default::default()
+            }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/emergency/cancel-all")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-emergency-cancel-failure-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"audit_reference":"ticket-789"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            "emergency_control_orchestration_unavailable"
+        );
+        assert_eq!(payload["action"], "emergency_control_cancel_all");
+    }
+
+    #[test]
+    fn emergency_constraint_violations_map_to_conflict_status() {
+        assert_eq!(
+            emergency_control_service_error_status("safety_control_constraint_violation"),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_action_query_route_returns_record_and_machine_readable_fields() {
+        let app = test_app_with_safety_control_orchestrator(Arc::new(
+            StubSafetyControlOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/emergency/actions/action::stale-feed")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-emergency-query-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action_id"], "action::stale-feed");
+        assert_eq!(payload["source"], "automatic");
+        assert_eq!(payload["trigger_source"], "stale_feed");
+        assert_eq!(payload["resulting_mode"], "paused");
+        assert_eq!(
+            payload["reason_code"],
+            "emergency_control_stale_feed_triggered"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_action_query_route_surfaces_not_found_machine_error() {
+        let app =
+            test_app_with_safety_control_orchestrator(Arc::new(StubSafetyControlOrchestrator {
+                query_error: Some((
+                    EmergencyControlReasonCode::NotFound.code(),
+                    "action result not found",
+                )),
+                ..Default::default()
+            }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/emergency/actions/action::missing")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-emergency-query-missing-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], EmergencyControlReasonCode::NotFound.code());
+        assert_eq!(payload["action"], "emergency_control_action_query");
+        assert_eq!(payload["endpoint"], "/control/emergency/actions/action::missing");
     }
 
     #[derive(Debug)]

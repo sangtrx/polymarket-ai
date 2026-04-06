@@ -54,11 +54,14 @@ async fn main() {
         let orders_store = orders::PostgresOrderLifecycleStore::new(pool.clone());
         let risk_adjudication_port =
             Arc::new(orders::PostgresRiskAdjudicationPort::new(pool.clone()));
+        let emergency_mode_port =
+            Arc::new(orders::PostgresEmergencyControlModePort::new(pool.clone()));
         let pretrade_adjudication_timeout =
             Duration::from_millis(orders::DEFAULT_PRETRADE_ADJUDICATION_TIMEOUT_MS);
-        let orders_runtime = Arc::new(orders::OrderLifecycleRuntime::with_risk_adjudication_port(
+        let orders_runtime = Arc::new(orders::OrderLifecycleRuntime::with_runtime_ports(
             orders_store,
             risk_adjudication_port,
+            emergency_mode_port,
             pretrade_adjudication_timeout,
         ));
         user_runtime.attach_freshness_signals(freshness_signals.clone());
