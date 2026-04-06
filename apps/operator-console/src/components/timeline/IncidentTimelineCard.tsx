@@ -156,6 +156,9 @@ export function IncidentTimelineCard({ freshness, baseUrl }: IncidentTimelineCar
   const [requestError, setRequestError] = useState<IncidentForensicsClientError | null>(
     null,
   );
+  const [lastAnnouncementAtUtc, setLastAnnouncementAtUtc] = useState(
+    windowDefaults.endTs,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -176,6 +179,7 @@ export function IncidentTimelineCard({ freshness, baseUrl }: IncidentTimelineCar
         }
         setRequestError(null);
         setResult(next);
+        setLastAnnouncementAtUtc(next.timestampUtc);
         if (next.dataState === "empty") {
           setState("empty");
           return;
@@ -193,6 +197,7 @@ export function IncidentTimelineCard({ freshness, baseUrl }: IncidentTimelineCar
         setRequestError(clientError);
         setResult(null);
         setState(isCriticalFailure(clientError) ? "critical" : "error");
+        setLastAnnouncementAtUtc(clientError.timestampUtc);
       }
     }
 
@@ -304,6 +309,31 @@ export function IncidentTimelineCard({ freshness, baseUrl }: IncidentTimelineCar
         Recommended next action: {recommendedAction(state, result)}
       </p>
 
+      <section
+        className="incident-announcement-surface"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        <p className="type-metadata">
+          Status <code>{state}</code> at{" "}
+          <time dateTime={lastAnnouncementAtUtc}>{lastAnnouncementAtUtc}</time>.{" "}
+          {result ? (
+            <>
+              Reason <code>{result.reasonCode}</code>. Correlation{" "}
+              <code>{result.correlationId}</code>.
+            </>
+          ) : requestError ? (
+            <>
+              Reason <code>{requestError.reasonCode}</code>. Correlation{" "}
+              <code>{requestError.correlationId ?? "n/a"}</code>.
+            </>
+          ) : (
+            <>Awaiting incident query response.</>
+          )}
+        </p>
+      </section>
+
       <form
         className="incident-filter-grid"
         onSubmit={(event) => {
@@ -311,6 +341,7 @@ export function IncidentTimelineCard({ freshness, baseUrl }: IncidentTimelineCar
           setState("loading");
           setResult(null);
           setRequestError(null);
+          setLastAnnouncementAtUtc(new Date().toISOString());
           setSubmitted({
             marketId: normalizeInput(draft.marketId),
             orderId: normalizeInput(draft.orderId),
@@ -411,6 +442,7 @@ export function IncidentTimelineCard({ freshness, baseUrl }: IncidentTimelineCar
             setState("loading");
             setResult(null);
             setRequestError(null);
+            setLastAnnouncementAtUtc(new Date().toISOString());
             setRefreshTick((value) => value + 1);
           }}
         >

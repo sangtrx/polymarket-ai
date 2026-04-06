@@ -93,3 +93,4 @@ Successful resume responses include:
 2. Incident forensics timeline: `docs/operations/incident-search-causal-timeline-forensics.md`
 3. Severity alert delivery and fallback policy: `docs/operations/severity-alert-delivery.md`
 4. Backup integrity and deterministic restore rehearsal: `docs/operations/backup-integrity-restore-rehearsal.md`
+5. Accessibility and reduced-motion critical-flow standards: `docs/operations/accessibility-reduced-motion-critical-flows.md`

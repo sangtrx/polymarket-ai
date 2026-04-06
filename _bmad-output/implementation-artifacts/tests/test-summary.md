@@ -468,3 +468,37 @@
 
 - `node --test tests/story-3-8/*.test.mjs tests/api/story-3-8*.test.mjs tests/e2e/story-3-8*.test.mjs` ✅
 - `npm run --silent qa:test:story-3-8` ✅
+
+---
+
+## Story
+
+- 3-9-enforce-accessibility-and-reduced-motion-standards-in-critical-flows
+
+## Generated Tests
+
+### Operator Console Accessibility + Reduced-Motion Hardening
+
+- [x] `tests/story-3-9/accessibility-reduced-motion.story-3-9.test.mjs` — validates keyboard confirmation focus-return behavior on critical controls, banner/timeline/alert assistive announcement semantics, reduced-motion CSS contracts, and Story 3.9 runbook scope/cross-link coverage.
+- [x] `tests/api/story-3-9-accessibility-contract-api.test.mjs` — validates strict fail-closed `control-actions` parsing for missing/malformed `timestamp_utc` evidence, missing `correlation_id` evidence on accepted emergency payloads, and valid outcome/timestamp mapping continuity.
+- [x] `tests/e2e/story-3-9-critical-flow-accessibility.e2e.test.mjs` — validates Story 3.9 QA command wiring, shared shell announcement-region contract, safety-rail keyboard confirmation (`alertdialog`, `aria-modal`, `<= 10s` evidence target), reduced-motion/focus-visible CSS contracts, incident-panel keyboard feedback semantics, and runbook cross-link continuity.
+
+## Coverage
+
+- Story 3.9 accessibility/reduced-motion contracts covered across critical operator-console seams:
+  - deterministic keyboard-only danger confirmation flow with Escape cancel handling and explicit focus-return behavior,
+  - explicit assistive announcement evidence shape (`outcome`, `reason_code`, `timestamp_utc`, correlation-aware IDs) across banner/safety/timeline/alerts surfaces,
+  - reduced-motion contract hardening for risk/safety/incident critical transitions with non-color semantic fallback text,
+  - strict machine-readable client parsing for malformed timestamp evidence with no success-shaped fallback in critical control responses,
+  - Story 3.9 operations runbook creation and incident/alerts/recovery runbook cross-link updates.
+- Automated Story 3.9 regression inventory in this QA refresh: **22 Story-3.9 tests passing** (`story: 6`, `api: 10`, `e2e: 6`).
+
+## Execution Result
+
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-9/*.test.mjs tests/api/story-3-9*.test.mjs tests/e2e/story-3-9*.test.mjs` ✅
+- `npm run --silent qa:test:story-3-9` ✅
+- `npm run --silent bootstrap:test` ✅
+- `node --test tests/story-*/*.test.mjs` ✅

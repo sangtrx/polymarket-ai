@@ -31,6 +31,9 @@ export function OperatorShellLayout({
   riskPosture,
   children,
 }: OperatorShellLayoutProps) {
+  const activeRouteLabel =
+    PRIMARY_ROUTES.find((route) => route.key === activeRoute)?.label ?? activeRoute;
+
   return (
     <div className="shell-root">
       <a className="skip-link" href="#main-content">
@@ -46,6 +49,16 @@ export function OperatorShellLayout({
         />
         <RiskCommandSurface riskPosture={riskPosture} />
       </header>
+
+      <div
+        id="operator-shell-announcements"
+        className="assistive-announcement operator-shell-announcements"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        Active route: {activeRouteLabel}. Risk posture: {riskPosture.posture}. Last evidence
+        timestamp: {riskPosture.evidence.lastUpdatedIso}.
+      </div>
 
       <div className="shell-frame">
         <nav aria-label="Primary navigation" className="shell-rail">

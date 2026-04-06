@@ -1,6 +1,17 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import {
+  resolveConfirmationTabLoop,
+  shouldDismissDangerConfirmation,
+  type ConfirmationDialogControl,
+} from "@/lib/risk/confirmation-dialog";
 import {
   EmergencyControlClientError,
   getEmergencyControlActionResult,
@@ -234,6 +245,20 @@ export function SafetyActionRail({
   onRecoveryResumed,
 }: SafetyActionRailProps) {
   const actionInFlightRef = useRef(false);
+  const railRegionRef = useRef<HTMLElement | null>(null);
+  const confirmationTriggerRef = useRef<EmergencyControlAction | "resume" | null>(
+    null,
+  );
+  const actionButtonRefs = useRef<
+    Record<EmergencyControlAction | "resume", HTMLButtonElement | null>
+  >({
+    pause: null,
+    "reduce-only": null,
+    "cancel-all": null,
+    resume: null,
+  });
+  const confirmationConfirmButtonRef = useRef<HTMLButtonElement | null>(null);
+  const confirmationCancelButtonRef = useRef<HTMLButtonElement | null>(null);
   const [pendingDangerAction, setPendingDangerAction] =
     useState<EmergencyControlAction | null>(null);
   const [activeAction, setActiveAction] = useState<
@@ -270,6 +295,72 @@ export function SafetyActionRail({
   const confirmationDescriptionId = pendingDangerAction
     ? `safety-action-confirmation-description-${pendingDangerAction}`
     : undefined;
+
+  const restoreFocusAfterConfirmation = ({
+    target,
+    trigger,
+  }: {
+    target: "trigger" | "rail";
+    trigger?: EmergencyControlAction | "resume" | null;
+  }) => {
+    setTimeout(() => {
+      if (target === "trigger") {
+        const resolvedTrigger = trigger ?? confirmationTriggerRef.current;
+        if (resolvedTrigger) {
+          const button = actionButtonRefs.current[resolvedTrigger];
+          if (button && !button.disabled) {
+            button.focus();
+            return;
+          }
+        }
+      }
+      railRegionRef.current?.focus();
+    }, 0);
+  };
+
+  useEffect(() => {
+    if (!pendingDangerAction) {
+      return;
+    }
+
+    const handleWindowEscape = (event: KeyboardEvent) => {
+      if (!shouldDismissDangerConfirmation({ key: event.key, isBusy })) {
+        return;
+      }
+      event.preventDefault();
+      const triggerForRestore = confirmationTriggerRef.current;
+      setPendingDangerAction(null);
+      restoreFocusAfterConfirmation({ target: "trigger", trigger: triggerForRestore });
+    };
+
+    window.addEventListener("keydown", handleWindowEscape);
+    return () => {
+      window.removeEventListener("keydown", handleWindowEscape);
+    };
+  }, [isBusy, pendingDangerAction]);
+
+  const handleConfirmationTabLoop = (event: ReactKeyboardEvent<HTMLElement>) => {
+    const activeControl: ConfirmationDialogControl | null =
+      document.activeElement === confirmationConfirmButtonRef.current
+        ? "confirm"
+        : document.activeElement === confirmationCancelButtonRef.current
+          ? "cancel"
+          : null;
+    const targetControl = resolveConfirmationTabLoop({
+      key: event.key,
+      shiftKey: event.shiftKey,
+      activeControl,
+    });
+    if (!targetControl) {
+      return;
+    }
+    event.preventDefault();
+    if (targetControl === "confirm") {
+      confirmationConfirmButtonRef.current?.focus();
+      return;
+    }
+    confirmationCancelButtonRef.current?.focus();
+  };
 
   const resolveState = (action: EmergencyControlAction | "resume"): ActionButtonState => {
     if (action === "resume") {
@@ -352,8 +443,12 @@ export function SafetyActionRail({
       return;
     }
 
+    const launchedFromConfirmation = pendingDangerAction !== null;
     actionInFlightRef.current = true;
     setPendingDangerAction(null);
+    if (launchedFromConfirmation) {
+      restoreFocusAfterConfirmation({ target: "rail" });
+    }
     setError(null);
     setTimingEvidence(null);
     setTimingWarning(null);
@@ -523,6 +618,8 @@ export function SafetyActionRail({
       aria-label="Persistent safety action rail"
       className="safety-action-rail"
       role="region"
+      ref={railRegionRef}
+      tabIndex={-1}
     >
       <div className="shell-panel-header">
         <div>
@@ -539,7 +636,8 @@ export function SafetyActionRail({
 
       <p className="type-body text-muted">
         Urgent interventions stay within {"<= 2 interactions"} while dangerous
-        controls enforce explicit confirmations.
+        controls enforce explicit confirmations. Recovery pathways preserve
+        Story 3.7 controlled-recovery gate semantics.
       </p>
       <p className="type-metadata text-muted">
         Acknowledgment target {"<= 1s"} · reflected state target {"<= 5s"} ·
@@ -553,12 +651,17 @@ export function SafetyActionRail({
             <li key={action}>
               <button
                 aria-disabled={state === "gated" || state === "in-progress"}
+                aria-label={`${ACTION_LABELS[action]} emergency control (${state} state)`}
                 className="safety-action-button"
                 data-hierarchy={ACTION_HIERARCHY[action]}
                 data-state={state}
                 disabled={state === "gated" || state === "in-progress"}
+                ref={(node) => {
+                  actionButtonRefs.current[action] = node;
+                }}
                 onClick={() => {
                   if (isDangerAction(action)) {
+                    confirmationTriggerRef.current = action;
                     setPendingDangerAction(action);
                     return;
                   }
@@ -586,6 +689,9 @@ export function SafetyActionRail({
                   data-hierarchy="tertiary"
                   data-state={resumeButtonState}
                   disabled={resumeButtonDisabled}
+                  ref={(node) => {
+                    actionButtonRefs.current.resume = node;
+                  }}
                   onClick={() => {
                     if (resumeButtonDisabled) {
                       return;
@@ -596,6 +702,9 @@ export function SafetyActionRail({
                 >
                   Resume
                 </button>
+                <p className="type-metadata text-muted">
+                  State: {resumeButtonState}
+                </p>
                 <p className="type-metadata text-muted">
                   {effectiveResumeReason}
                 </p>
@@ -610,8 +719,9 @@ export function SafetyActionRail({
           aria-describedby={confirmationDescriptionId}
           aria-labelledby={confirmationTitleId}
           aria-live="assertive"
-          aria-modal="false"
+          aria-modal="true"
           className="safety-action-confirmation"
+          onKeyDown={handleConfirmationTabLoop}
           role="alertdialog"
         >
           <h3 className="type-heading-m" id={confirmationTitleId}>
@@ -628,6 +738,7 @@ export function SafetyActionRail({
               data-hierarchy="danger"
               data-state="enabled"
               disabled={isBusy}
+              ref={confirmationConfirmButtonRef}
               onClick={() => {
                 if (isBusy) {
                   return;
@@ -644,7 +755,15 @@ export function SafetyActionRail({
               data-hierarchy="secondary"
               data-state="enabled"
               disabled={isBusy}
-              onClick={() => setPendingDangerAction(null)}
+              ref={confirmationCancelButtonRef}
+              onClick={() => {
+                const triggerForRestore = confirmationTriggerRef.current;
+                setPendingDangerAction(null);
+                restoreFocusAfterConfirmation({
+                  target: "trigger",
+                  trigger: triggerForRestore,
+                });
+              }}
               type="button"
             >
               Cancel
@@ -656,6 +775,11 @@ export function SafetyActionRail({
       {lastDecision && timingEvidence ? (
         <section className="safety-action-evidence" role="status">
           <p className="type-eyebrow">Post-action confirmation</p>
+          <p className="assistive-announcement" aria-atomic="true" aria-live="assertive">
+            Outcome: {lastDecision.resultingMode}. Reason: {lastDecision.reasonCode}.
+            Timestamp: {lastDecision.timestampUtc}. Action ID: {lastDecision.actionId}.
+            Correlation ID: {lastDecision.correlationId}.
+          </p>
           <dl className="risk-evidence-grid">
             <div>
               <dt className="type-metadata text-muted">Action ID</dt>

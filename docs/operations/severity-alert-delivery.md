@@ -90,3 +90,4 @@ For each delivery attempt:
 2. Emergency containment controls: `docs/operations/emergency-safe-state-controls.md`
 3. Controlled recovery readiness gates: `docs/operations/controlled-recovery-readiness-gates.md`
 4. Backup integrity and deterministic restore rehearsal: `docs/operations/backup-integrity-restore-rehearsal.md`
+5. Accessibility and reduced-motion critical-flow standards: `docs/operations/accessibility-reduced-motion-critical-flows.md`

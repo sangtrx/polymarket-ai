@@ -37,6 +37,8 @@
 
   --foundation-motion-fast: 150ms;
   --foundation-motion-standard: 220ms;
+  --foundation-motion-critical: 320ms;
+  --foundation-motion-reduced: 0ms;
 
   --font-family-heading: var(--font-source-serif-4);
   --font-family-body: var(--font-ibm-plex-sans);

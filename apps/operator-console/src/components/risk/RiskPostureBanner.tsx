@@ -8,14 +8,22 @@ const POSTURE_LABELS: Record<RiskPostureViewModel["posture"], string> = {
 };
 
 export function RiskPostureBanner({ model }: { model: RiskPostureViewModel }) {
+  const announcementSummaryId = "risk-banner-announcement-summary";
+
   return (
     <section
+      aria-describedby={announcementSummaryId}
       aria-atomic="true"
       aria-live={model.ariaLive}
       className="risk-banner"
       data-posture={model.posture}
       role="status"
     >
+      <p className="assistive-announcement risk-banner--announcement" id={announcementSummaryId}>
+        Outcome: {model.evidence.resultingMode}. Timestamp: {model.evidence.lastUpdatedIso}.
+        Reason: {model.evidence.reasonCode}. Action ID: {model.evidence.actionId ?? "n/a"}.
+        Correlation ID: {model.evidence.correlationId ?? "n/a"}.
+      </p>
       <div className="shell-panel-header">
         <div>
           <p className="type-eyebrow">Risk posture banner</p>

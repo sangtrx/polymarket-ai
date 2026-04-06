@@ -24,6 +24,23 @@ a {
   outline-offset: 2px;
 }
 
+.assistive-announcement {
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  width: 1px;
+}
+
+.operator-shell-announcements {
+  left: 0;
+  top: 0;
+}
+
 .skip-link {
   left: var(--foundation-space-2);
   position: absolute;
@@ -179,6 +196,13 @@ a {
   flex-direction: column;
   gap: var(--foundation-space-1);
   padding: var(--foundation-space-2);
+  transition:
+    background-color var(--foundation-motion-critical) ease,
+    border-color var(--foundation-motion-critical) ease;
+}
+
+.risk-banner--announcement {
+  white-space: nowrap;
 }
 
 .risk-banner[data-posture="warning"] {
@@ -251,6 +275,10 @@ a {
   width: 100%;
 }
 
+.safety-action-button:focus-visible {
+  outline-color: var(--risk-critical);
+}
+
 .safety-action-button[data-hierarchy="danger"] {
   background: var(--safety-action-danger-bg);
   color: var(--safety-action-danger-text);
@@ -301,6 +329,9 @@ a {
   flex-direction: column;
   gap: var(--foundation-space-1);
   padding: var(--foundation-space-1);
+  transition:
+    background-color var(--foundation-motion-critical) ease,
+    border-color var(--foundation-motion-critical) ease;
 }
 
 .safety-action-confirmation-controls {
@@ -715,6 +746,18 @@ a {
   padding: 0.45rem 0.6rem;
 }
 
+.incident-filter-input:focus-visible {
+  border-color: var(--interactive-primary-bg);
+}
+
+.incident-announcement-surface {
+  background: var(--surface-muted);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--foundation-radius-8);
+  margin: 0;
+  padding: 0.3rem 0.45rem;
+}
+
 .incident-skeleton {
   background: var(--surface-elevated);
   border: 1px solid var(--state-loading-border);
@@ -781,6 +824,9 @@ a {
   flex-direction: column;
   gap: 0.45rem;
   padding: var(--foundation-space-1);
+  transition:
+    background-color var(--foundation-motion-critical) ease,
+    border-color var(--foundation-motion-critical) ease;
 }
 
 .incident-timeline-item[data-severity="warning"] {
@@ -893,6 +939,9 @@ a {
   flex-direction: column;
   gap: 0.45rem;
   padding: var(--foundation-space-1);
+  transition:
+    background-color var(--foundation-motion-critical) ease,
+    border-color var(--foundation-motion-critical) ease;
 }
 
 .incident-alert-item[data-severity="critical"] {
@@ -1152,6 +1201,12 @@ a {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  :root {
+    --foundation-motion-fast: var(--foundation-motion-reduced);
+    --foundation-motion-standard: var(--foundation-motion-reduced);
+    --foundation-motion-critical: var(--foundation-motion-reduced);
+  }
+
   *,
   *::before,
   *::after {
@@ -1159,5 +1214,14 @@ a {
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .risk-banner,
+  .safety-action-button,
+  .safety-action-confirmation,
+  .incident-timeline-item,
+  .incident-alert-item {
+    animation: none !important;
+    transition: none !important;
   }
 }

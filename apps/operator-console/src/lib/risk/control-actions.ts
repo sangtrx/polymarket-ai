@@ -231,6 +231,8 @@ const ACTION_ERROR_KEYS: Record<EmergencyControlAction, string> = {
 };
 const ACTION_ID_PATTERN = /^[a-z0-9._:-]{1,180}$/i;
 const CHECKSUM_PATTERN = /^[0-9a-f]{64}$/;
+const ISO_8601_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const RECOVERY_READINESS_ENDPOINT = "/control/recovery/readiness/evaluate";
 const RECOVERY_RESUME_ENDPOINT = "/control/recovery/resume";
 const RECOVERY_RUNS_ENDPOINT = "/control/recovery/runs";
@@ -347,14 +349,91 @@ function optionalFiniteNumber(
   return candidate;
 }
 
-function normalizeTimestamp(value: string | undefined): string {
-  if (value) {
-    const parsed = Date.parse(value);
-    if (!Number.isNaN(parsed)) {
-      return new Date(parsed).toISOString();
-    }
+function parseIsoTimestampStrict({
+  value,
+  key,
+  context,
+  errorCode,
+  action,
+}: {
+  value: string;
+  key: string;
+  context: string;
+  errorCode: string;
+  action: string;
+}): string {
+  if (!ISO_8601_TIMESTAMP_PATTERN.test(value)) {
+    throw new EmergencyControlClientError({
+      status: 502,
+      errorCode,
+      message: `expected ${key} to be ISO-8601 timestamp in ${context}`,
+      action,
+      endpoint: context,
+      timestampUtc: new Date().toISOString(),
+    });
   }
-  return new Date().toISOString();
+  const parsed = Date.parse(value);
+  if (!Number.isNaN(parsed)) {
+    return new Date(parsed).toISOString();
+  }
+  throw new EmergencyControlClientError({
+    status: 502,
+    errorCode,
+    message: `expected ${key} to be ISO-8601 timestamp in ${context}`,
+    action,
+    endpoint: context,
+    timestampUtc: new Date().toISOString(),
+  });
+}
+
+function requiredTimestamp(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+  errorCode: string,
+  action: string,
+): string {
+  return parseIsoTimestampStrict({
+    value: requiredString(record, key, context),
+    key,
+    context,
+    errorCode,
+    action,
+  });
+}
+
+function optionalTimestamp(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+  errorCode: string,
+  action: string,
+): string | undefined {
+  const value = optionalString(record, key);
+  if (!value) {
+    return undefined;
+  }
+  return parseIsoTimestampStrict({
+    value,
+    key,
+    context,
+    errorCode,
+    action,
+  });
+}
+
+function parseOptionalIsoTimestamp(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (!ISO_8601_TIMESTAMP_PATTERN.test(value)) {
+    return undefined;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return undefined;
+  }
+  return new Date(parsed).toISOString();
 }
 
 function resolveFetch(fetchImpl: FetchLike | undefined): FetchLike {
@@ -432,7 +511,13 @@ function parseDecisionPayload(
     resultingMode: requiredString(payload, "resulting_mode", endpoint),
     reasonCode: requiredString(payload, "reason_code", endpoint),
     correlationId: requiredString(payload, "correlation_id", endpoint),
-    timestampUtc: normalizeTimestamp(optionalString(payload, "timestamp_utc")),
+    timestampUtc: requiredTimestamp(
+      payload,
+      "timestamp_utc",
+      endpoint,
+      "emergency_control_contract_mismatch",
+      "emergency_control_contract_validation",
+    ),
     auditReference: optionalString(payload, "audit_reference"),
   };
 }
@@ -539,13 +624,27 @@ function parseRecoveryReadinessPayload(
     actorId: requiredString(payload, "actor_id", endpoint),
     actorRole: requiredString(payload, "actor_role", endpoint),
     correlationId: requiredString(payload, "correlation_id", endpoint),
-    requestedAtUtc: normalizeTimestamp(
-      requiredString(payload, "requested_at_utc", endpoint),
+    requestedAtUtc: requiredTimestamp(
+      payload,
+      "requested_at_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
-    evaluatedAtUtc: normalizeTimestamp(
-      requiredString(payload, "evaluated_at_utc", endpoint),
+    evaluatedAtUtc: requiredTimestamp(
+      payload,
+      "evaluated_at_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
-    resumedAtUtc: optionalString(payload, "resumed_at_utc"),
+    resumedAtUtc: optionalTimestamp(
+      payload,
+      "resumed_at_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
+    ),
     reconciliationRunId: optionalString(payload, "reconciliation_run_id"),
     approvedChecksum: optionalString(payload, "approved_checksum"),
     computedChecksum: optionalString(payload, "computed_checksum"),
@@ -553,8 +652,12 @@ function parseRecoveryReadinessPayload(
     gateOutcomes: parseRecoveryGateOutcomes(payload, endpoint),
     recommendedNextAction: requiredString(payload, "recommended_next_action", endpoint),
     auditReference: optionalString(payload, "audit_reference"),
-    timestampUtc: normalizeTimestamp(
-      requiredString(payload, "timestamp_utc", endpoint),
+    timestampUtc: requiredTimestamp(
+      payload,
+      "timestamp_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
   };
 }
@@ -600,14 +703,26 @@ function parseRecoveryResumePayload(
     actorId: requiredString(payload, "actor_id", endpoint),
     actorRole: requiredString(payload, "actor_role", endpoint),
     correlationId: requiredString(payload, "correlation_id", endpoint),
-    resumedAtUtc: normalizeTimestamp(
-      requiredString(payload, "resumed_at_utc", endpoint),
+    resumedAtUtc: requiredTimestamp(
+      payload,
+      "resumed_at_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
-    verificationTimestampUtc: normalizeTimestamp(
-      requiredString(payload, "verification_timestamp_utc", endpoint),
+    verificationTimestampUtc: requiredTimestamp(
+      payload,
+      "verification_timestamp_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
-    timestampUtc: normalizeTimestamp(
-      requiredString(payload, "timestamp_utc", endpoint),
+    timestampUtc: requiredTimestamp(
+      payload,
+      "timestamp_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
     auditReference: optionalString(payload, "audit_reference"),
   };
@@ -743,14 +858,26 @@ function parseRecoveryRehearsalPayload(
       "reconciliation_mismatch_rate",
     ),
     reconciliationPassed: requiredBoolean(payload, "reconciliation_passed", endpoint),
-    requestedAtUtc: normalizeTimestamp(
-      requiredString(payload, "requested_at_utc", endpoint),
+    requestedAtUtc: requiredTimestamp(
+      payload,
+      "requested_at_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
-    startedAtUtc: normalizeTimestamp(
-      requiredString(payload, "started_at_utc", endpoint),
+    startedAtUtc: requiredTimestamp(
+      payload,
+      "started_at_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
-    completedAtUtc: normalizeTimestamp(
-      requiredString(payload, "completed_at_utc", endpoint),
+    completedAtUtc: requiredTimestamp(
+      payload,
+      "completed_at_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
     integrityChecks: parseRecoveryRehearsalIntegrityChecks(payload, endpoint),
     deterministicSignature: parseRecoveryDeterministicSignature(payload, endpoint),
@@ -758,8 +885,12 @@ function parseRecoveryRehearsalPayload(
     incidentCorrelationId: optionalString(payload, "incident_correlation_id"),
     incidentSeverity: optionalString(payload, "incident_severity"),
     auditReference: optionalString(payload, "audit_reference"),
-    timestampUtc: normalizeTimestamp(
-      requiredString(payload, "timestamp_utc", endpoint),
+    timestampUtc: requiredTimestamp(
+      payload,
+      "timestamp_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
     ),
   };
 }
@@ -819,8 +950,12 @@ function parseRecoveryRehearsalQueryPayload(
       reasonCode: requiredString(candidate, "reason_code", endpoint),
       artifactId: requiredString(candidate, "artifact_id", endpoint),
       correlationId: requiredString(candidate, "correlation_id", endpoint),
-      completedAtUtc: normalizeTimestamp(
-        requiredString(candidate, "completed_at_utc", endpoint),
+      completedAtUtc: requiredTimestamp(
+        candidate,
+        "completed_at_utc",
+        endpoint,
+        "recovery_contract_mismatch",
+        "recovery_contract_validation",
       ),
       failingChecks: Array.isArray(failingChecksRaw)
         ? failingChecksRaw
@@ -842,7 +977,13 @@ function parseRecoveryRehearsalQueryPayload(
     actorId: requiredString(payload, "actor_id", endpoint),
     role: requiredString(payload, "role", endpoint),
     correlationId: requiredString(payload, "correlation_id", endpoint),
-    timestampUtc: normalizeTimestamp(requiredString(payload, "timestamp_utc", endpoint)),
+    timestampUtc: requiredTimestamp(
+      payload,
+      "timestamp_utc",
+      endpoint,
+      "recovery_contract_mismatch",
+      "recovery_contract_validation",
+    ),
     rehearsals,
   };
 }
@@ -874,7 +1015,9 @@ function parseErrorPayload(
     action: optionalString(payload, "action") ?? fallbackAction,
     correlationId: optionalString(payload, "correlation_id"),
     endpoint: optionalString(payload, "endpoint") ?? endpoint,
-    timestampUtc: normalizeTimestamp(optionalString(payload, "timestamp_utc")),
+    timestampUtc:
+      parseOptionalIsoTimestamp(optionalString(payload, "timestamp_utc")) ??
+      new Date().toISOString(),
   });
 }
 
