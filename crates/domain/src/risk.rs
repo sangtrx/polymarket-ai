@@ -4,6 +4,8 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 const MARKET_EXPOSURE_MIN_PCT_NAV: f64 = 0.0;
 const MARKET_EXPOSURE_MAX_PCT_NAV: f64 = 100.0;
+const RISK_LIMIT_PERCENT_MIN_PCT_NAV: f64 = 0.0;
+const RISK_LIMIT_PERCENT_MAX_PCT_NAV: f64 = 100.0;
 pub const MARKET_STREAM_LATENCY_TARGET_SECONDS: f64 = 2.0;
 pub const USER_STREAM_LATENCY_TARGET_SECONDS: f64 = 2.0;
 pub const MARKET_STREAM_BACKLOG_WARNING_SECONDS: f64 = 5.0;
@@ -19,6 +21,395 @@ pub const FRESHNESS_MAX_BREACH_TO_PAUSE_SECONDS: f64 = 5.0;
 pub struct RiskLimit {
     pub policy_key: String,
     pub max_notional_usd: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLimitScope {
+    Portfolio,
+    Market,
+    Strategy,
+}
+
+impl RiskLimitScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Portfolio => "portfolio",
+            Self::Market => "market",
+            Self::Strategy => "strategy",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RiskLimitContractError> {
+        match value {
+            "portfolio" => Ok(Self::Portfolio),
+            "market" => Ok(Self::Market),
+            "strategy" => Ok(Self::Strategy),
+            _ => Err(RiskLimitContractError::invalid_payload(format!(
+                "unknown risk limit scope `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLimitProfileStatus {
+    Active,
+    Pending,
+    Denied,
+}
+
+impl RiskLimitProfileStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::Denied => "denied",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RiskLimitContractError> {
+        match value {
+            "active" => Ok(Self::Active),
+            "pending" => Ok(Self::Pending),
+            "denied" => Ok(Self::Denied),
+            _ => Err(RiskLimitContractError::invalid_payload(format!(
+                "unknown risk limit profile status `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLimitReasonCode {
+    ProfileApplied,
+    ProfilePendingApproval,
+    ProfileDenied,
+    ApprovalRequired,
+    InvalidPayload,
+    InvalidThreshold,
+    InvalidScopeInvariant,
+    PolicyStateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl RiskLimitReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProfileApplied => "risk_limit_profile_applied",
+            Self::ProfilePendingApproval => "risk_limit_profile_pending_approval",
+            Self::ProfileDenied => "risk_limit_profile_denied",
+            Self::ApprovalRequired => "risk_limit_approval_required",
+            Self::InvalidPayload => "risk_limit_invalid_payload",
+            Self::InvalidThreshold => "risk_limit_invalid_threshold",
+            Self::InvalidScopeInvariant => "risk_limit_invalid_scope_invariant",
+            Self::PolicyStateUnavailable => "risk_limit_policy_state_unavailable",
+            Self::PersistenceUnavailable => "risk_limit_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RiskLimitContractError> {
+        match value {
+            "risk_limit_profile_applied" => Ok(Self::ProfileApplied),
+            "risk_limit_profile_pending_approval" => Ok(Self::ProfilePendingApproval),
+            "risk_limit_profile_denied" => Ok(Self::ProfileDenied),
+            "risk_limit_approval_required" => Ok(Self::ApprovalRequired),
+            "risk_limit_invalid_payload" => Ok(Self::InvalidPayload),
+            "risk_limit_invalid_threshold" => Ok(Self::InvalidThreshold),
+            "risk_limit_invalid_scope_invariant" => Ok(Self::InvalidScopeInvariant),
+            "risk_limit_policy_state_unavailable" => Ok(Self::PolicyStateUnavailable),
+            "risk_limit_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(RiskLimitContractError::invalid_payload(format!(
+                "unknown risk limit reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RiskScopeLimit {
+    pub scope: RiskLimitScope,
+    pub scope_id: String,
+    pub max_notional_usd: f64,
+    pub max_inventory_units: f64,
+    pub max_concentration_pct_nav: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RiskLimitProfileVersion {
+    pub profile_key: String,
+    pub version: i64,
+    pub portfolio: RiskScopeLimit,
+    pub market: RiskScopeLimit,
+    pub strategy: RiskScopeLimit,
+    pub status: RiskLimitProfileStatus,
+    pub approval_reference: Option<String>,
+    pub actor_id: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InventoryLimitRule {
+    pub rule_id: String,
+    pub profile_key: String,
+    pub profile_version: i64,
+    pub scope: RiskLimitScope,
+    pub scope_id: String,
+    pub max_position_units: f64,
+    pub max_order_size_units: f64,
+    pub max_concentration_pct_nav: f64,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RiskLimitValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RiskLimitContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<RiskLimitValidationIssue>,
+}
+
+impl RiskLimitContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: RiskLimitReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<RiskLimitValidationIssue>,
+    ) -> Self {
+        Self {
+            code: RiskLimitReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+pub fn validate_risk_limit_profile_version(
+    profile: &RiskLimitProfileVersion,
+) -> Result<(), RiskLimitContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_risk_limit_field(&mut field_errors, "profile_key", &profile.profile_key);
+    validate_non_empty_risk_limit_field(&mut field_errors, "actor_id", &profile.actor_id);
+    validate_non_empty_risk_limit_field(
+        &mut field_errors,
+        "correlation_id",
+        &profile.correlation_id,
+    );
+    validate_non_empty_risk_limit_field(&mut field_errors, "reason_code", &profile.reason_code);
+    validate_risk_limit_timestamp_field(
+        &mut field_errors,
+        "updated_at_utc",
+        &profile.updated_at_utc,
+    );
+
+    if profile.version <= 0 {
+        field_errors.push(RiskLimitValidationIssue {
+            field: "version",
+            code: RiskLimitReasonCode::InvalidPayload.code(),
+            message: "version must be greater than 0".to_string(),
+        });
+    }
+
+    if RiskLimitReasonCode::parse(&profile.reason_code).is_err() {
+        field_errors.push(RiskLimitValidationIssue {
+            field: "reason_code",
+            code: RiskLimitReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known risk limit reason".to_string(),
+        });
+    }
+
+    if profile.status == RiskLimitProfileStatus::Pending
+        && profile
+            .approval_reference
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        field_errors.push(RiskLimitValidationIssue {
+            field: "approval_reference",
+            code: RiskLimitReasonCode::InvalidScopeInvariant.code(),
+            message: "pending profiles cannot carry approval_reference until activated".to_string(),
+        });
+    }
+
+    validate_scope_limit(
+        &mut field_errors,
+        &profile.portfolio,
+        RiskLimitScope::Portfolio,
+        "portfolio.scope",
+        "portfolio.scope_id",
+        "portfolio.max_notional_usd",
+        "portfolio.max_inventory_units",
+        "portfolio.max_concentration_pct_nav",
+    );
+    validate_scope_limit(
+        &mut field_errors,
+        &profile.market,
+        RiskLimitScope::Market,
+        "market.scope",
+        "market.scope_id",
+        "market.max_notional_usd",
+        "market.max_inventory_units",
+        "market.max_concentration_pct_nav",
+    );
+    validate_scope_limit(
+        &mut field_errors,
+        &profile.strategy,
+        RiskLimitScope::Strategy,
+        "strategy.scope",
+        "strategy.scope_id",
+        "strategy.max_notional_usd",
+        "strategy.max_inventory_units",
+        "strategy.max_concentration_pct_nav",
+    );
+
+    validate_child_not_above_parent(
+        &mut field_errors,
+        "market.max_notional_usd",
+        profile.market.max_notional_usd,
+        "portfolio.max_notional_usd",
+        profile.portfolio.max_notional_usd,
+    );
+    validate_child_not_above_parent(
+        &mut field_errors,
+        "strategy.max_notional_usd",
+        profile.strategy.max_notional_usd,
+        "market.max_notional_usd",
+        profile.market.max_notional_usd,
+    );
+    validate_child_not_above_parent(
+        &mut field_errors,
+        "market.max_inventory_units",
+        profile.market.max_inventory_units,
+        "portfolio.max_inventory_units",
+        profile.portfolio.max_inventory_units,
+    );
+    validate_child_not_above_parent(
+        &mut field_errors,
+        "strategy.max_inventory_units",
+        profile.strategy.max_inventory_units,
+        "market.max_inventory_units",
+        profile.market.max_inventory_units,
+    );
+    validate_child_not_above_parent(
+        &mut field_errors,
+        "market.max_concentration_pct_nav",
+        profile.market.max_concentration_pct_nav,
+        "portfolio.max_concentration_pct_nav",
+        profile.portfolio.max_concentration_pct_nav,
+    );
+    validate_child_not_above_parent(
+        &mut field_errors,
+        "strategy.max_concentration_pct_nav",
+        profile.strategy.max_concentration_pct_nav,
+        "market.max_concentration_pct_nav",
+        profile.market.max_concentration_pct_nav,
+    );
+
+    if !field_errors.is_empty() {
+        return Err(RiskLimitContractError::invalid_payload_with_issues(
+            "risk limit profile contains invalid scope thresholds",
+            field_errors,
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn validate_inventory_limit_rule(
+    rule: &InventoryLimitRule,
+) -> Result<(), RiskLimitContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_risk_limit_field(&mut field_errors, "rule_id", &rule.rule_id);
+    validate_non_empty_risk_limit_field(&mut field_errors, "profile_key", &rule.profile_key);
+    validate_non_empty_risk_limit_field(&mut field_errors, "scope_id", &rule.scope_id);
+    validate_non_empty_risk_limit_field(&mut field_errors, "actor_id", &rule.actor_id);
+    validate_non_empty_risk_limit_field(&mut field_errors, "correlation_id", &rule.correlation_id);
+    validate_risk_limit_timestamp_field(&mut field_errors, "updated_at_utc", &rule.updated_at_utc);
+    validate_non_negative_risk_limit_value(
+        &mut field_errors,
+        "max_position_units",
+        rule.max_position_units,
+    );
+    validate_non_negative_risk_limit_value(
+        &mut field_errors,
+        "max_order_size_units",
+        rule.max_order_size_units,
+    );
+    validate_risk_limit_percent_range(
+        &mut field_errors,
+        "max_concentration_pct_nav",
+        rule.max_concentration_pct_nav,
+    );
+
+    if rule.profile_version <= 0 {
+        field_errors.push(RiskLimitValidationIssue {
+            field: "profile_version",
+            code: RiskLimitReasonCode::InvalidPayload.code(),
+            message: "profile_version must be greater than 0".to_string(),
+        });
+    }
+
+    if rule.scope == RiskLimitScope::Portfolio {
+        field_errors.push(RiskLimitValidationIssue {
+            field: "scope",
+            code: RiskLimitReasonCode::InvalidScopeInvariant.code(),
+            message: "inventory rules are only valid for market or strategy scopes".to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(RiskLimitContractError::invalid_payload_with_issues(
+            "inventory limit rule payload is invalid",
+            field_errors,
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn requires_risk_limit_increase_approval(
+    current: Option<&RiskLimitProfileVersion>,
+    proposed: &RiskLimitProfileVersion,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    if current.profile_key.trim() != proposed.profile_key.trim() {
+        return false;
+    }
+
+    proposed.portfolio.max_notional_usd > current.portfolio.max_notional_usd
+        || proposed.market.max_notional_usd > current.market.max_notional_usd
+        || proposed.strategy.max_notional_usd > current.strategy.max_notional_usd
+        || proposed.portfolio.max_inventory_units > current.portfolio.max_inventory_units
+        || proposed.market.max_inventory_units > current.market.max_inventory_units
+        || proposed.strategy.max_inventory_units > current.strategy.max_inventory_units
+        || proposed.portfolio.max_concentration_pct_nav
+            > current.portfolio.max_concentration_pct_nav
+        || proposed.market.max_concentration_pct_nav > current.market.max_concentration_pct_nav
+        || proposed.strategy.max_concentration_pct_nav > current.strategy.max_concentration_pct_nav
+}
+
+pub fn normalize_risk_limit_identifier(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2304,6 +2695,135 @@ fn validate_stream_timestamp_field(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_scope_limit(
+    field_errors: &mut Vec<RiskLimitValidationIssue>,
+    scope_limit: &RiskScopeLimit,
+    expected_scope: RiskLimitScope,
+    scope_field: &'static str,
+    scope_id_field: &'static str,
+    max_notional_field: &'static str,
+    max_inventory_field: &'static str,
+    max_concentration_field: &'static str,
+) {
+    if scope_limit.scope != expected_scope {
+        field_errors.push(RiskLimitValidationIssue {
+            field: scope_field,
+            code: RiskLimitReasonCode::InvalidScopeInvariant.code(),
+            message: format!("{scope_field} must be `{}`", expected_scope.as_str()),
+        });
+    }
+
+    validate_non_empty_risk_limit_field(field_errors, scope_id_field, &scope_limit.scope_id);
+    validate_non_negative_risk_limit_value(
+        field_errors,
+        max_notional_field,
+        scope_limit.max_notional_usd,
+    );
+    validate_non_negative_risk_limit_value(
+        field_errors,
+        max_inventory_field,
+        scope_limit.max_inventory_units,
+    );
+    validate_risk_limit_percent_range(
+        field_errors,
+        max_concentration_field,
+        scope_limit.max_concentration_pct_nav,
+    );
+}
+
+fn validate_non_empty_risk_limit_field(
+    field_errors: &mut Vec<RiskLimitValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(RiskLimitValidationIssue {
+            field,
+            code: RiskLimitReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_non_negative_risk_limit_value(
+    field_errors: &mut Vec<RiskLimitValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(RiskLimitValidationIssue {
+            field,
+            code: RiskLimitReasonCode::InvalidThreshold.code(),
+            message: format!("{field} must be finite"),
+        });
+        return;
+    }
+    if value < 0.0 {
+        field_errors.push(RiskLimitValidationIssue {
+            field,
+            code: RiskLimitReasonCode::InvalidThreshold.code(),
+            message: format!("{field} must be greater than or equal to 0"),
+        });
+    }
+}
+
+fn validate_risk_limit_percent_range(
+    field_errors: &mut Vec<RiskLimitValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(RiskLimitValidationIssue {
+            field,
+            code: RiskLimitReasonCode::InvalidThreshold.code(),
+            message: format!("{field} must be finite"),
+        });
+        return;
+    }
+    if !(RISK_LIMIT_PERCENT_MIN_PCT_NAV..=RISK_LIMIT_PERCENT_MAX_PCT_NAV).contains(&value) {
+        field_errors.push(RiskLimitValidationIssue {
+            field,
+            code: RiskLimitReasonCode::InvalidThreshold.code(),
+            message: format!(
+                "{field} must be between {RISK_LIMIT_PERCENT_MIN_PCT_NAV} and {RISK_LIMIT_PERCENT_MAX_PCT_NAV}"
+            ),
+        });
+    }
+}
+
+fn validate_risk_limit_timestamp_field(
+    field_errors: &mut Vec<RiskLimitValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(RiskLimitValidationIssue {
+            field,
+            code: RiskLimitReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
+fn validate_child_not_above_parent(
+    field_errors: &mut Vec<RiskLimitValidationIssue>,
+    child_field: &'static str,
+    child_value: f64,
+    parent_field: &'static str,
+    parent_value: f64,
+) {
+    if child_value > parent_value {
+        field_errors.push(RiskLimitValidationIssue {
+            field: child_field,
+            code: RiskLimitReasonCode::InvalidScopeInvariant.code(),
+            message: format!(
+                "{child_field} cannot exceed {parent_field}; equality is allowed but strict greater-than is rejected"
+            ),
+        });
+    }
+}
+
 fn validate_non_empty_field(
     field_errors: &mut Vec<MarketPolicyValidationIssue>,
     field: &'static str,
@@ -2397,6 +2917,144 @@ fn normalize_identifier<'a>(value: &'a str, fallback: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_risk_scope(
+        scope: RiskLimitScope,
+        scope_id: &str,
+        max_notional_usd: f64,
+        max_inventory_units: f64,
+        max_concentration_pct_nav: f64,
+    ) -> RiskScopeLimit {
+        RiskScopeLimit {
+            scope,
+            scope_id: scope_id.to_string(),
+            max_notional_usd,
+            max_inventory_units,
+            max_concentration_pct_nav,
+        }
+    }
+
+    fn sample_risk_profile_version() -> RiskLimitProfileVersion {
+        RiskLimitProfileVersion {
+            profile_key: "default".to_string(),
+            version: 1,
+            portfolio: sample_risk_scope(
+                RiskLimitScope::Portfolio,
+                "portfolio::default",
+                1000.0,
+                600.0,
+                50.0,
+            ),
+            market: sample_risk_scope(RiskLimitScope::Market, "market::sports", 600.0, 300.0, 40.0),
+            strategy: sample_risk_scope(
+                RiskLimitScope::Strategy,
+                "strategy::maker",
+                300.0,
+                150.0,
+                25.0,
+            ),
+            status: RiskLimitProfileStatus::Active,
+            approval_reference: None,
+            actor_id: "ops-1".to_string(),
+            reason_code: RiskLimitReasonCode::ProfileApplied.code().to_string(),
+            correlation_id: "corr-risk-limit-001".to_string(),
+            updated_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_inventory_rule() -> InventoryLimitRule {
+        InventoryLimitRule {
+            rule_id: "rule::market::sports".to_string(),
+            profile_key: "default".to_string(),
+            profile_version: 1,
+            scope: RiskLimitScope::Market,
+            scope_id: "market::sports".to_string(),
+            max_position_units: 250.0,
+            max_order_size_units: 40.0,
+            max_concentration_pct_nav: 30.0,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-risk-limit-001".to_string(),
+            updated_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn risk_limit_profile_validation_accepts_equal_boundaries() {
+        let mut profile = sample_risk_profile_version();
+        profile.market.max_notional_usd = profile.portfolio.max_notional_usd;
+        profile.strategy.max_notional_usd = profile.market.max_notional_usd;
+        profile.market.max_inventory_units = profile.portfolio.max_inventory_units;
+        profile.strategy.max_inventory_units = profile.market.max_inventory_units;
+        profile.market.max_concentration_pct_nav = profile.portfolio.max_concentration_pct_nav;
+        profile.strategy.max_concentration_pct_nav = profile.market.max_concentration_pct_nav;
+
+        assert!(validate_risk_limit_profile_version(&profile).is_ok());
+    }
+
+    #[test]
+    fn risk_limit_profile_validation_rejects_child_scope_exceeding_parent() {
+        let mut profile = sample_risk_profile_version();
+        profile.market.max_notional_usd = profile.portfolio.max_notional_usd + 0.01;
+
+        let error = validate_risk_limit_profile_version(&profile)
+            .expect_err("market > portfolio must fail strict child-scope invariant");
+
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "market.max_notional_usd")
+        );
+        assert_eq!(error.code, RiskLimitReasonCode::InvalidPayload.code());
+    }
+
+    #[test]
+    fn risk_limit_reason_code_parse_round_trip_is_deterministic() {
+        let codes = [
+            RiskLimitReasonCode::ProfileApplied,
+            RiskLimitReasonCode::ProfilePendingApproval,
+            RiskLimitReasonCode::ProfileDenied,
+            RiskLimitReasonCode::ApprovalRequired,
+            RiskLimitReasonCode::PolicyStateUnavailable,
+        ];
+
+        for code in codes {
+            let parsed = RiskLimitReasonCode::parse(code.code()).expect("known reason must parse");
+            assert_eq!(parsed, code);
+        }
+    }
+
+    #[test]
+    fn inventory_rule_validation_rejects_portfolio_scope_and_negative_units() {
+        let mut rule = sample_inventory_rule();
+        rule.scope = RiskLimitScope::Portfolio;
+        rule.max_position_units = -1.0;
+
+        let error =
+            validate_inventory_limit_rule(&rule).expect_err("invalid inventory rule must fail");
+        let fields: Vec<_> = error.field_errors.iter().map(|issue| issue.field).collect();
+        assert!(fields.contains(&"scope"));
+        assert!(fields.contains(&"max_position_units"));
+    }
+
+    #[test]
+    fn risk_limit_increase_requires_approval_only_for_strict_increase() {
+        let baseline = sample_risk_profile_version();
+        let mut equal = baseline.clone();
+        equal.version = 2;
+        assert!(!requires_risk_limit_increase_approval(
+            Some(&baseline),
+            &equal
+        ));
+
+        let mut increase = baseline.clone();
+        increase.version = 2;
+        increase.strategy.max_notional_usd += 1.0;
+        assert!(requires_risk_limit_increase_approval(
+            Some(&baseline),
+            &increase
+        ));
+    }
 
     fn sample_profile() -> MarketPolicyProfile {
         MarketPolicyProfile {

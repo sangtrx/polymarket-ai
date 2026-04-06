@@ -1,3 +1,4 @@
+use crate::limits::{RuntimeRiskLimitStateReader, evaluate_risk_limit_state_snapshot};
 use domain::reconciliation::ReconciliationReasonCode;
 use domain::risk::{
     FreshnessGateReasonCode, MarketClusterOverride, MarketPolicyReasonCode, UserStreamReasonCode,
@@ -187,6 +188,38 @@ pub fn evaluate_order_intent_gate<S: RuntimePolicyStateReader>(
     decision
 }
 
+pub fn evaluate_order_intent_gate_with_limit_state<S, L>(
+    runtime_policy_state: &S,
+    runtime_limit_state: &L,
+    intent: &OrderIntent,
+    profile_key: &str,
+) -> OrderIntentGateDecision
+where
+    S: RuntimePolicyStateReader,
+    L: RuntimeRiskLimitStateReader,
+{
+    let limit_snapshot = evaluate_risk_limit_state_snapshot(
+        runtime_limit_state,
+        profile_key,
+        &intent.requested_at_utc,
+    );
+    if !limit_snapshot.available {
+        let decision = OrderIntentGateDecision {
+            intent_id: intent.intent_id.clone(),
+            market_id: intent.market_id.clone(),
+            cluster_id: intent.cluster_id.clone(),
+            allowed: false,
+            reason_code: limit_snapshot.reason_code,
+            correlation_id: intent.correlation_id.clone(),
+            decided_at_utc: intent.requested_at_utc.clone(),
+        };
+        emit_order_intent_gate_telemetry(&decision);
+        return decision;
+    }
+
+    evaluate_order_intent_gate(runtime_policy_state, intent)
+}
+
 fn emit_order_intent_gate_telemetry(decision: &OrderIntentGateDecision) {
     let event = OrderIntentGateTelemetryEvent {
         event_name: "risk_order_intent_gate_decision_v1",
@@ -221,6 +254,11 @@ struct OrderIntentGateTelemetryEvent<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::InMemoryRiskLimitState;
+    use domain::risk::{
+        RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode, RiskLimitScope,
+        RiskScopeLimit,
+    };
 
     fn sample_intent() -> OrderIntent {
         OrderIntent {
@@ -246,6 +284,56 @@ mod tests {
             actor_id: "ops-1".to_string(),
             correlation_id: "corr-toggle-001".to_string(),
             updated_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_limit_scope(
+        scope: RiskLimitScope,
+        scope_id: &str,
+        max_notional_usd: f64,
+        max_inventory_units: f64,
+        max_concentration_pct_nav: f64,
+    ) -> RiskScopeLimit {
+        RiskScopeLimit {
+            scope,
+            scope_id: scope_id.to_string(),
+            max_notional_usd,
+            max_inventory_units,
+            max_concentration_pct_nav,
+        }
+    }
+
+    fn sample_active_limit_profile(updated_at_utc: &str) -> RiskLimitProfileVersion {
+        RiskLimitProfileVersion {
+            profile_key: "default".to_string(),
+            version: 1,
+            portfolio: sample_limit_scope(
+                RiskLimitScope::Portfolio,
+                "portfolio::default",
+                1000.0,
+                800.0,
+                40.0,
+            ),
+            market: sample_limit_scope(
+                RiskLimitScope::Market,
+                "market::sports",
+                600.0,
+                400.0,
+                30.0,
+            ),
+            strategy: sample_limit_scope(
+                RiskLimitScope::Strategy,
+                "strategy::maker",
+                300.0,
+                200.0,
+                20.0,
+            ),
+            status: RiskLimitProfileStatus::Active,
+            approval_reference: Some("apr_risk_limit_bootstrap".to_string()),
+            actor_id: "ops-1".to_string(),
+            reason_code: RiskLimitReasonCode::ProfileApplied.code().to_string(),
+            correlation_id: "corr-risk-limit-001".to_string(),
+            updated_at_utc: updated_at_utc.to_string(),
         }
     }
 
@@ -376,10 +464,8 @@ mod tests {
     fn order_intent_gate_denies_when_reconciliation_halt_is_active() {
         let runtime_state = InMemoryRuntimePolicyState::default();
         runtime_state.upsert_cluster_override(sample_override(true));
-        runtime_state.set_reconciliation_halt(
-            true,
-            ReconciliationReasonCode::CriticalMismatch.code(),
-        );
+        runtime_state
+            .set_reconciliation_halt(true, ReconciliationReasonCode::CriticalMismatch.code());
 
         let decision = evaluate_order_intent_gate(&runtime_state, &sample_intent());
 
@@ -394,18 +480,14 @@ mod tests {
     fn order_intent_gate_recovery_unblocks_after_reconciliation_halt_clears() {
         let runtime_state = InMemoryRuntimePolicyState::default();
         runtime_state.upsert_cluster_override(sample_override(true));
-        runtime_state.set_reconciliation_halt(
-            true,
-            ReconciliationReasonCode::CriticalMismatch.code(),
-        );
+        runtime_state
+            .set_reconciliation_halt(true, ReconciliationReasonCode::CriticalMismatch.code());
 
         let blocked = evaluate_order_intent_gate(&runtime_state, &sample_intent());
         assert!(!blocked.allowed);
 
-        runtime_state.set_reconciliation_halt(
-            false,
-            ReconciliationReasonCode::CriticalMismatch.code(),
-        );
+        runtime_state
+            .set_reconciliation_halt(false, ReconciliationReasonCode::CriticalMismatch.code());
         let recovered = evaluate_order_intent_gate(&runtime_state, &sample_intent());
 
         assert!(recovered.allowed);
@@ -427,6 +509,47 @@ mod tests {
         assert_eq!(
             decision.reason_code,
             ReconciliationReasonCode::CriticalMismatch.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_fails_closed_when_limit_state_unavailable() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+
+        let limit_state = InMemoryRiskLimitState::default();
+        let decision = evaluate_order_intent_gate_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            RiskLimitReasonCode::PolicyStateUnavailable.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_allows_when_limit_state_is_available() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        runtime_state.upsert_cluster_override(sample_override(true));
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+
+        let decision = evaluate_order_intent_gate_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert!(decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            MarketPolicyReasonCode::MarketEligible.code()
         );
     }
 }

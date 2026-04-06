@@ -15,7 +15,10 @@ use domain::governance::{
     CredentialRotationEvidence, CredentialRotationReasonCode, PrivilegedAuditOutcome,
     PrivilegedAuditRecord,
 };
-use domain::risk::{MarketPolicyReasonCode, MarketPolicyValidationIssue};
+use domain::risk::{
+    MarketPolicyReasonCode, MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope,
+    RiskLimitValidationIssue,
+};
 use governance_service::approvals::{
     EvaluateApprovalExecutionInput, RecordApprovalVoteInput, SubmitApprovalRequestInput,
 };
@@ -24,6 +27,10 @@ use governance_service::credentials::{
     TriggerEmergencyRotationInput, TriggerScheduledRotationInput,
 };
 use governance_service::market_policy::{ToggleMarketClusterInput, UpsertMarketPolicyProfileInput};
+use governance_service::risk_limits::{
+    PendingRiskLimitProfilesInput, RiskLimitProfileMutationEvidence, RiskLimitRuleInput,
+    UpsertRiskLimitProfileInput,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -78,6 +85,19 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let risk_limit_routes = Router::new()
+        .route(
+            "/control/risk-limits/profiles/{profile_key}",
+            post(upsert_risk_limit_profile),
+        )
+        .route(
+            "/control/risk-limits/pending",
+            get(list_pending_risk_limit_profiles),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -85,6 +105,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(critical_routes)
         .merge(credential_rotation_routes)
         .merge(market_policy_routes)
+        .merge(risk_limit_routes)
         .with_state(state)
 }
 
@@ -174,7 +195,7 @@ pub async fn submit_critical_action_request(
     axum::Json(payload): axum::Json<CriticalActionRequestPayload>,
 ) -> Response {
     let endpoint = format!("/control/critical-actions/{action_id}/requests/{request_id}");
-    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
         Ok(decision) => decision,
         Err(response) => return *response,
     };
@@ -212,7 +233,7 @@ pub async fn record_critical_action_vote(
     axum::Json(payload): axum::Json<CriticalActionVotePayload>,
 ) -> Response {
     let endpoint = format!("/control/critical-actions/{action_id}/requests/{request_id}/votes");
-    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
         Ok(decision) => decision,
         Err(response) => return *response,
     };
@@ -262,7 +283,7 @@ pub async fn execute_critical_action(
     Extension(actor): Extension<AuthenticatedActor>,
 ) -> Response {
     let endpoint = format!("/control/critical-actions/{action_id}/requests/{request_id}/execute");
-    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
         Ok(decision) => decision,
         Err(response) => return *response,
     };
@@ -299,7 +320,7 @@ pub async fn trigger_scheduled_credential_rotation(
     axum::Json(payload): axum::Json<ScheduledCredentialRotationPayload>,
 ) -> Response {
     let endpoint = "/control/credentials/rotation/scheduled";
-    let authorization = match authorize_critical_action(&state, &actor, endpoint) {
+    let authorization = match authorize_critical_action(&state, &actor, endpoint, "POST") {
         Ok(decision) => decision,
         Err(response) => return *response,
     };
@@ -337,7 +358,7 @@ pub async fn trigger_emergency_credential_rotation(
     axum::Json(payload): axum::Json<EmergencyCredentialRotationPayload>,
 ) -> Response {
     let endpoint = "/control/credentials/rotation/emergency";
-    let authorization = match authorize_critical_action(&state, &actor, endpoint) {
+    let authorization = match authorize_critical_action(&state, &actor, endpoint, "POST") {
         Ok(decision) => decision,
         Err(response) => return *response,
     };
@@ -376,7 +397,7 @@ pub async fn update_market_policy_profile(
     axum::Json(payload): axum::Json<MarketPolicyProfilePayload>,
 ) -> Response {
     let endpoint = format!("/control/market-policy/profiles/{cluster_id}");
-    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
         Ok(decision) => decision,
         Err(response) => return *response,
     };
@@ -418,7 +439,7 @@ pub async fn toggle_market_policy_cluster(
     axum::Json(payload): axum::Json<MarketClusterTogglePayload>,
 ) -> Response {
     let endpoint = format!("/control/market-policy/clusters/{cluster_id}/toggle");
-    let authorization = match authorize_critical_action(&state, &actor, &endpoint) {
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
         Ok(decision) => decision,
         Err(response) => return *response,
     };
@@ -452,10 +473,178 @@ pub async fn toggle_market_policy_cluster(
     market_policy_cluster_toggle_response(&state, &actor, decision, endpoint)
 }
 
+pub async fn upsert_risk_limit_profile(
+    State(state): State<ControlApiState>,
+    Path(profile_key): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<RiskLimitProfilePayload>,
+) -> Response {
+    let endpoint = format!("/control/risk-limits/profiles/{profile_key}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let mut approval_reference = None;
+    if let Some(request_id) = payload.approval_request_id.clone() {
+        let approval_decision =
+            match state
+                .approval_orchestrator
+                .evaluate_execution(EvaluateApprovalExecutionInput {
+                    request_id,
+                    action_id: "risk_limit_increase".to_string(),
+                    actor_id: actor.actor_id.clone(),
+                    actor_role: actor.role.clone(),
+                    correlation_id: actor.correlation_id.clone(),
+                    now_utc: authorization.timestamp_utc.clone(),
+                }) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return approval_service_error_response(
+                        error.code,
+                        error.message,
+                        &actor,
+                        authorization.timestamp_utc.clone(),
+                        endpoint,
+                    );
+                }
+            };
+
+        match approval_decision.outcome {
+            ApprovalDecisionOutcome::Allow => {
+                approval_reference = approval_decision.approval_reference.clone();
+            }
+            ApprovalDecisionOutcome::Pending => {}
+            ApprovalDecisionOutcome::Deny => {
+                return critical_approval_response(
+                    &state,
+                    &actor,
+                    approval_decision,
+                    endpoint,
+                    "risk_limit_profile_update",
+                );
+            }
+        }
+    }
+
+    let mut inventory_rules = Vec::with_capacity(payload.inventory_rules.len());
+    for rule in payload.inventory_rules {
+        let scope = match RiskLimitScope::parse(&rule.scope) {
+            Ok(scope) => scope,
+            Err(error) => {
+                return risk_limit_service_error_response(
+                    error.code,
+                    error.message,
+                    vec![RiskLimitValidationIssue {
+                        field: "inventory_rules.scope",
+                        code: RiskLimitReasonCode::InvalidPayload.code(),
+                        message: "inventory_rules.scope must be `market` or `strategy`".to_string(),
+                    }],
+                    "risk_limit_profile_update",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        inventory_rules.push(RiskLimitRuleInput {
+            scope,
+            scope_id: rule.scope_id,
+            max_position_units: rule.max_position_units,
+            max_order_size_units: rule.max_order_size_units,
+            max_concentration_pct_nav: rule.max_concentration_pct_nav,
+        });
+    }
+
+    let decision =
+        match state
+            .risk_limit_orchestrator
+            .upsert_risk_limit_profile(UpsertRiskLimitProfileInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                profile_key,
+                version: payload.version,
+                portfolio_scope_id: payload.portfolio_scope_id,
+                market_scope_id: payload.market_scope_id,
+                strategy_scope_id: payload.strategy_scope_id,
+                portfolio_max_notional_usd: payload.portfolio_max_notional_usd,
+                market_max_notional_usd: payload.market_max_notional_usd,
+                strategy_max_notional_usd: payload.strategy_max_notional_usd,
+                portfolio_max_inventory_units: payload.portfolio_max_inventory_units,
+                market_max_inventory_units: payload.market_max_inventory_units,
+                strategy_max_inventory_units: payload.strategy_max_inventory_units,
+                portfolio_max_concentration_pct_nav: payload.portfolio_max_concentration_pct_nav,
+                market_max_concentration_pct_nav: payload.market_max_concentration_pct_nav,
+                strategy_max_concentration_pct_nav: payload.strategy_max_concentration_pct_nav,
+                inventory_rules,
+                correlation_id: actor.correlation_id.clone(),
+                updated_at_utc: authorization.timestamp_utc.clone(),
+                approval_reference,
+            }) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return risk_limit_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "risk_limit_profile_update",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+
+    risk_limit_profile_response(&state, &actor, decision, endpoint)
+}
+
+pub async fn list_pending_risk_limit_profiles(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/risk-limits/pending".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let pending = match state
+        .risk_limit_orchestrator
+        .list_pending_risk_limit_profiles(PendingRiskLimitProfilesInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+            profile_key: None,
+        }) {
+        Ok(pending) => pending,
+        Err(error) => {
+            return risk_limit_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "risk_limit_pending_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    risk_limit_pending_query_response(
+        &state,
+        &actor,
+        pending,
+        authorization.timestamp_utc,
+        endpoint,
+    )
+}
+
 fn authorize_critical_action(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
     endpoint: &str,
+    http_method: &'static str,
 ) -> Result<AuthorizationDecision, Box<Response>> {
     let decision = state
         .authorization_guard
@@ -467,7 +656,7 @@ fn authorize_critical_action(
         actor.authentication_outcome.as_str(),
         json!({
             "endpoint": endpoint,
-            "http_method": "POST",
+            "http_method": http_method,
         }),
     );
     if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
@@ -1056,6 +1245,252 @@ fn market_policy_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn risk_limit_profile_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: RiskLimitProfileMutationEvidence,
+    endpoint: String,
+) -> Response {
+    let audit_outcome = match decision.status.as_str() {
+        "active" => PrivilegedAuditOutcome::Allow,
+        "pending" | "denied" => PrivilegedAuditOutcome::AuthorizationDenied,
+        _ => PrivilegedAuditOutcome::AuthorizationDenied,
+    };
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "risk_limit_profile_update".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+            "profile_key": decision.profile_key,
+            "version": decision.version,
+            "approval_status": decision.status,
+            "inventory_rule_count": decision.inventory_rule_count,
+        }),
+        approval_reference: if decision.status == "active" {
+            decision.approval_reference.clone()
+        } else {
+            None
+        },
+        timestamp: decision.updated_at_utc.clone(),
+        outcome: audit_outcome,
+        reason_code: decision.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: decision.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "risk_limit_profile_update".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.updated_at_utc,
+        );
+    }
+
+    match decision.status.as_str() {
+        "active" => (
+            StatusCode::ACCEPTED,
+            axum::Json(RiskLimitProfileDecisionResponse {
+                status: "accepted",
+                error_code: None,
+                message: None,
+                profile_key: decision.profile_key,
+                version: decision.version,
+                approval_status: "active".to_string(),
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                reason_code: decision.reason_code,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.updated_at_utc,
+                approval_reference: decision.approval_reference,
+                inventory_rule_count: decision.inventory_rule_count,
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        "pending" => (
+            StatusCode::ACCEPTED,
+            axum::Json(RiskLimitProfileDecisionResponse {
+                status: "pending",
+                error_code: None,
+                message: None,
+                profile_key: decision.profile_key,
+                version: decision.version,
+                approval_status: "pending".to_string(),
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                reason_code: decision.reason_code,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.updated_at_utc,
+                approval_reference: None,
+                inventory_rule_count: decision.inventory_rule_count,
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::FORBIDDEN,
+            axum::Json(RiskLimitProfileDecisionResponse {
+                status: "denied",
+                error_code: Some(decision.reason_code.clone()),
+                message: Some("risk limit mutation was denied".to_string()),
+                profile_key: decision.profile_key,
+                version: decision.version,
+                approval_status: decision.status,
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                reason_code: decision.reason_code,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.updated_at_utc,
+                approval_reference: None,
+                inventory_rule_count: decision.inventory_rule_count,
+                security_signal: Some(RiskLimitSecuritySignal {
+                    name: "unauthorized_risk_limit_mutation_attempt_v1",
+                    severity: "high",
+                    alert_compatible: true,
+                    alert_target_seconds: 30,
+                }),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn risk_limit_pending_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    pending: Vec<RiskLimitProfileMutationEvidence>,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "risk_limit_pending_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "pending_count": pending.len(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: RiskLimitReasonCode::ProfilePendingApproval
+            .code()
+            .to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "risk_limit_pending_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(RiskLimitPendingProfilesResponse {
+            status: "accepted",
+            action: "risk_limit_pending_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            pending_profiles: pending
+                .into_iter()
+                .map(|item| RiskLimitPendingProfileItem {
+                    profile_key: item.profile_key,
+                    version: item.version,
+                    action_type: "risk_limit_profile_update".to_string(),
+                    actor_id: item.actor_id,
+                    approval_status: item.status,
+                    reason_code: item.reason_code,
+                    correlation_id: item.correlation_id,
+                    updated_at_utc: item.updated_at_utc,
+                    approval_reference: item.approval_reference,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn risk_limit_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<RiskLimitValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let security_signal = if error_code == "risk_limit_unauthorized_role" {
+        Some(RiskLimitSecuritySignal {
+            name: "unauthorized_risk_limit_mutation_attempt_v1",
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        risk_limit_service_error_status(error_code),
+        axum::Json(RiskLimitServiceErrorResponse {
+            error_code,
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| RiskLimitFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+            security_signal,
+        }),
+    )
+        .into_response()
+}
+
+fn risk_limit_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == RiskLimitReasonCode::InvalidPayload.code()
+            || code == RiskLimitReasonCode::InvalidThreshold.code()
+            || code == RiskLimitReasonCode::InvalidScopeInvariant.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        "risk_limit_unauthorized_role" => StatusCode::FORBIDDEN,
+        "risk_limit_constraint_violation" => StatusCode::CONFLICT,
+        code if code == RiskLimitReasonCode::PersistenceUnavailable.code()
+            || code == "risk_limit_query_failed"
+            || code == "risk_limit_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn critical_approval_audit_outcome(
     outcome: ApprovalDecisionOutcome,
 ) -> Option<PrivilegedAuditOutcome> {
@@ -1364,6 +1799,36 @@ pub struct MarketClusterTogglePayload {
     pub reason_code: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RiskLimitRulePayload {
+    pub scope: String,
+    pub scope_id: String,
+    pub max_position_units: f64,
+    pub max_order_size_units: f64,
+    pub max_concentration_pct_nav: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RiskLimitProfilePayload {
+    pub version: i64,
+    pub portfolio_scope_id: String,
+    pub market_scope_id: String,
+    pub strategy_scope_id: String,
+    pub portfolio_max_notional_usd: f64,
+    pub market_max_notional_usd: f64,
+    pub strategy_max_notional_usd: f64,
+    pub portfolio_max_inventory_units: f64,
+    pub market_max_inventory_units: f64,
+    pub strategy_max_inventory_units: f64,
+    pub portfolio_max_concentration_pct_nav: f64,
+    pub market_max_concentration_pct_nav: f64,
+    pub strategy_max_concentration_pct_nav: f64,
+    #[serde(default)]
+    pub inventory_rules: Vec<RiskLimitRulePayload>,
+    #[serde(default)]
+    pub approval_request_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CredentialRotationDecisionResponse {
     pub status: &'static str,
@@ -1479,6 +1944,84 @@ pub struct MarketPolicySecuritySignal {
     pub alert_target_seconds: u16,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RiskLimitProfileDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub profile_key: String,
+    pub version: i64,
+    pub approval_status: String,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+    pub inventory_rule_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<RiskLimitSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RiskLimitPendingProfilesResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub pending_profiles: Vec<RiskLimitPendingProfileItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RiskLimitPendingProfileItem {
+    pub profile_key: String,
+    pub version: i64,
+    pub action_type: String,
+    pub actor_id: String,
+    pub approval_status: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RiskLimitServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<RiskLimitFieldError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<RiskLimitSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RiskLimitFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RiskLimitSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1502,6 +2045,10 @@ mod tests {
         market_policy::{
             MarketClusterToggleEvidence, MarketPolicyOrchestrator, MarketPolicyProfileEvidence,
             MarketPolicyServiceError, ToggleMarketClusterInput, UpsertMarketPolicyProfileInput,
+        },
+        risk_limits::{
+            PendingRiskLimitProfilesInput, RiskLimitOrchestrator, RiskLimitProfileMutationEvidence,
+            RiskLimitService, RiskLimitServiceError, UpsertRiskLimitProfileInput,
         },
     };
     use std::sync::{Arc, Mutex};
@@ -1643,6 +2190,81 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct StubRiskLimitOrchestrator {
+        upsert_error: Option<(&'static str, &'static str)>,
+        pending_error: Option<(&'static str, &'static str)>,
+        force_pending: bool,
+    }
+
+    impl RiskLimitOrchestrator for StubRiskLimitOrchestrator {
+        fn upsert_risk_limit_profile(
+            &self,
+            input: UpsertRiskLimitProfileInput,
+        ) -> Result<RiskLimitProfileMutationEvidence, RiskLimitServiceError> {
+            if let Some((code, message)) = self.upsert_error {
+                return Err(RiskLimitServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            let status = if self.force_pending {
+                "pending"
+            } else {
+                "active"
+            };
+            Ok(RiskLimitProfileMutationEvidence {
+                profile_key: input.profile_key.trim().to_lowercase(),
+                version: input.version,
+                status: status.to_string(),
+                actor_id: input.actor_id,
+                reason_code: if status == "pending" {
+                    RiskLimitReasonCode::ApprovalRequired.code().to_string()
+                } else {
+                    RiskLimitReasonCode::ProfileApplied.code().to_string()
+                },
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.updated_at_utc,
+                approval_reference: if status == "active" {
+                    input.approval_reference
+                } else {
+                    None
+                },
+                inventory_rule_count: input.inventory_rules.len(),
+            })
+        }
+
+        fn list_pending_risk_limit_profiles(
+            &self,
+            input: PendingRiskLimitProfilesInput,
+        ) -> Result<Vec<RiskLimitProfileMutationEvidence>, RiskLimitServiceError> {
+            if let Some((code, message)) = self.pending_error {
+                return Err(RiskLimitServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            Ok(vec![RiskLimitProfileMutationEvidence {
+                profile_key: input
+                    .profile_key
+                    .unwrap_or_else(|| "default".to_string())
+                    .to_lowercase(),
+                version: 3,
+                status: "pending".to_string(),
+                actor_id: input.actor_id,
+                reason_code: RiskLimitReasonCode::ApprovalRequired.code().to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.queried_at_utc,
+                approval_reference: None,
+                inventory_rule_count: 2,
+            }])
+        }
+    }
+
     fn test_app_with_market_policy_orchestrator(
         market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     ) -> Router {
@@ -1655,6 +2277,23 @@ mod tests {
             Arc::new(GovernanceApprovalService::default()),
             Arc::new(CredentialRotationService::default()),
             market_policy_orchestrator,
+            Arc::new(RiskLimitService::default()),
+        ))
+    }
+
+    fn test_app_with_risk_limit_orchestrator(
+        risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
+    ) -> Router {
+        test_app_with_state(ControlApiState::with_all_orchestrators(
+            Arc::new(GovernanceAuthorizationGuard::new(
+                AuthorizationEvaluator::default(),
+            )),
+            Arc::new(HeaderTokenAuthenticator),
+            Arc::new(CapturingAuditAppender::default()),
+            Arc::new(GovernanceApprovalService::default()),
+            Arc::new(CredentialRotationService::default()),
+            Arc::new(StubMarketPolicyOrchestrator::default()),
+            risk_limit_orchestrator,
         ))
     }
 
@@ -3818,6 +4457,298 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "market_policy_constraint_violation");
         assert_eq!(payload["action"], "market_policy_cluster_toggle");
+    }
+
+    #[tokio::test]
+    async fn risk_limit_profile_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/risk-limits/profiles/default")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-risk-limit-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "version": 1,
+                            "portfolio_scope_id": "portfolio::default",
+                            "market_scope_id": "market::sports",
+                            "strategy_scope_id": "strategy::maker",
+                            "portfolio_max_notional_usd": 1000.0,
+                            "market_max_notional_usd": 600.0,
+                            "strategy_max_notional_usd": 300.0,
+                            "portfolio_max_inventory_units": 800.0,
+                            "market_max_inventory_units": 400.0,
+                            "strategy_max_inventory_units": 200.0,
+                            "portfolio_max_concentration_pct_nav": 45.0,
+                            "market_max_concentration_pct_nav": 30.0,
+                            "strategy_max_concentration_pct_nav": 20.0,
+                            "inventory_rules": []
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn risk_limit_profile_route_returns_machine_readable_active_evidence() {
+        let app =
+            test_app_with_risk_limit_orchestrator(Arc::new(StubRiskLimitOrchestrator::default()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/risk-limits/profiles/default")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-risk-limit-accept-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "version": 1,
+                            "portfolio_scope_id": "portfolio::default",
+                            "market_scope_id": "market::sports",
+                            "strategy_scope_id": "strategy::maker",
+                            "portfolio_max_notional_usd": 1000.0,
+                            "market_max_notional_usd": 600.0,
+                            "strategy_max_notional_usd": 300.0,
+                            "portfolio_max_inventory_units": 800.0,
+                            "market_max_inventory_units": 400.0,
+                            "strategy_max_inventory_units": 200.0,
+                            "portfolio_max_concentration_pct_nav": 45.0,
+                            "market_max_concentration_pct_nav": 30.0,
+                            "strategy_max_concentration_pct_nav": 20.0,
+                            "inventory_rules": [
+                                {
+                                    "scope": "market",
+                                    "scope_id": "market::sports",
+                                    "max_position_units": 300.0,
+                                    "max_order_size_units": 40.0,
+                                    "max_concentration_pct_nav": 25.0
+                                },
+                                {
+                                    "scope": "strategy",
+                                    "scope_id": "strategy::maker",
+                                    "max_position_units": 150.0,
+                                    "max_order_size_units": 20.0,
+                                    "max_concentration_pct_nav": 15.0
+                                }
+                            ]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["approval_status"], "active");
+        assert_eq!(payload["reason_code"], "risk_limit_profile_applied");
+        assert_eq!(payload["inventory_rule_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn risk_limit_profile_route_returns_pending_without_synthetic_approval_reference() {
+        let app = test_app_with_risk_limit_orchestrator(Arc::new(StubRiskLimitOrchestrator {
+            force_pending: true,
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/risk-limits/profiles/default")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-risk-limit-pending-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "version": 2,
+                            "portfolio_scope_id": "portfolio::default",
+                            "market_scope_id": "market::sports",
+                            "strategy_scope_id": "strategy::maker",
+                            "portfolio_max_notional_usd": 1000.0,
+                            "market_max_notional_usd": 650.0,
+                            "strategy_max_notional_usd": 300.0,
+                            "portfolio_max_inventory_units": 800.0,
+                            "market_max_inventory_units": 450.0,
+                            "strategy_max_inventory_units": 200.0,
+                            "portfolio_max_concentration_pct_nav": 45.0,
+                            "market_max_concentration_pct_nav": 35.0,
+                            "strategy_max_concentration_pct_nav": 20.0,
+                            "inventory_rules": []
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "pending");
+        assert_eq!(payload["approval_status"], "pending");
+        assert_eq!(payload["reason_code"], "risk_limit_approval_required");
+        assert!(payload["approval_reference"].is_null());
+    }
+
+    #[tokio::test]
+    async fn risk_limit_pending_route_returns_queryable_pending_evidence() {
+        let app =
+            test_app_with_risk_limit_orchestrator(Arc::new(StubRiskLimitOrchestrator::default()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/risk-limits/pending")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-risk-limit-query-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action"], "risk_limit_pending_query");
+        assert_eq!(
+            payload["pending_profiles"][0]["action_type"],
+            "risk_limit_profile_update"
+        );
+        assert_eq!(payload["pending_profiles"][0]["approval_status"], "pending");
+        assert_eq!(
+            payload["pending_profiles"][0]["reason_code"],
+            "risk_limit_approval_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn risk_limit_pending_route_authorization_audit_records_get_http_method() {
+        let audit_appender = Arc::new(CapturingAuditAppender::default());
+        let app = test_app_with_audit_appender(audit_appender.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/risk-limits/pending")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-risk-limit-pending-audit-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let records = audit_appender.snapshot();
+        let auth_record = records
+            .iter()
+            .find(|record| record.action_type == "execute_control_plane_action")
+            .expect("authorization audit record should exist");
+        assert_eq!(auth_record.parameters["endpoint"], "/control/risk-limits/pending");
+        assert_eq!(auth_record.parameters["http_method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn risk_limit_profile_route_surfaces_service_unavailable_machine_error() {
+        let app = test_app_with_risk_limit_orchestrator(Arc::new(StubRiskLimitOrchestrator {
+            upsert_error: Some((
+                "risk_limit_persistence_unavailable",
+                "risk limit repository unavailable",
+            )),
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/risk-limits/profiles/default")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-risk-limit-failure-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "version": 1,
+                            "portfolio_scope_id": "portfolio::default",
+                            "market_scope_id": "market::sports",
+                            "strategy_scope_id": "strategy::maker",
+                            "portfolio_max_notional_usd": 1000.0,
+                            "market_max_notional_usd": 600.0,
+                            "strategy_max_notional_usd": 300.0,
+                            "portfolio_max_inventory_units": 800.0,
+                            "market_max_inventory_units": 400.0,
+                            "strategy_max_inventory_units": 200.0,
+                            "portfolio_max_concentration_pct_nav": 45.0,
+                            "market_max_concentration_pct_nav": 30.0,
+                            "strategy_max_concentration_pct_nav": 20.0,
+                            "inventory_rules": []
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "risk_limit_persistence_unavailable");
+        assert_eq!(payload["action"], "risk_limit_profile_update");
     }
 
     #[derive(Debug)]

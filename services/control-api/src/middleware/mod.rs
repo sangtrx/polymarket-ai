@@ -13,6 +13,7 @@ use governance_service::approvals::{ApprovalOrchestrator, GovernanceApprovalServ
 use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
 use governance_service::credentials::{CredentialRotationOrchestrator, CredentialRotationService};
 use governance_service::market_policy::{MarketPolicyOrchestrator, MarketPolicyService};
+use governance_service::risk_limits::{RiskLimitOrchestrator, RiskLimitService};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -210,6 +211,7 @@ pub struct ControlApiState {
     pub approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
     pub credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
     pub market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
+    pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
 }
 
 impl ControlApiState {
@@ -256,6 +258,7 @@ impl ControlApiState {
             approval_orchestrator,
             credential_rotation_orchestrator,
             Arc::new(MarketPolicyService::default()),
+            Arc::new(RiskLimitService::default()),
         )
     }
 
@@ -266,6 +269,7 @@ impl ControlApiState {
         approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
         credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
         market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
+        risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
     ) -> Self {
         Self {
             authorization_guard,
@@ -274,6 +278,7 @@ impl ControlApiState {
             approval_orchestrator,
             credential_rotation_orchestrator,
             market_policy_orchestrator,
+            risk_limit_orchestrator,
         }
     }
 }

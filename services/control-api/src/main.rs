@@ -9,6 +9,7 @@ use governance_service::approvals::GovernanceApprovalService;
 use governance_service::audit::{GovernanceAuditService, InMemoryAuditAppendPort};
 use governance_service::credentials::CredentialRotationService;
 use governance_service::market_policy::MarketPolicyService;
+use governance_service::risk_limits::RiskLimitService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -33,7 +34,8 @@ async fn main() {
         ))),
         Arc::new(GovernanceApprovalService::postgres(pool.clone())),
         Arc::new(CredentialRotationService::postgres(pool.clone())),
-        Arc::new(MarketPolicyService::postgres(pool)),
+        Arc::new(MarketPolicyService::postgres(pool.clone())),
+        Arc::new(RiskLimitService::postgres(pool)),
     );
     let _app: Router = routes::app_router(state);
     println!("control-api bootstrap ready at {}", timestamp_utc());
