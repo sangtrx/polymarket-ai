@@ -5,6 +5,7 @@ mod reconciliation;
 use common::time::timestamp_utc;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -51,7 +52,15 @@ async fn main() {
         let mut user_runtime =
             ingestion::user_stream::UserStreamIngestionRuntime::new(user_store, user_config);
         let orders_store = orders::PostgresOrderLifecycleStore::new(pool.clone());
-        let orders_runtime = Arc::new(orders::OrderLifecycleRuntime::new(orders_store));
+        let risk_adjudication_port =
+            Arc::new(orders::PostgresRiskAdjudicationPort::new(pool.clone()));
+        let pretrade_adjudication_timeout =
+            Duration::from_millis(orders::DEFAULT_PRETRADE_ADJUDICATION_TIMEOUT_MS);
+        let orders_runtime = Arc::new(orders::OrderLifecycleRuntime::with_risk_adjudication_port(
+            orders_store,
+            risk_adjudication_port,
+            pretrade_adjudication_timeout,
+        ));
         user_runtime.attach_freshness_signals(freshness_signals.clone());
         user_runtime.attach_order_lifecycle_port(orders_runtime);
         println!(

@@ -12,3 +12,5 @@ serde_json.workspace = true
 time.workspace = true
 common = { path = "../../crates/common" }
 domain = { path = "../../crates/domain" }
+persistence = { path = "../../crates/persistence" }
+sqlx.workspace = true

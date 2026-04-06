@@ -2,39 +2,38 @@
 
 ## Story
 
-- 2-7-configure-portfolio-market-and-strategy-limit-policies
+- 2-8-enforce-pre-trade-gate-evaluation-pipeline
 
 ## Generated Tests
 
-### API Tests
+### Domain and Persistence Tests
 
-- [x] `services/control-api/src/routes/mod.rs` — `risk_limit_profile_route_returns_machine_readable_active_evidence` validates accepted profile mutation evidence with machine-readable fields.
-- [x] `services/control-api/src/routes/mod.rs` — `risk_limit_profile_route_returns_pending_without_synthetic_approval_reference` validates pending critical-increase behavior with null approval reference.
-- [x] `services/control-api/src/routes/mod.rs` — `risk_limit_pending_route_returns_queryable_pending_evidence` validates pending-policy query contract (actor/action/status/reason metadata).
-- [x] `services/control-api/src/routes/mod.rs` — unauthorized and service-unavailable risk-limit route tests validate fail-closed error envelopes.
+- [x] `crates/domain/src/risk.rs` — pre-trade gate tests validate all-pass allow, single-fail deny determinism, drawdown equality boundary deny/protective mode, and reason-code parse determinism.
+- [x] `crates/persistence/src/postgres/pretrade_gate.rs` — migration scope, constraint/index contracts, canonical payload validation, and deterministic latest-query ordering for `pretrade_gate_decisions`.
 
-### Integration and Runtime Tests
+### Risk Runtime Tests
 
-- [x] `crates/domain/src/risk.rs` — risk-limit profile validation tests cover boundary equality acceptance, strict child-scope `>` rejection, and deterministic reason-code parsing.
-- [x] `crates/persistence/src/postgres/risk_limits.rs` — migration scope/constraint/index tests plus bundle validation tests for profile/rule consistency.
-- [x] `services/governance-service/src/risk_limits/mod.rs` — orchestration tests cover unauthorized role denial, pending critical increase, approved activation, pending query evidence, and invariant rejection.
-- [x] `services/risk-engine/src/limits/mod.rs` — runtime limit-state tests cover available path, missing/stale/unavailable fail-closed behavior, and pending-count snapshot surface.
-- [x] `services/risk-engine/src/gates/mod.rs` — gate integration tests validate fail-closed deny when limit state is unavailable and allow when state is available.
+- [x] `services/risk-engine/src/gates/mod.rs` — pre-trade gate orchestration tests validate all-gates-pass allow, single-gate failure deny, deterministic gate precedence, limit-state fail-closed behavior, drawdown equality protective-mode signaling, strategy-approval missing-state denial, and missing market snapshot fail-closed denial.
+- [x] `services/risk-engine/src/safe_state/mod.rs` — safe-state signal tests validate in-memory retention of drawdown protective-mode transitions.
+
+### Execution Runtime Tests
+
+- [x] `services/execution-engine/src/orders/mod.rs` — submit path tests validate allowed adjudication preserves lifecycle transition, denied adjudication blocks side effects, unavailable adjudication fails closed (including default runtime wiring with no adjudication integration), and timeout adjudication fails closed with no persisted submit transition.
 
 ## Coverage
 
-- Story 2.7 critical flows covered across domain, persistence, governance service, control API, and risk-engine runtime:
-  - scoped profile/inventory contract validation with deterministic boundary semantics,
-  - strict schema scope (`risk_limit_profiles`, `inventory_limit_rules`) and index contracts,
-  - transactional profile/rule persistence adapter validation,
-  - approval-gated critical-increase pending behavior and machine-readable mutation evidence,
-  - pending-policy query visibility with actor/action/reason traceability,
-  - risk runtime limit-state fail-closed availability surfaces for downstream pre-trade gating.
+- Story 2.8 critical flows covered across domain, persistence, risk-engine runtime, and execution-runtime integration:
+  - deterministic FR21 gate-order adjudication and single final machine-readable deny reason,
+  - fail-closed handling for missing/unavailable gate inputs and adjudication failures,
+  - drawdown `>=` stop threshold protective-mode deny signaling,
+  - telemetry-compatible decision emission plus durable pre-trade decision schema/adapter surfaces,
+  - execution submit guardrail preventing persistence side effects when adjudication denies, times out, or is unavailable.
+- Automated Story 2.8 regression inventory in this QA pass: **44 tests passing** (`domain: 5`, `persistence: 5`, `risk-engine: 23`, `execution-engine: 11`).
 
 ## Execution Result
 
-- `npm run --silent qa:test:story-2-7` ✅
-- `npm run --silent rust:lint` ✅
-- `npm run --silent test` ✅
-- `npm run --silent rust:build` ✅
-- `npm run --silent qa:test:story-2-7` (BMAD QA automation rerun) ✅
+- `cargo test -p domain risk::tests::pretrade_` ✅
+- `cargo test -p persistence postgres::pretrade_gate::tests::` ✅
+- `cargo test -p risk-engine gates::tests::` ✅
+- `cargo test -p execution-engine orders::tests::` ✅
+- `npm run --silent qa:test:story-2-8` ✅ (re-run after adding fail-closed regressions)

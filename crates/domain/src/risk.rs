@@ -2446,6 +2446,536 @@ pub fn evaluate_freshness_gate(
     })
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum PreTradeGateDimension {
+    Freshness,
+    StreamHealth,
+    ExposureLimitState,
+    ReconciliationHalt,
+    UserStreamAuth,
+    DrawdownStop,
+    StrategyApproval,
+    VenueEligibility,
+}
+
+impl PreTradeGateDimension {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Freshness => "freshness",
+            Self::StreamHealth => "stream_health",
+            Self::ExposureLimitState => "exposure_limit_state",
+            Self::ReconciliationHalt => "reconciliation_halt",
+            Self::UserStreamAuth => "user_stream_auth",
+            Self::DrawdownStop => "drawdown_stop",
+            Self::StrategyApproval => "strategy_approval",
+            Self::VenueEligibility => "venue_eligibility",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PreTradeGateContractError> {
+        match value {
+            "freshness" => Ok(Self::Freshness),
+            "stream_health" => Ok(Self::StreamHealth),
+            "exposure_limit_state" => Ok(Self::ExposureLimitState),
+            "reconciliation_halt" => Ok(Self::ReconciliationHalt),
+            "user_stream_auth" => Ok(Self::UserStreamAuth),
+            "drawdown_stop" => Ok(Self::DrawdownStop),
+            "strategy_approval" => Ok(Self::StrategyApproval),
+            "venue_eligibility" => Ok(Self::VenueEligibility),
+            _ => Err(PreTradeGateContractError::invalid_payload(format!(
+                "unknown pre-trade gate dimension `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreTradeDecisionOutcome {
+    Allow,
+    Deny,
+}
+
+impl PreTradeDecisionOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PreTradeGateContractError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            _ => Err(PreTradeGateContractError::invalid_payload(format!(
+                "unknown pre-trade decision outcome `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreTradeReasonCode {
+    Pass,
+    FreshnessStateUnavailable,
+    FreshnessStaleBreach,
+    StreamHealthStateUnavailable,
+    StreamHealthDegraded,
+    RiskLimitStateUnavailable,
+    ReconciliationCriticalHalt,
+    UserStreamAuthExpired,
+    DrawdownStateUnavailable,
+    DrawdownStopTriggered,
+    StrategyApprovalUnavailable,
+    StrategyApprovalRequired,
+    VenueEligibilityUnavailable,
+    VenueIneligible,
+    AdjudicationUnavailable,
+    AdjudicationTimeout,
+    PersistenceUnavailable,
+    InvalidPayload,
+}
+
+impl PreTradeReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Pass => "pretrade_gate_pass",
+            Self::FreshnessStateUnavailable => "pretrade_freshness_state_unavailable",
+            Self::FreshnessStaleBreach => "pretrade_freshness_stale_breach",
+            Self::StreamHealthStateUnavailable => "pretrade_stream_health_state_unavailable",
+            Self::StreamHealthDegraded => "pretrade_stream_health_degraded",
+            Self::RiskLimitStateUnavailable => "pretrade_risk_limit_state_unavailable",
+            Self::ReconciliationCriticalHalt => "pretrade_reconciliation_critical_halt",
+            Self::UserStreamAuthExpired => "pretrade_user_stream_auth_expired",
+            Self::DrawdownStateUnavailable => "pretrade_drawdown_state_unavailable",
+            Self::DrawdownStopTriggered => "pretrade_drawdown_stop_triggered",
+            Self::StrategyApprovalUnavailable => "pretrade_strategy_approval_unavailable",
+            Self::StrategyApprovalRequired => "pretrade_strategy_approval_required",
+            Self::VenueEligibilityUnavailable => "pretrade_venue_eligibility_unavailable",
+            Self::VenueIneligible => "pretrade_venue_ineligible",
+            Self::AdjudicationUnavailable => "pretrade_adjudication_unavailable",
+            Self::AdjudicationTimeout => "pretrade_adjudication_timeout",
+            Self::PersistenceUnavailable => "pretrade_persistence_unavailable",
+            Self::InvalidPayload => "pretrade_invalid_payload",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PreTradeGateContractError> {
+        match value {
+            "pretrade_gate_pass" => Ok(Self::Pass),
+            "pretrade_freshness_state_unavailable" => Ok(Self::FreshnessStateUnavailable),
+            "pretrade_freshness_stale_breach" => Ok(Self::FreshnessStaleBreach),
+            "pretrade_stream_health_state_unavailable" => Ok(Self::StreamHealthStateUnavailable),
+            "pretrade_stream_health_degraded" => Ok(Self::StreamHealthDegraded),
+            "pretrade_risk_limit_state_unavailable" => Ok(Self::RiskLimitStateUnavailable),
+            "pretrade_reconciliation_critical_halt" => Ok(Self::ReconciliationCriticalHalt),
+            "pretrade_user_stream_auth_expired" => Ok(Self::UserStreamAuthExpired),
+            "pretrade_drawdown_state_unavailable" => Ok(Self::DrawdownStateUnavailable),
+            "pretrade_drawdown_stop_triggered" => Ok(Self::DrawdownStopTriggered),
+            "pretrade_strategy_approval_unavailable" => Ok(Self::StrategyApprovalUnavailable),
+            "pretrade_strategy_approval_required" => Ok(Self::StrategyApprovalRequired),
+            "pretrade_venue_eligibility_unavailable" => Ok(Self::VenueEligibilityUnavailable),
+            "pretrade_venue_ineligible" => Ok(Self::VenueIneligible),
+            "pretrade_adjudication_unavailable" => Ok(Self::AdjudicationUnavailable),
+            "pretrade_adjudication_timeout" => Ok(Self::AdjudicationTimeout),
+            "pretrade_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            "pretrade_invalid_payload" => Ok(Self::InvalidPayload),
+            _ => Err(PreTradeGateContractError::invalid_payload(format!(
+                "unknown pre-trade reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreTradeGateValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreTradeGateContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<PreTradeGateValidationIssue>,
+}
+
+impl PreTradeGateContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<PreTradeGateValidationIssue>,
+    ) -> Self {
+        Self {
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreTradeGateResult {
+    pub gate: PreTradeGateDimension,
+    pub passed: bool,
+    pub reason_code: String,
+    pub evaluated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreTradeGateDecision {
+    pub decision_id: String,
+    pub intent_id: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub profile_key: String,
+    pub outcome: PreTradeDecisionOutcome,
+    pub reason_code: String,
+    pub protective_mode_active: bool,
+    pub gate_results: Vec<PreTradeGateResult>,
+    pub correlation_id: String,
+    pub evaluated_at_utc: String,
+}
+
+pub fn normalize_pretrade_identifier(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+pub fn drawdown_stop_triggered(
+    current_drawdown_pct: f64,
+    configured_stop_threshold_pct: f64,
+) -> Result<bool, PreTradeGateContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_negative_pretrade_numeric(
+        &mut field_errors,
+        "current_drawdown_pct",
+        current_drawdown_pct,
+    );
+    validate_non_negative_pretrade_numeric(
+        &mut field_errors,
+        "configured_stop_threshold_pct",
+        configured_stop_threshold_pct,
+    );
+    if !field_errors.is_empty() {
+        return Err(PreTradeGateContractError::invalid_payload_with_issues(
+            "drawdown stop inputs are invalid",
+            field_errors,
+        ));
+    }
+    Ok(current_drawdown_pct >= configured_stop_threshold_pct)
+}
+
+pub fn validate_pretrade_gate_result(
+    result: &PreTradeGateResult,
+) -> Result<(), PreTradeGateContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_pretrade_field(&mut field_errors, "reason_code", &result.reason_code);
+    validate_pretrade_timestamp_field(
+        &mut field_errors,
+        "evaluated_at_utc",
+        &result.evaluated_at_utc,
+    );
+    if PreTradeReasonCode::parse(&result.reason_code).is_err() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field: "reason_code",
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known pre-trade reason".to_string(),
+        });
+    }
+    if result.passed && result.reason_code != PreTradeReasonCode::Pass.code() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field: "reason_code",
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: "passed gate results must use pretrade_gate_pass reason_code".to_string(),
+        });
+    }
+    if !result.passed && result.reason_code == PreTradeReasonCode::Pass.code() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field: "reason_code",
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: "failed gate results cannot use pretrade_gate_pass reason_code".to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(PreTradeGateContractError::invalid_payload_with_issues(
+            "pre-trade gate result payload is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_pretrade_gate_decision(
+    decision: &PreTradeGateDecision,
+) -> Result<(), PreTradeGateContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_pretrade_field(&mut field_errors, "decision_id", &decision.decision_id);
+    validate_non_empty_pretrade_field(&mut field_errors, "intent_id", &decision.intent_id);
+    validate_non_empty_pretrade_field(&mut field_errors, "market_id", &decision.market_id);
+    validate_non_empty_pretrade_field(&mut field_errors, "cluster_id", &decision.cluster_id);
+    validate_non_empty_pretrade_field(&mut field_errors, "profile_key", &decision.profile_key);
+    validate_non_empty_pretrade_field(
+        &mut field_errors,
+        "correlation_id",
+        &decision.correlation_id,
+    );
+    validate_non_empty_pretrade_field(&mut field_errors, "reason_code", &decision.reason_code);
+    validate_pretrade_timestamp_field(
+        &mut field_errors,
+        "evaluated_at_utc",
+        &decision.evaluated_at_utc,
+    );
+    validate_normalized_pretrade_identifier(
+        &mut field_errors,
+        "decision_id",
+        &decision.decision_id,
+    );
+    validate_normalized_pretrade_identifier(&mut field_errors, "intent_id", &decision.intent_id);
+    validate_normalized_pretrade_identifier(&mut field_errors, "market_id", &decision.market_id);
+    validate_normalized_pretrade_identifier(&mut field_errors, "cluster_id", &decision.cluster_id);
+    validate_normalized_pretrade_identifier(
+        &mut field_errors,
+        "profile_key",
+        &decision.profile_key,
+    );
+    validate_normalized_pretrade_identifier(
+        &mut field_errors,
+        "correlation_id",
+        &decision.correlation_id,
+    );
+
+    if PreTradeReasonCode::parse(&decision.reason_code).is_err() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field: "reason_code",
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a known pre-trade reason".to_string(),
+        });
+    }
+    if decision.gate_results.is_empty() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field: "gate_results",
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: "gate_results must include at least one gate entry".to_string(),
+        });
+    }
+
+    for result in &decision.gate_results {
+        if let Err(error) = validate_pretrade_gate_result(result) {
+            field_errors.extend(error.field_errors);
+        }
+    }
+
+    let failed = decision
+        .gate_results
+        .iter()
+        .filter(|result| !result.passed)
+        .count();
+    match decision.outcome {
+        PreTradeDecisionOutcome::Allow => {
+            if failed != 0 {
+                field_errors.push(PreTradeGateValidationIssue {
+                    field: "outcome",
+                    code: PreTradeReasonCode::InvalidPayload.code(),
+                    message: "allow outcome cannot include failed gate results".to_string(),
+                });
+            }
+            if decision.reason_code != PreTradeReasonCode::Pass.code() {
+                field_errors.push(PreTradeGateValidationIssue {
+                    field: "reason_code",
+                    code: PreTradeReasonCode::InvalidPayload.code(),
+                    message: "allow outcome must use pretrade_gate_pass reason_code".to_string(),
+                });
+            }
+            if decision.protective_mode_active {
+                field_errors.push(PreTradeGateValidationIssue {
+                    field: "protective_mode_active",
+                    code: PreTradeReasonCode::InvalidPayload.code(),
+                    message: "allow outcome cannot assert protective_mode_active".to_string(),
+                });
+            }
+        }
+        PreTradeDecisionOutcome::Deny => {
+            if failed != 1 {
+                field_errors.push(PreTradeGateValidationIssue {
+                    field: "gate_results",
+                    code: PreTradeReasonCode::InvalidPayload.code(),
+                    message:
+                        "deny outcome must contain exactly one failed gate for deterministic reason precedence"
+                            .to_string(),
+                });
+            }
+            if let Some(failed_result) = decision.gate_results.iter().find(|result| !result.passed)
+                && decision.reason_code != failed_result.reason_code
+            {
+                field_errors.push(PreTradeGateValidationIssue {
+                    field: "reason_code",
+                    code: PreTradeReasonCode::InvalidPayload.code(),
+                    message: "deny outcome reason_code must match the failed gate reason_code"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    if decision.protective_mode_active
+        && decision.reason_code != PreTradeReasonCode::DrawdownStopTriggered.code()
+    {
+        field_errors.push(PreTradeGateValidationIssue {
+            field: "protective_mode_active",
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message:
+                "protective_mode_active is only valid for drawdown-stop-triggered deny decisions"
+                    .to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(PreTradeGateContractError::invalid_payload_with_issues(
+            "pre-trade gate decision payload is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn adjudicate_pretrade_gate_results(
+    intent_id: &str,
+    market_id: &str,
+    cluster_id: &str,
+    profile_key: &str,
+    correlation_id: &str,
+    evaluated_at_utc: &str,
+    gate_results: Vec<PreTradeGateResult>,
+    protective_mode_active: bool,
+) -> Result<PreTradeGateDecision, PreTradeGateContractError> {
+    if gate_results.is_empty() {
+        return Err(PreTradeGateContractError::invalid_payload(
+            "gate_results must include at least one entry",
+        ));
+    }
+    for gate_result in &gate_results {
+        validate_pretrade_gate_result(gate_result)?;
+    }
+    if parse_utc_timestamp(evaluated_at_utc).is_err() {
+        return Err(PreTradeGateContractError::invalid_payload(
+            "evaluated_at_utc must be an RFC3339 UTC timestamp",
+        ));
+    }
+
+    let failed_gate_reason = gate_results
+        .iter()
+        .find(|result| !result.passed)
+        .map(|result| result.reason_code.clone());
+    let (outcome, reason_code) = match failed_gate_reason {
+        Some(reason_code) => (PreTradeDecisionOutcome::Deny, reason_code),
+        None => (
+            PreTradeDecisionOutcome::Allow,
+            PreTradeReasonCode::Pass.code().to_string(),
+        ),
+    };
+    let normalized_intent_id = normalize_pretrade_identifier(intent_id);
+    let decision = PreTradeGateDecision {
+        decision_id: format!(
+            "pretrade::{}::{}",
+            normalized_intent_id,
+            compact_utc_timestamp_token(evaluated_at_utc)
+        ),
+        intent_id: normalized_intent_id,
+        market_id: normalize_pretrade_identifier(market_id),
+        cluster_id: normalize_pretrade_identifier(cluster_id),
+        profile_key: normalize_pretrade_identifier(profile_key),
+        outcome,
+        reason_code,
+        protective_mode_active,
+        gate_results,
+        correlation_id: normalize_pretrade_identifier(correlation_id),
+        evaluated_at_utc: evaluated_at_utc.to_string(),
+    };
+    validate_pretrade_gate_decision(&decision)?;
+    Ok(decision)
+}
+
+fn validate_non_empty_pretrade_field(
+    field_errors: &mut Vec<PreTradeGateValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field,
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_pretrade_timestamp_field(
+    field_errors: &mut Vec<PreTradeGateValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field,
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
+fn validate_non_negative_pretrade_numeric(
+    field_errors: &mut Vec<PreTradeGateValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(PreTradeGateValidationIssue {
+            field,
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite"),
+        });
+    } else if value < 0.0 {
+        field_errors.push(PreTradeGateValidationIssue {
+            field,
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be greater than or equal to 0"),
+        });
+    }
+}
+
+fn validate_normalized_pretrade_identifier(
+    field_errors: &mut Vec<PreTradeGateValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if normalize_pretrade_identifier(value) != value {
+        field_errors.push(PreTradeGateValidationIssue {
+            field,
+            code: PreTradeReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be normalized (trimmed lowercase)"),
+        });
+    }
+}
+
+fn compact_utc_timestamp_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .collect()
+}
+
 fn validate_non_negative_freshness_age(
     field_errors: &mut Vec<FreshnessGateValidationIssue>,
     field: &'static str,
@@ -3753,5 +4283,233 @@ mod tests {
             .to_event("freshness::event-2", &policy)
             .expect("pause transition should emit an event payload");
         assert!(validate_freshness_gate_event(&event).is_ok());
+    }
+
+    fn sample_pretrade_gate_result(
+        gate: PreTradeGateDimension,
+        passed: bool,
+        reason_code: PreTradeReasonCode,
+        evaluated_at_utc: &str,
+    ) -> PreTradeGateResult {
+        PreTradeGateResult {
+            gate,
+            passed,
+            reason_code: reason_code.code().to_string(),
+            evaluated_at_utc: evaluated_at_utc.to_string(),
+        }
+    }
+
+    #[test]
+    fn pretrade_reason_code_parse_round_trip_is_deterministic() {
+        let codes = [
+            PreTradeReasonCode::Pass,
+            PreTradeReasonCode::FreshnessStaleBreach,
+            PreTradeReasonCode::StreamHealthDegraded,
+            PreTradeReasonCode::RiskLimitStateUnavailable,
+            PreTradeReasonCode::DrawdownStopTriggered,
+            PreTradeReasonCode::VenueIneligible,
+        ];
+
+        for code in codes {
+            let parsed = PreTradeReasonCode::parse(code.code())
+                .expect("known pre-trade reason code should parse");
+            assert_eq!(parsed, code);
+        }
+    }
+
+    #[test]
+    fn pretrade_all_gates_pass_returns_allow_decision() {
+        let gate_results = vec![
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::Freshness,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:00Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::StreamHealth,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:00Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::ExposureLimitState,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:00Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::DrawdownStop,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:00Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::StrategyApproval,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:00Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::VenueEligibility,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:00Z",
+            ),
+        ];
+
+        let decision = adjudicate_pretrade_gate_results(
+            " intent-1 ",
+            " market_yes_no_1 ",
+            " cluster_alpha ",
+            " default ",
+            " corr-pretrade-1 ",
+            "2026-04-06T00:00:00Z",
+            gate_results,
+            false,
+        )
+        .expect("all passing gates should produce allow decision");
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Allow);
+        assert_eq!(decision.reason_code, PreTradeReasonCode::Pass.code());
+        assert_eq!(decision.intent_id, "intent-1");
+        assert_eq!(decision.market_id, "market_yes_no_1");
+        assert_eq!(decision.cluster_id, "cluster_alpha");
+        assert!(!decision.protective_mode_active);
+        assert!(validate_pretrade_gate_decision(&decision).is_ok());
+    }
+
+    #[test]
+    fn pretrade_single_gate_failure_returns_deterministic_deny_reason() {
+        let gate_results = vec![
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::Freshness,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:01Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::StreamHealth,
+                false,
+                PreTradeReasonCode::StreamHealthDegraded,
+                "2026-04-06T00:00:01Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::ExposureLimitState,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:01Z",
+            ),
+        ];
+
+        let decision = adjudicate_pretrade_gate_results(
+            "intent-2",
+            "market_yes_no_2",
+            "cluster_beta",
+            "default",
+            "corr-pretrade-2",
+            "2026-04-06T00:00:01Z",
+            gate_results,
+            false,
+        )
+        .expect("single failed gate should produce deny decision");
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::StreamHealthDegraded.code()
+        );
+        assert_eq!(
+            decision
+                .gate_results
+                .iter()
+                .filter(|result| !result.passed)
+                .count(),
+            1
+        );
+        assert!(!decision.protective_mode_active);
+        assert!(validate_pretrade_gate_decision(&decision).is_ok());
+    }
+
+    #[test]
+    fn pretrade_drawdown_boundary_equality_triggers_protective_mode_deny() {
+        let triggers = drawdown_stop_triggered(8.5, 8.5)
+            .expect("drawdown boundary comparison should evaluate deterministically");
+        assert!(triggers);
+
+        let gate_results = vec![
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::Freshness,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:02Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::StreamHealth,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:02Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::ExposureLimitState,
+                true,
+                PreTradeReasonCode::Pass,
+                "2026-04-06T00:00:02Z",
+            ),
+            sample_pretrade_gate_result(
+                PreTradeGateDimension::DrawdownStop,
+                false,
+                PreTradeReasonCode::DrawdownStopTriggered,
+                "2026-04-06T00:00:02Z",
+            ),
+        ];
+
+        let decision = adjudicate_pretrade_gate_results(
+            "intent-3",
+            "market_yes_no_3",
+            "cluster_gamma",
+            "default",
+            "corr-pretrade-3",
+            "2026-04-06T00:00:02Z",
+            gate_results,
+            true,
+        )
+        .expect("drawdown stop boundary should deny with protective mode");
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::DrawdownStopTriggered.code()
+        );
+        assert!(decision.protective_mode_active);
+        assert!(validate_pretrade_gate_decision(&decision).is_ok());
+    }
+
+    #[test]
+    fn pretrade_protective_mode_requires_drawdown_reason() {
+        let gate_results = vec![sample_pretrade_gate_result(
+            PreTradeGateDimension::StreamHealth,
+            false,
+            PreTradeReasonCode::StreamHealthDegraded,
+            "2026-04-06T00:00:03Z",
+        )];
+
+        let validation_error = adjudicate_pretrade_gate_results(
+            "intent-4",
+            "market_yes_no_4",
+            "cluster_delta",
+            "default",
+            "corr-pretrade-4",
+            "2026-04-06T00:00:03Z",
+            gate_results,
+            true,
+        )
+        .expect_err("protective mode must be restricted to drawdown-triggered denies");
+        assert!(
+            validation_error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "protective_mode_active")
+        );
     }
 }

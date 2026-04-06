@@ -5,11 +5,16 @@ use domain::order::{
     normalize_order_batch_cancel_idempotency_key, normalize_order_cancel_idempotency_key,
     normalize_order_idempotency_key, normalize_order_submission_idempotency_key,
 };
-use domain::risk::{UserStreamEvent, UserStreamEventStatus};
+use domain::risk::{
+    PreTradeDecisionOutcome, PreTradeReasonCode, UserStreamEvent, UserStreamEventStatus,
+};
 use persistence::postgres::orders::{
     OrderLifecyclePersistDisposition, OrderLifecyclePersistOutcome, OrderLifecyclePersistenceError,
     OrderLifecycleTransitionCommand, load_order, load_order_state_transitions,
     persist_order_transition,
+};
+use persistence::postgres::pretrade_gate::{
+    PreTradeGatePersistenceError, load_latest_pretrade_gate_decision_by_intent,
 };
 use serde::Serialize;
 use sqlx::PgPool;
@@ -17,6 +22,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 #[cfg(test)]
@@ -46,6 +53,144 @@ impl Display for OrderLifecycleRuntimeError {
 }
 
 impl Error for OrderLifecycleRuntimeError {}
+
+pub const DEFAULT_PRETRADE_ADJUDICATION_TIMEOUT_MS: u64 = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreTradeAdjudicationRequest {
+    pub order_id: String,
+    pub market_id: String,
+    pub correlation_id: String,
+    pub requested_at_utc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreTradeAdjudicationDecision {
+    pub allowed: bool,
+    pub reason_code: String,
+    pub decided_at_utc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreTradeAdjudicationPortError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl PreTradeAdjudicationPortError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+pub trait RiskAdjudicationPort: Send + Sync {
+    fn adjudicate_submit<'a>(
+        &'a self,
+        request: &'a PreTradeAdjudicationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<PreTradeAdjudicationDecision, PreTradeAdjudicationPortError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+#[derive(Debug, Default)]
+pub struct AllowAllRiskAdjudicationPort;
+
+impl RiskAdjudicationPort for AllowAllRiskAdjudicationPort {
+    fn adjudicate_submit<'a>(
+        &'a self,
+        request: &'a PreTradeAdjudicationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<PreTradeAdjudicationDecision, PreTradeAdjudicationPortError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(PreTradeAdjudicationDecision {
+                allowed: true,
+                reason_code: PreTradeReasonCode::Pass.code().to_string(),
+                decided_at_utc: request.requested_at_utc.clone(),
+            })
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UnavailableRiskAdjudicationPort;
+
+impl RiskAdjudicationPort for UnavailableRiskAdjudicationPort {
+    fn adjudicate_submit<'a>(
+        &'a self,
+        _request: &'a PreTradeAdjudicationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<PreTradeAdjudicationDecision, PreTradeAdjudicationPortError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(PreTradeAdjudicationPortError::new(
+                PreTradeReasonCode::AdjudicationUnavailable.code(),
+                "pre-trade adjudication port is unavailable",
+            ))
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresRiskAdjudicationPort {
+    pool: PgPool,
+}
+
+impl PostgresRiskAdjudicationPort {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl RiskAdjudicationPort for PostgresRiskAdjudicationPort {
+    fn adjudicate_submit<'a>(
+        &'a self,
+        request: &'a PreTradeAdjudicationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<PreTradeAdjudicationDecision, PreTradeAdjudicationPortError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let persisted_decision =
+                load_latest_pretrade_gate_decision_by_intent(&self.pool, &request.order_id)
+                    .await
+                    .map_err(map_pretrade_lookup_error_to_adjudication_error)?
+                    .ok_or_else(|| {
+                        PreTradeAdjudicationPortError::new(
+                            PreTradeReasonCode::AdjudicationUnavailable.code(),
+                            format!(
+                                "no persisted pre-trade decision found for intent `{}`",
+                                request.order_id.trim()
+                            ),
+                        )
+                    })?;
+
+            Ok(PreTradeAdjudicationDecision {
+                allowed: matches!(persisted_decision.outcome, PreTradeDecisionOutcome::Allow),
+                reason_code: persisted_decision.reason_code,
+                decided_at_utc: persisted_decision.evaluated_at_utc,
+            })
+        })
+    }
+}
 
 pub trait OrderLifecycleStore: Send + Sync {
     fn persist_transition<'a>(
@@ -150,6 +295,15 @@ fn map_persistence_error(error: OrderLifecyclePersistenceError) -> OrderLifecycl
     OrderLifecycleRuntimeError::new(error.code, error.to_string())
 }
 
+fn map_pretrade_lookup_error_to_adjudication_error(
+    error: PreTradeGatePersistenceError,
+) -> PreTradeAdjudicationPortError {
+    let normalized_code = PreTradeReasonCode::parse(error.code)
+        .map(|reason| reason.code())
+        .unwrap_or(PreTradeReasonCode::AdjudicationUnavailable.code());
+    PreTradeAdjudicationPortError::new(normalized_code, error.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderLifecycleCommandDisposition {
     Applied,
@@ -246,11 +400,31 @@ pub trait OrderLifecycleUpdatePort: Send + Sync {
 
 pub struct OrderLifecycleRuntime<S: OrderLifecycleStore> {
     store: S,
+    risk_adjudication_port: Arc<dyn RiskAdjudicationPort>,
+    pretrade_adjudication_timeout: Duration,
 }
 
 impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
     pub fn new(store: S) -> Self {
-        Self { store }
+        Self {
+            store,
+            risk_adjudication_port: Arc::new(UnavailableRiskAdjudicationPort),
+            pretrade_adjudication_timeout: Duration::from_millis(
+                DEFAULT_PRETRADE_ADJUDICATION_TIMEOUT_MS,
+            ),
+        }
+    }
+
+    pub fn with_risk_adjudication_port(
+        store: S,
+        risk_adjudication_port: Arc<dyn RiskAdjudicationPort>,
+        pretrade_adjudication_timeout: Duration,
+    ) -> Self {
+        Self {
+            store,
+            risk_adjudication_port,
+            pretrade_adjudication_timeout,
+        }
     }
 
     pub async fn submit_order(
@@ -263,6 +437,35 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
             &command.correlation_id,
             &command.requested_at_utc,
         )?;
+        let adjudication_request = PreTradeAdjudicationRequest {
+            order_id: command.order_id.clone(),
+            market_id: command.market_id.clone(),
+            correlation_id: command.correlation_id.clone(),
+            requested_at_utc: command.requested_at_utc.clone(),
+        };
+        let adjudication_decision = match self
+            .adjudicate_submit_order_request(&adjudication_request)
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                let reason_code = normalize_pretrade_reason_code(error.code);
+                emit_pretrade_submit_deny_telemetry(&adjudication_request, reason_code);
+                return Err(OrderLifecycleRuntimeError::new(reason_code, error.message));
+            }
+        };
+        if !adjudication_decision.allowed {
+            let reason_code = normalize_pretrade_reason_code(&adjudication_decision.reason_code);
+            emit_pretrade_submit_deny_telemetry(&adjudication_request, reason_code);
+            return Err(OrderLifecycleRuntimeError::new(
+                reason_code,
+                format!(
+                    "pre-trade adjudication denied submit for `{}` with reason `{}`",
+                    adjudication_request.order_id, reason_code
+                ),
+            ));
+        }
+
         let idempotency_key =
             normalize_order_submission_idempotency_key(&command.order_id, &command.idempotency_key);
         let transition_command = OrderLifecycleTransitionCommand {
@@ -465,6 +668,56 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
         Ok(outcome)
     }
 
+    async fn adjudicate_submit_order_request(
+        &self,
+        request: &PreTradeAdjudicationRequest,
+    ) -> Result<PreTradeAdjudicationDecision, OrderLifecycleRuntimeError> {
+        let adjudication_future = self.risk_adjudication_port.adjudicate_submit(request);
+        let adjudication_result =
+            tokio::time::timeout(self.pretrade_adjudication_timeout, adjudication_future).await;
+
+        match adjudication_result {
+            Err(_) => Err(OrderLifecycleRuntimeError::new(
+                PreTradeReasonCode::AdjudicationTimeout.code(),
+                format!(
+                    "pre-trade adjudication timed out after {}ms for order `{}`",
+                    self.pretrade_adjudication_timeout.as_millis(),
+                    request.order_id
+                ),
+            )),
+            Ok(Err(error)) => {
+                let normalized_code = normalize_pretrade_reason_code(error.code);
+                Err(OrderLifecycleRuntimeError::new(
+                    normalized_code,
+                    error.message,
+                ))
+            }
+            Ok(Ok(decision)) => {
+                let normalized_reason_code = normalize_pretrade_reason_code(&decision.reason_code);
+                if decision.allowed && normalized_reason_code != PreTradeReasonCode::Pass.code() {
+                    return Err(OrderLifecycleRuntimeError::new(
+                        PreTradeReasonCode::InvalidPayload.code(),
+                        format!(
+                            "pre-trade adjudication allow decision must use `{}` reason_code",
+                            PreTradeReasonCode::Pass.code()
+                        ),
+                    ));
+                }
+                if !decision.allowed && normalized_reason_code == PreTradeReasonCode::Pass.code() {
+                    return Err(OrderLifecycleRuntimeError::new(
+                        PreTradeReasonCode::InvalidPayload.code(),
+                        "pre-trade adjudication deny decision cannot use pretrade_gate_pass reason_code",
+                    ));
+                }
+                Ok(PreTradeAdjudicationDecision {
+                    allowed: decision.allowed,
+                    reason_code: normalized_reason_code.to_string(),
+                    decided_at_utc: decision.decided_at_utc,
+                })
+            }
+        }
+    }
+
     async fn persist_with_telemetry(
         &self,
         event_name: &'static str,
@@ -556,6 +809,12 @@ fn map_user_stream_event_state(
     Ok(mapped)
 }
 
+fn normalize_pretrade_reason_code(reason_code: &str) -> &'static str {
+    PreTradeReasonCode::parse(reason_code)
+        .map(|reason| reason.code())
+        .unwrap_or(PreTradeReasonCode::InvalidPayload.code())
+}
+
 fn is_retryable_runtime_error(error: &OrderLifecycleRuntimeError) -> bool {
     matches!(
         error.code,
@@ -613,6 +872,29 @@ fn fallback_event_id(event_name: &str, order_id: &str, timestamp_utc: &str) -> S
         .filter(|character| character.is_ascii_digit())
         .collect();
     format!("{event_name}::{order_id}::{compact_timestamp}")
+}
+
+fn emit_pretrade_submit_deny_telemetry(
+    request: &PreTradeAdjudicationRequest,
+    reason_code: &str,
+) {
+    let deny_event_id = fallback_event_id(
+        "execution_order_lifecycle_submit_pretrade_deny_v1",
+        &request.order_id,
+        &request.requested_at_utc,
+    );
+    emit_order_lifecycle_telemetry(OrderLifecycleTelemetryEvent {
+        event_name: "execution_order_lifecycle_submit_pretrade_deny_v1",
+        event_id: &deny_event_id,
+        outcome: "deny",
+        correlation_id: &request.correlation_id,
+        order_id: &request.order_id,
+        market_id: &request.market_id,
+        from_state: None,
+        to_state: None,
+        reason_code,
+        timestamp_utc: &request.requested_at_utc,
+    });
 }
 
 fn emit_batch_cancel_outcome(outcome: &BatchCancelOrderOutcome) {
@@ -923,6 +1205,7 @@ impl OrderLifecycleStore for InMemoryOrderLifecycleStore {
 mod tests {
     use super::*;
     use domain::risk::{UserStreamEventKind, UserStreamReasonCode};
+    use tokio::time::sleep;
 
     fn sample_submit_command(order_id: &str) -> SubmitOrderCommand {
         SubmitOrderCommand {
@@ -960,10 +1243,282 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct DenyRiskAdjudicationPort;
+
+    impl RiskAdjudicationPort for DenyRiskAdjudicationPort {
+        fn adjudicate_submit<'a>(
+            &'a self,
+            request: &'a PreTradeAdjudicationRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            PreTradeAdjudicationDecision,
+                            PreTradeAdjudicationPortError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(PreTradeAdjudicationDecision {
+                    allowed: false,
+                    reason_code: PreTradeReasonCode::VenueIneligible.code().to_string(),
+                    decided_at_utc: request.requested_at_utc.clone(),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct UnavailableRiskAdjudicationPort;
+
+    impl RiskAdjudicationPort for UnavailableRiskAdjudicationPort {
+        fn adjudicate_submit<'a>(
+            &'a self,
+            _request: &'a PreTradeAdjudicationRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            PreTradeAdjudicationDecision,
+                            PreTradeAdjudicationPortError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Err(PreTradeAdjudicationPortError::new(
+                    PreTradeReasonCode::AdjudicationUnavailable.code(),
+                    "risk adjudication service unavailable",
+                ))
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SlowRiskAdjudicationPort;
+
+    impl RiskAdjudicationPort for SlowRiskAdjudicationPort {
+        fn adjudicate_submit<'a>(
+            &'a self,
+            request: &'a PreTradeAdjudicationRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            PreTradeAdjudicationDecision,
+                            PreTradeAdjudicationPortError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                sleep(Duration::from_millis(50)).await;
+                Ok(PreTradeAdjudicationDecision {
+                    allowed: true,
+                    reason_code: PreTradeReasonCode::Pass.code().to_string(),
+                    decided_at_utc: request.requested_at_utc.clone(),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct InvalidDenyReasonRiskAdjudicationPort;
+
+    impl RiskAdjudicationPort for InvalidDenyReasonRiskAdjudicationPort {
+        fn adjudicate_submit<'a>(
+            &'a self,
+            request: &'a PreTradeAdjudicationRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            PreTradeAdjudicationDecision,
+                            PreTradeAdjudicationPortError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(PreTradeAdjudicationDecision {
+                    allowed: false,
+                    reason_code: PreTradeReasonCode::Pass.code().to_string(),
+                    decided_at_utc: request.requested_at_utc.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_order_with_allowed_pretrade_adjudication_preserves_lifecycle_behavior() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
+
+        let outcome = runtime
+            .submit_order(sample_submit_command("order-pretrade-allow"))
+            .await
+            .expect("allowed pre-trade adjudication should preserve submit transition");
+
+        assert_eq!(
+            outcome.disposition,
+            OrderLifecycleCommandDisposition::Applied
+        );
+        assert_eq!(
+            outcome.reason_code,
+            OrderLifecycleReasonCode::SubmissionAccepted.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_order_denied_by_pretrade_adjudication_has_no_side_effects() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(DenyRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-pretrade-deny"))
+            .await
+            .expect_err("denied adjudication must fail submit path closed");
+        assert_eq!(error.code, PreTradeReasonCode::VenueIneligible.code());
+        let hydrated = runtime
+            .hydrate_order("order-pretrade-deny")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_unavailable_pretrade_adjudication_has_no_side_effects() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(UnavailableRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-pretrade-unavailable"))
+            .await
+            .expect_err("unavailable adjudication must fail submit path closed");
+        assert_eq!(
+            error.code,
+            PreTradeReasonCode::AdjudicationUnavailable.code()
+        );
+        let hydrated = runtime
+            .hydrate_order("order-pretrade-unavailable")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_default_runtime_fails_closed_when_pretrade_port_is_unavailable() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::new(store);
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-pretrade-default-unavailable"))
+            .await
+            .expect_err("default runtime must fail closed when no adjudication integration exists");
+        assert_eq!(
+            error.code,
+            PreTradeReasonCode::AdjudicationUnavailable.code()
+        );
+        let hydrated = runtime
+            .hydrate_order("order-pretrade-default-unavailable")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_timeout_pretrade_adjudication_has_no_side_effects() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(SlowRiskAdjudicationPort),
+            Duration::from_millis(10),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-pretrade-timeout"))
+            .await
+            .expect_err("timed out adjudication must fail submit path closed");
+        assert_eq!(error.code, PreTradeReasonCode::AdjudicationTimeout.code());
+        let hydrated = runtime
+            .hydrate_order("order-pretrade-timeout")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_denied_with_pass_reason_is_rejected_as_invalid_payload() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(InvalidDenyReasonRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-pretrade-invalid-deny-reason"))
+            .await
+            .expect_err("deny decision with pass reason code must be rejected");
+        assert_eq!(error.code, PreTradeReasonCode::InvalidPayload.code());
+        let hydrated = runtime
+            .hydrate_order("order-pretrade-invalid-deny-reason")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[test]
+    fn pretrade_lookup_errors_normalize_to_fail_closed_adjudication_codes() {
+        let unknown =
+            map_pretrade_lookup_error_to_adjudication_error(PreTradeGatePersistenceError {
+                code: "unexpected_pretrade_code",
+                message: "unexpected failure".to_string(),
+                field_errors: Vec::new(),
+            });
+        assert_eq!(
+            unknown.code,
+            PreTradeReasonCode::AdjudicationUnavailable.code()
+        );
+
+        let persistence =
+            map_pretrade_lookup_error_to_adjudication_error(PreTradeGatePersistenceError {
+                code: PreTradeReasonCode::PersistenceUnavailable.code(),
+                message: "db unavailable".to_string(),
+                field_errors: Vec::new(),
+            });
+        assert_eq!(
+            persistence.code,
+            PreTradeReasonCode::PersistenceUnavailable.code()
+        );
+    }
+
     #[tokio::test]
     async fn user_stream_progression_tracks_terminal_resolution() {
         let store = InMemoryOrderLifecycleStore::default();
-        let runtime = OrderLifecycleRuntime::new(store);
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
         runtime
             .submit_order(sample_submit_command("order-1"))
             .await
@@ -1017,7 +1572,11 @@ mod tests {
     #[tokio::test]
     async fn terminal_to_non_terminal_regression_is_rejected_without_state_mutation() {
         let store = InMemoryOrderLifecycleStore::default();
-        let runtime = OrderLifecycleRuntime::new(store);
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
         runtime
             .submit_order(sample_submit_command("order-2"))
             .await
@@ -1190,7 +1749,11 @@ mod tests {
     #[tokio::test]
     async fn batch_cancel_retry_preserves_idempotency_keys_and_deterministic_outcomes() {
         let store = InMemoryOrderLifecycleStore::default();
-        let runtime = OrderLifecycleRuntime::new(store);
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(AllowAllRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
 
         runtime
             .submit_order(sample_submit_command("order-retry-safe"))
@@ -1243,9 +1806,15 @@ mod tests {
         assert_eq!(first_attempt.len(), 2);
         assert_eq!(retry_attempt.len(), 2);
         assert_eq!(first_attempt[0].outcome, BatchCancelOutcomeKind::Canceled);
-        assert_eq!(first_attempt[1].outcome, BatchCancelOutcomeKind::AlreadyTerminal);
+        assert_eq!(
+            first_attempt[1].outcome,
+            BatchCancelOutcomeKind::AlreadyTerminal
+        );
         assert_eq!(retry_attempt[0].outcome, BatchCancelOutcomeKind::Canceled);
-        assert_eq!(retry_attempt[1].outcome, BatchCancelOutcomeKind::AlreadyTerminal);
+        assert_eq!(
+            retry_attempt[1].outcome,
+            BatchCancelOutcomeKind::AlreadyTerminal
+        );
 
         assert_eq!(
             retry_attempt[0].reason_code,
