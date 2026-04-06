@@ -1274,6 +1274,7 @@ dependencies = [
  "common",
  "domain",
  "governance-service",
+ "persistence",
  "serde",
  "serde_json",
  "sqlx",

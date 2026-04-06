@@ -1,4 +1,5 @@
 import { AllocationPolicyForm } from "@/components/portfolio/AllocationPolicyForm";
+import { PnlAttributionSummaryCard } from "@/components/portfolio/PnlAttributionSummaryCard";
 import { RebalanceRecommendationCard } from "@/components/portfolio/RebalanceRecommendationCard";
 import { getOperatorConsoleEnv } from "@/lib/env";
 import type { ShellFreshnessSnapshot } from "@/lib/shell/read-models";
@@ -21,7 +22,8 @@ export function PortfolioSummaryCard({
 
       <h2 className="type-heading-m">Portfolio summary shell slot</h2>
       <p className="type-body text-muted">
-        Read-only portfolio aggregate for allocation and exposure orientation.
+        Cost-aware realized/unrealized attribution plus allocation/rebalance controls for operator
+        triage.
       </p>
 
       <dl className="shell-metric-grid">
@@ -39,6 +41,8 @@ export function PortfolioSummaryCard({
         Last update:{" "}
         <time dateTime={freshness.lastUpdatedIso}>{freshness.lastUpdatedIso}</time>
       </p>
+
+      <PnlAttributionSummaryCard baseUrl={apiBaseUrl} freshness={freshness} />
 
       <section className="portfolio-allocation-grid">
         <AllocationPolicyForm baseUrl={apiBaseUrl} />

@@ -5,3 +5,7 @@
 ## Deferred from: code review of 1-6-add-scheduled-and-emergency-credential-rotation-flows (2026-04-05T15:52:26Z)
 
 - Non-story workspace drift in `.gitignore`, `_bmad/**`, and `.scripts/**` was detected during git cross-check and excluded from application-source review scope.
+
+## Deferred from: code review of 3-4-build-cost-aware-pnl-and-attribution-surfaces (2026-04-06T09:29:22Z)
+
+- `.scripts/bmad-auto/copilot/bmad-progress.log` appeared in git reality but is outside application-source review scope for Story 3.4.

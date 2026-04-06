@@ -13,6 +13,10 @@ use domain::allocation::{
     DEFAULT_EXPOSURE_DRIFT_THRESHOLD_PCT, DEFAULT_POLICY_STALE_AFTER_SECONDS,
     DEFAULT_RELATIVE_ALPHA_DRIFT_THRESHOLD_PCT, RebalanceReasonCode,
 };
+use domain::attribution::{
+    AttributionPeriod, AttributionReasonCode, AttributionRow, AttributionValidationIssue,
+    build_cost_aware_attribution_rows, build_query_scope,
+};
 use domain::governance::{
     ApprovalDecisionEvidence, ApprovalDecisionOutcome, ApprovalReasonCode, AuthorizationDecision,
     AuthorizationOutcome, AuthorizationReason, ControlAction, CredentialRotationDecisionOutcome,
@@ -42,8 +46,10 @@ use governance_service::risk_limits::{
     UpsertRiskLimitProfileInput,
 };
 use governance_service::safety_controls::ExecuteManualSafetyControlInput;
+use persistence::postgres::attribution_snapshots::load_latest_attribution_snapshots;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 pub fn app_router(state: ControlApiState) -> Router {
     let privileged_routes = Router::new().route(
@@ -126,6 +132,12 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let attribution_routes = Router::new()
+        .route("/control/portfolio/attribution", get(read_portfolio_attribution))
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
     let emergency_control_routes = Router::new()
         .route("/control/emergency/pause", post(trigger_emergency_pause))
         .route(
@@ -153,6 +165,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(market_policy_routes)
         .merge(risk_limit_routes)
         .merge(allocation_policy_routes)
+        .merge(attribution_routes)
         .merge(emergency_control_routes)
         .with_state(state)
 }
@@ -907,6 +920,188 @@ pub async fn list_pending_rebalance_recommendations(
     )
 }
 
+pub async fn read_portfolio_attribution(
+    State(state): State<ControlApiState>,
+    Query(query): Query<AttributionQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/portfolio/attribution".to_string();
+    let authorization = match authorize_attribution_read(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let period_raw = query.period.as_deref().unwrap_or("24h");
+    let period = match AttributionPeriod::parse(period_raw) {
+        Ok(period) => period,
+        Err(error) => {
+            return attribution_service_error_response(
+                error.code,
+                error.message,
+                if error.field_errors.is_empty() {
+                    vec![AttributionValidationIssue {
+                        field: "period",
+                        code: AttributionReasonCode::InvalidPayload.code(),
+                        message: "period must be one of: 1h, 24h, 30d".to_string(),
+                    }]
+                } else {
+                    error.field_errors
+                },
+                "attribution_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    let as_of_utc = query
+        .as_of_utc
+        .clone()
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let dependency_state = match parse_attribution_dependency_state(query.dependency_state.as_deref())
+    {
+        Ok(state) => state,
+        Err(error) => {
+            return attribution_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "attribution_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    match dependency_state {
+        AttributionDependencyState::ProjectionUnavailable => {
+            return attribution_service_error_response(
+                AttributionReasonCode::ProjectionUnavailable.code(),
+                "attribution projection dependency is unavailable".to_string(),
+                Vec::new(),
+                "attribution_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        AttributionDependencyState::StaleSource => {
+            return attribution_service_error_response(
+                AttributionReasonCode::StaleSource.code(),
+                "reconciliation evidence is stale for attribution query".to_string(),
+                Vec::new(),
+                "attribution_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        AttributionDependencyState::ReconciliationUnavailable => {
+            return attribution_service_error_response(
+                AttributionReasonCode::PersistenceUnavailable.code(),
+                "reconciliation evidence is unavailable for attribution query".to_string(),
+                Vec::new(),
+                "attribution_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        AttributionDependencyState::Healthy => {}
+    }
+
+    let scope = match build_query_scope(
+        period,
+        &as_of_utc,
+        query.market_id.as_deref(),
+        query.alpha_id.as_deref(),
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return attribution_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "attribution_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    let rows = if let Some(pool) = state.attribution_pool.as_ref() {
+        match load_latest_attribution_snapshots(
+            pool,
+            period,
+            query.market_id.as_deref(),
+            query.alpha_id.as_deref(),
+            200,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                return attribution_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "attribution_query",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+    } else {
+        let observations =
+            match synthetic_attribution_observations(&scope.as_of_utc, &actor.correlation_id) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    return attribution_service_error_response(
+                        error.code,
+                        error.message,
+                        error.field_errors,
+                        "attribution_query",
+                        &actor,
+                        authorization.timestamp_utc.clone(),
+                        endpoint,
+                    );
+                }
+            };
+        match build_cost_aware_attribution_rows(&observations, &scope) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return attribution_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "attribution_query",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+    };
+
+    attribution_query_response(
+        &state,
+        &actor,
+        rows,
+        AttributionQueryWindow {
+            period,
+            start_inclusive_utc: scope.start_inclusive_utc,
+            end_exclusive_utc: scope.end_exclusive_utc,
+            as_of_utc: scope.as_of_utc,
+        },
+        authorization.timestamp_utc.clone(),
+        endpoint,
+    )
+}
+
 pub async fn execute_rebalance_recommendation(
     State(state): State<ControlApiState>,
     Path(recommendation_id): Path<String>,
@@ -1217,6 +1412,55 @@ fn authorize_critical_action(
         )
             .into_response(),
     ))
+}
+
+fn authorize_attribution_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ExecuteControlPlaneAction);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+
+    Err(Box::new(attribution_service_error_response(
+        AttributionReasonCode::Unauthorized.code(),
+        machine_error.message,
+        Vec::new(),
+        "attribution_query",
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
 }
 
 fn critical_approval_response(
@@ -2374,6 +2618,305 @@ fn approval_reference_requires_request_id_response(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributionDependencyState {
+    Healthy,
+    ProjectionUnavailable,
+    StaleSource,
+    ReconciliationUnavailable,
+}
+
+fn parse_attribution_dependency_state(
+    value: Option<&str>,
+) -> Result<AttributionDependencyState, domain::attribution::AttributionContractError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("healthy") => Ok(AttributionDependencyState::Healthy),
+        Some("projection_unavailable") => Ok(AttributionDependencyState::ProjectionUnavailable),
+        Some("stale_source") => Ok(AttributionDependencyState::StaleSource),
+        Some("reconciliation_unavailable") => Ok(AttributionDependencyState::ReconciliationUnavailable),
+        Some(other) => Err(domain::attribution::AttributionContractError::invalid_payload_with_issues(
+            format!(
+                "dependency_state `{other}` is not supported; expected healthy, projection_unavailable, stale_source, or reconciliation_unavailable"
+            ),
+            vec![AttributionValidationIssue {
+                field: "dependency_state",
+                code: AttributionReasonCode::InvalidPayload.code(),
+                message: "dependency_state must be healthy, projection_unavailable, stale_source, or reconciliation_unavailable".to_string(),
+            }],
+        )),
+    }
+}
+
+fn synthetic_attribution_observations(
+    as_of_utc: &str,
+    correlation_id: &str,
+) -> Result<Vec<domain::attribution::AttributionObservation>, domain::attribution::AttributionContractError>
+{
+    let as_of = OffsetDateTime::parse(as_of_utc, &Rfc3339)
+        .map_err(|_| {
+            domain::attribution::AttributionContractError::invalid_payload_with_issues(
+                "as_of_utc must be an RFC3339 UTC timestamp",
+                vec![AttributionValidationIssue {
+                    field: "as_of_utc",
+                    code: AttributionReasonCode::InvalidPayload.code(),
+                    message: "as_of_utc must be an RFC3339 UTC timestamp".to_string(),
+                }],
+            )
+        })?
+        .to_offset(UtcOffset::UTC);
+
+    let point_30m = (as_of - Duration::minutes(30))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+    let point_2h = (as_of - Duration::hours(2))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+    let point_20h = (as_of - Duration::hours(20))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+    let point_29d = (as_of - Duration::days(29))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+
+    Ok(vec![
+        domain::attribution::AttributionObservation {
+            market_id: "market-btc-election".to_string(),
+            alpha_id: "alpha-momentum".to_string(),
+            period_end_utc: point_30m,
+            realized_pnl_usd: 132.5,
+            unrealized_pnl_usd: 24.0,
+            fees_usd: 6.8,
+            rebates_usd: 1.9,
+            incentives_usd: 0.6,
+            as_of_utc: as_of_utc.to_string(),
+            source: "reconciliation.exposure.v1".to_string(),
+            reason_code: AttributionReasonCode::Ready.code().to_string(),
+            correlation_id: correlation_id.to_string(),
+            snapshot_id: Some("snapshot::attribution::btc::001".to_string()),
+            run_id: Some("run::reconciliation::btc::001".to_string()),
+        },
+        domain::attribution::AttributionObservation {
+            market_id: "market-eth-election".to_string(),
+            alpha_id: "alpha-carry".to_string(),
+            period_end_utc: point_2h,
+            realized_pnl_usd: 45.0,
+            unrealized_pnl_usd: 12.0,
+            fees_usd: 3.2,
+            rebates_usd: 0.7,
+            incentives_usd: 0.2,
+            as_of_utc: as_of_utc.to_string(),
+            source: "reconciliation.exposure.v1".to_string(),
+            reason_code: AttributionReasonCode::Ready.code().to_string(),
+            correlation_id: correlation_id.to_string(),
+            snapshot_id: Some("snapshot::attribution::eth::001".to_string()),
+            run_id: Some("run::reconciliation::eth::001".to_string()),
+        },
+        domain::attribution::AttributionObservation {
+            market_id: "market-btc-election".to_string(),
+            alpha_id: "alpha-carry".to_string(),
+            period_end_utc: point_20h,
+            realized_pnl_usd: 18.0,
+            unrealized_pnl_usd: 9.0,
+            fees_usd: 2.1,
+            rebates_usd: 0.4,
+            incentives_usd: 0.3,
+            as_of_utc: as_of_utc.to_string(),
+            source: "reconciliation.exposure.v1".to_string(),
+            reason_code: AttributionReasonCode::Ready.code().to_string(),
+            correlation_id: correlation_id.to_string(),
+            snapshot_id: Some("snapshot::attribution::btc::002".to_string()),
+            run_id: Some("run::reconciliation::btc::002".to_string()),
+        },
+        domain::attribution::AttributionObservation {
+            market_id: "market-sol-election".to_string(),
+            alpha_id: "alpha-momentum".to_string(),
+            period_end_utc: point_29d,
+            realized_pnl_usd: 80.0,
+            unrealized_pnl_usd: 20.0,
+            fees_usd: 5.0,
+            rebates_usd: 0.9,
+            incentives_usd: 0.0,
+            as_of_utc: as_of_utc.to_string(),
+            source: "reconciliation.exposure.v1".to_string(),
+            reason_code: AttributionReasonCode::Ready.code().to_string(),
+            correlation_id: correlation_id.to_string(),
+            snapshot_id: Some("snapshot::attribution::sol::001".to_string()),
+            run_id: Some("run::reconciliation::sol::001".to_string()),
+        },
+    ])
+}
+
+struct AttributionQueryWindow {
+    period: AttributionPeriod,
+    start_inclusive_utc: String,
+    end_exclusive_utc: String,
+    as_of_utc: String,
+}
+
+fn attribution_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    rows: Vec<AttributionRow>,
+    window: AttributionQueryWindow,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let AttributionQueryWindow {
+        period,
+        start_inclusive_utc,
+        end_exclusive_utc,
+        as_of_utc,
+    } = window;
+    let data_state = if rows.is_empty() { "empty" } else { "ready" };
+    let reason_code = if rows.is_empty() {
+        AttributionReasonCode::EmptyWindow.code().to_string()
+    } else {
+        AttributionReasonCode::Ready.code().to_string()
+    };
+    let source = rows
+        .first()
+        .map(|row| row.source.clone())
+        .unwrap_or_else(|| "portfolio-engine.attribution.v1".to_string());
+    let correlation_id = rows
+        .first()
+        .map(|row| row.correlation_id.clone())
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let recommended_next_action = if rows.is_empty() {
+        "No activity in this period. Expand to a wider period window or remove restrictive filters."
+            .to_string()
+    } else {
+        "Review highest net contributors first, then verify cost drag (fees/rebates/incentives) against execution quality."
+            .to_string()
+    };
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "attribution_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "period": period.as_str(),
+            "rows": rows.len(),
+            "data_state": data_state,
+            "market_id": rows.first().map(|row| row.market_id.clone()),
+            "alpha_id": rows.first().map(|row| row.alpha_id.clone()),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "attribution_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc.clone(),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(AttributionQueryResponse {
+            status: "accepted",
+            action: "attribution_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            period: period.as_str().to_string(),
+            start_inclusive_utc,
+            end_exclusive_utc,
+            as_of_utc,
+            source,
+            reason_code,
+            data_state: data_state.to_string(),
+            recommended_next_action,
+            rows: rows
+                .into_iter()
+                .map(|row| AttributionRowItem {
+                    market_id: row.market_id,
+                    alpha_id: row.alpha_id,
+                    period: row.period,
+                    period_start_utc: row.period_start_utc,
+                    period_end_utc: row.period_end_utc,
+                    realized_pnl_usd: row.realized_pnl_usd,
+                    unrealized_pnl_usd: row.unrealized_pnl_usd,
+                    gross_pnl_usd: row.gross_pnl_usd,
+                    net_pnl_usd: row.net_pnl_usd,
+                    fees_usd: row.costs.fees_usd,
+                    rebates_usd: row.costs.rebates_usd,
+                    incentives_usd: row.costs.incentives_usd,
+                    net_cost_impact_usd: row.costs.net_cost_impact_usd,
+                    as_of_utc: row.as_of_utc,
+                    source: row.source,
+                    reason_code: row.reason_code,
+                    correlation_id: row.correlation_id,
+                    snapshot_id: row.snapshot_id,
+                    run_id: row.run_id,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn attribution_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<AttributionValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    (
+        attribution_service_error_status(error_code),
+        axum::Json(AttributionServiceErrorResponse {
+            error_code,
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| AttributionFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn attribution_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == AttributionReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == AttributionReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
+        code if code == AttributionReasonCode::ProjectionUnavailable.code()
+            || code == AttributionReasonCode::StaleSource.code()
+            || code == AttributionReasonCode::PersistenceUnavailable.code()
+            || code == "attribution_query_failed"
+            || code == "attribution_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        "attribution_constraint_violation" => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn emergency_control_action_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -2844,6 +3387,20 @@ pub struct PendingRebalanceRecommendationsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AttributionQuery {
+    #[serde(default)]
+    pub market_id: Option<String>,
+    #[serde(default)]
+    pub alpha_id: Option<String>,
+    #[serde(default)]
+    pub period: Option<String>,
+    #[serde(default)]
+    pub as_of_utc: Option<String>,
+    #[serde(default)]
+    pub dependency_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RebalanceExecutionPayload {
     #[serde(default)]
     pub executed_at_utc: Option<String>,
@@ -3096,6 +3653,71 @@ pub struct PendingRebalanceRecommendationItem {
     pub updated_at_utc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttributionQueryResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub period: String,
+    pub start_inclusive_utc: String,
+    pub end_exclusive_utc: String,
+    pub as_of_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub data_state: String,
+    pub recommended_next_action: String,
+    pub rows: Vec<AttributionRowItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttributionRowItem {
+    pub market_id: String,
+    pub alpha_id: String,
+    pub period: String,
+    pub period_start_utc: String,
+    pub period_end_utc: String,
+    pub realized_pnl_usd: f64,
+    pub unrealized_pnl_usd: f64,
+    pub gross_pnl_usd: f64,
+    pub net_pnl_usd: f64,
+    pub fees_usd: f64,
+    pub rebates_usd: f64,
+    pub incentives_usd: f64,
+    pub net_cost_impact_usd: f64,
+    pub as_of_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttributionServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<AttributionFieldError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttributionFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -6700,6 +7322,204 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "rebalance_persistence_unavailable");
         assert_eq!(payload["action"], "rebalance_recommendation_evaluate");
+    }
+
+    #[tokio::test]
+    async fn attribution_route_returns_cost_aware_rows_with_traceable_metadata() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/portfolio/attribution?period=24h")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-attribution-route-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action"], "attribution_query");
+        assert_eq!(payload["period"], "24h");
+        assert_eq!(payload["data_state"], "ready");
+        assert_eq!(payload["rows"][0]["market_id"], "market-btc-election");
+        assert!(payload["rows"][0]["as_of_utc"].is_string());
+        assert_eq!(payload["rows"][0]["source"], "reconciliation.exposure.v1");
+        assert_eq!(payload["rows"][0]["reason_code"], "attribution_ready");
+        assert_eq!(payload["rows"][0]["correlation_id"], "corr-attribution-route-001");
+    }
+
+    #[tokio::test]
+    async fn attribution_route_keeps_response_timestamp_server_generated() {
+        let requested_as_of = "2026-03-01T00:00:00Z";
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/portfolio/attribution?period=24h&as_of_utc=2026-03-01T00:00:00Z")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-attribution-route-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["as_of_utc"], requested_as_of);
+        assert_ne!(payload["timestamp_utc"], requested_as_of);
+    }
+
+    #[tokio::test]
+    async fn attribution_route_returns_actionable_empty_state_for_zero_activity_windows() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/portfolio/attribution?period=1h&market_id=market-no-activity")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-attribution-empty-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["data_state"], "empty");
+        assert_eq!(payload["reason_code"], "attribution_empty_window");
+        assert!(payload["rows"].as_array().expect("rows should be array").is_empty());
+        assert!(
+            payload["recommended_next_action"]
+                .as_str()
+                .expect("recommended action should be string")
+                .contains("Expand to a wider period")
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_route_rejects_unsupported_period_filter() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/portfolio/attribution?period=7d")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-attribution-invalid-period-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error_code"], "attribution_invalid_payload");
+        assert_eq!(payload["action"], "attribution_query");
+        assert_eq!(payload["field_errors"][0]["field"], "period");
+    }
+
+    #[tokio::test]
+    async fn attribution_route_surfaces_projection_unavailable_machine_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/portfolio/attribution?period=24h&dependency_state=projection_unavailable",
+                    )
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-attribution-projection-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error_code"], "attribution_projection_unavailable");
+        assert_eq!(payload["action"], "attribution_query");
+    }
+
+    #[tokio::test]
+    async fn attribution_route_returns_attribution_unauthorized_for_denied_reads() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/portfolio/attribution?period=24h")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-attribution-denied-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error_code"], "attribution_unauthorized");
+        assert_eq!(payload["action"], "attribution_query");
     }
 
     #[tokio::test]

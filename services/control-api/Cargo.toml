@@ -15,6 +15,7 @@ time.workspace = true
 common = { path = "../../crates/common" }
 domain = { path = "../../crates/domain" }
 governance-service = { path = "../governance-service" }
+persistence = { path = "../../crates/persistence" }
 
 [dev-dependencies]
 tower = "0.5.2"

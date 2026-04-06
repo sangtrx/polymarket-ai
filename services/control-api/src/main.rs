@@ -39,8 +39,9 @@ async fn main() {
         Arc::new(AllocationPolicyService::postgres(pool.clone())),
         Arc::new(MarketPolicyService::postgres(pool.clone())),
         Arc::new(RiskLimitService::postgres(pool.clone())),
-        Arc::new(SafetyControlService::postgres(pool)),
-    );
+        Arc::new(SafetyControlService::postgres(pool.clone())),
+    )
+    .with_attribution_pool(pool);
     let _app: Router = routes::app_router(state);
     println!("control-api bootstrap ready at {}", timestamp_utc());
 }

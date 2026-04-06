@@ -152,3 +152,46 @@
 - `npm run web:build` ✅
 - `node --test tests/story-3-3/*.test.mjs tests/api/story-3-3*.test.mjs tests/e2e/story-3-3*.test.mjs` ✅
 - `npm run --silent qa:test:story-3-3` ✅
+
+---
+
+## Story
+
+- 3-4-build-cost-aware-pnl-and-attribution-surfaces
+
+## Generated Tests
+
+### Domain, Persistence, Runtime, and Control API
+
+- [x] `crates/domain/src/attribution.rs` — canonical period parsing (`1h/24h/30d`), start-inclusive/end-exclusive scope boundaries, deterministic row ordering, zero-activity empty-window semantics, and reason-code validation.
+- [x] `crates/persistence/src/postgres/attribution_snapshots.rs` — migration scope checks (`attribution_snapshots` only), finite numeric guardrails, reason-code constraints, and deterministic latest-by-scope ordering.
+- [x] `services/portfolio-engine/src/attribution/mod.rs` — attribution read-model seam behavior for ready/empty states, stale-source fail-closed signaling, and boundary-safe aggregation.
+- [x] `services/control-api/src/routes/mod.rs` — authenticated attribution query route coverage for accepted metadata-rich payloads, actionable empty windows, invalid-period validation, and projection-unavailable machine errors.
+
+### Operator Console and Story-Scoped QA
+
+- [x] `tests/story-3-4/pnl-attribution.story-3-4.test.mjs` — metadata-first card/table composition, explicit UI state-machine contracts, and Story 3.3 portfolio surface continuity checks.
+- [x] `tests/api/story-3-4-attribution-api.test.mjs` — typed attribution client endpoint/query contract checks, invalid-period preflight rejection, unauthorized/dependency machine-readable error propagation, canonical query evidence handling, and malformed payload mismatch handling.
+- [x] `tests/e2e/story-3-4-attribution-dashboard.e2e.test.mjs` — dashboard non-regression with Story 3.2/3.3 shells plus attribution style/state integration, canonical period boundary labels, and critical dependency-escalation guidance contracts.
+
+## Coverage
+
+- Story 3.4 attribution contracts covered across domain, persistence, portfolio runtime seam, control-api ingress, operator-console composition, and story-scoped QA automation:
+  - cost-aware decomposition fields (realized/unrealized + fees/rebates/incentives + net-cost impact),
+  - deterministic temporal/filter semantics (`start_inclusive`, `end_exclusive`, canonical periods),
+  - metadata-first evidence rendering (`as_of_utc`, `source`, `reason_code`, `correlation_id`, `snapshot_id`, `run_id`),
+  - explicit skeleton/empty/error/critical UI contracts with actionable next-step guidance,
+  - machine-readable failure handling for invalid filters and unavailable/stale dependencies.
+- Automated Story 3.4 regression inventory in this QA pass: **37 tests passing** (`rust targeted: 22`, `story/api/e2e node tests: 15`).
+
+## Execution Result
+
+- `cargo test -p domain attribution::tests::` ✅
+- `cargo test -p persistence postgres::attribution_snapshots::tests::` ✅
+- `cargo test -p portfolio-engine attribution::tests::` ✅
+- `cargo test -p control-api routes::tests::attribution_` ✅
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-4/*.test.mjs tests/api/story-3-4*.test.mjs tests/e2e/story-3-4*.test.mjs` ✅
+- `npm run --silent qa:test:story-3-4` ✅

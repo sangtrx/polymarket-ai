@@ -20,6 +20,7 @@ use governance_service::risk_limits::{RiskLimitOrchestrator, RiskLimitService};
 use governance_service::safety_controls::{SafetyControlOrchestrator, SafetyControlService};
 use serde::Serialize;
 use serde_json::json;
+use sqlx::PgPool;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -218,6 +219,7 @@ pub struct ControlApiState {
     pub market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
     pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
+    pub attribution_pool: Option<PgPool>,
 }
 
 impl ControlApiState {
@@ -292,7 +294,13 @@ impl ControlApiState {
             market_policy_orchestrator,
             risk_limit_orchestrator,
             safety_control_orchestrator,
+            attribution_pool: None,
         }
+    }
+
+    pub fn with_attribution_pool(mut self, attribution_pool: PgPool) -> Self {
+        self.attribution_pool = Some(attribution_pool);
+        self
     }
 }
 
