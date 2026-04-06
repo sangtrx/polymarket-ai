@@ -8,4 +8,5 @@ pub mod order;
 pub mod reconciliation;
 pub mod recovery;
 pub mod recovery_rehearsal;
+pub mod reporting;
 pub mod risk;

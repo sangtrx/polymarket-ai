@@ -502,3 +502,27 @@
 - `npm run --silent qa:test:story-3-9` ✅
 - `npm run --silent bootstrap:test` ✅
 - `node --test tests/story-*/*.test.mjs` ✅
+
+---
+
+## Story 4.1 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/reporting.rs` (`reporting::tests::`) — validates reporting reason-code taxonomy, deterministic identifier/timestamp normalization, canonical boundary checks (`start_inclusive_utc`/`end_exclusive_utc`), malformed identifier/non-UTC filter rejection, authorization guard behavior, and deterministic ordering contracts for trade and risk-event read rows.
+- [x] `crates/persistence/src/postgres/reporting_read_models.rs` (`postgres::reporting_read_models::tests::`) — validates Story 4.1 migration scope boundaries, deterministic SQL ordering clauses, query-limit/boundary validation, malformed identifier/non-UTC filter rejection, and canonical payload acceptance for trade/position/risk/performance adapter outputs.
+- [x] `services/reporting-service/src/read_models/queries.rs` (`read_models::queries::tests::`) — validates orchestration fail-closed semantics for unauthorized roles, dependency-unavailable/stale conditions, malformed request-filter rejection, evidence metadata/timestamp validation, deterministic response shaping, correlation fallback behavior, and Story 4.2 handoff-ready response envelopes.
+
+### Coverage
+
+- Story 4.1 normalized read-model contracts now have automated coverage across domain, persistence, and reporting-service seams:
+  - machine-readable error taxonomy and validation issue mapping (`reporting_invalid_payload`, `reporting_unauthorized`, `reporting_dependency_unavailable`, `reporting_stale_dependency`, `reporting_evidence_unavailable`);
+  - deterministic ordering tie-break guarantees for all normalized datasets (trade/position/risk_event/performance);
+  - strict bounded query behavior (`limit` range, inclusive/exclusive UTC windows, canonical filter normalization);
+  - fail-closed orchestration when evidence metadata cannot be produced.
+- Automated Story 4.1 regression inventory in this QA refresh: **29 Story-4.1 Rust tests passing** (`domain: 10`, `persistence: 7`, `reporting-service: 12`).
+
+### Execution Result
+
+- `npm run --silent qa:test:story-4-1` ✅
+- `npm test` ✅

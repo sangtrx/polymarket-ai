@@ -13,6 +13,7 @@ pub mod pretrade_gate;
 pub mod rbac;
 pub mod reconciliation;
 pub mod recovery_gate_runs;
+pub mod reporting_read_models;
 pub mod restore_rehearsals;
 pub mod risk_limits;
 pub mod safety_controls;

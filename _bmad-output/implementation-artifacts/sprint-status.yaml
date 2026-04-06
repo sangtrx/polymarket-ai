@@ -1,5 +1,5 @@
 # generated: 2026-04-04T17:40:16Z
-# last_updated: 2026-04-07T02:01:54Z
+# last_updated: 2026-04-07T03:08:26Z
 # project: polymarket-ai
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-04T17:40:16Z
-last_updated: 2026-04-07T02:01:54Z
+last_updated: 2026-04-07T03:08:26Z
 project: polymarket-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -72,8 +72,8 @@ development_status:
   3-8-add-backup-integrity-validation-and-deterministic-restore-rehearsal: done
   3-9-enforce-accessibility-and-reduced-motion-standards-in-critical-flows: done
   epic-3-retrospective: optional
-  epic-4: backlog
-  4-1-define-normalized-reporting-read-models: backlog
+  epic-4: in-progress
+  4-1-define-normalized-reporting-read-models: done
   4-2-build-versioned-read-only-api-contracts: backlog
   4-3-implement-recurring-summary-report-scheduling: backlog
   4-4-deliver-weekly-on-demand-and-incident-export-workflows: backlog
