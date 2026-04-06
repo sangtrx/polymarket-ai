@@ -1,6 +1,6 @@
 import type { ShellFreshnessSnapshot } from "@/lib/shell/read-models";
 
-export function GovernanceQueueCard({
+export function PortfolioSummaryCard({
   freshness,
 }: {
   freshness: ShellFreshnessSnapshot;
@@ -8,26 +8,25 @@ export function GovernanceQueueCard({
   return (
     <article className="shell-panel shell-panel-grid-item">
       <div className="shell-panel-header">
-        <p className="type-eyebrow">Governance</p>
-        <span className="shell-status-pill" data-tone="locked-safe">
-          locked-safe
+        <p className="type-eyebrow">Portfolio</p>
+        <span className="shell-status-pill" data-tone="normal">
+          normal
         </span>
       </div>
 
-      <h2 className="type-heading-m">Approval queue shell slot</h2>
+      <h2 className="type-heading-m">Portfolio summary shell slot</h2>
       <p className="type-body text-muted">
-        Read-only shell placeholder for policy-gated privileged action
-        requests.
+        Read-only portfolio aggregate for allocation and exposure orientation.
       </p>
 
       <dl className="shell-metric-grid">
         <div>
-          <dt className="type-metadata">Pending approvals</dt>
-          <dd className="type-mono">4</dd>
+          <dt className="type-metadata">Market value</dt>
+          <dd className="type-mono">$2.48M</dd>
         </div>
         <div>
-          <dt className="type-metadata">Oldest request age</dt>
-          <dd className="type-mono">00:12:18</dd>
+          <dt className="type-metadata">Available allocation</dt>
+          <dd className="type-mono">17.6%</dd>
         </div>
       </dl>
 

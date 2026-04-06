@@ -1,11 +1,90 @@
-export default function GovernancePage() {
+import { GovernanceQueueCard } from "@/components/governance/GovernanceQueueCard";
+import { InPageTabs } from "@/components/shell/InPageTabs";
+import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
+import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
+import {
+  type ShellSearchParams,
+  resolveShellReadModel,
+} from "@/lib/shell/read-models";
+
+interface GovernancePageProps {
+  searchParams?: Promise<ShellSearchParams>;
+}
+
+export default async function GovernancePage({
+  searchParams,
+}: GovernancePageProps) {
+  const resolvedSearchParams = (await searchParams) ?? {};
+  const stateModel = resolveShellReadModel(
+    resolvedSearchParams,
+    "governance.read-model.shell",
+  );
+
+  const tabViews = [
+    {
+      id: "approvals",
+      label: "Approvals",
+      content: (
+        <section className="shell-panel-grid">
+          <GovernanceQueueCard freshness={stateModel.freshness} />
+          <article className="shell-panel shell-panel-grid-item">
+            <p className="type-eyebrow">Control boundary</p>
+            <h2 className="type-heading-m">No mutation actions in Story 3.1</h2>
+            <p className="type-body text-muted">
+              Governance surfaces stay non-destructive in this story. Persistent
+              safety rail interactions are explicitly deferred to Story 3.2.
+            </p>
+          </article>
+        </section>
+      ),
+    },
+    {
+      id: "audit",
+      label: "Audit readiness",
+      content: (
+        <article className="shell-panel">
+          <p className="type-eyebrow">Audit traceability</p>
+          <h2 className="type-heading-m">Canonical shell evidence</h2>
+          <p className="type-body text-muted">
+            Governance shell views expose ISO-8601 UTC freshness evidence and
+            explicit fallback state messaging for review and incident QA.
+          </p>
+          <dl className="shell-state-evidence">
+            <div>
+              <dt className="type-metadata text-muted">Last update</dt>
+              <dd className="type-mono">
+                <time dateTime={stateModel.freshness.lastUpdatedIso}>
+                  {stateModel.freshness.lastUpdatedIso}
+                </time>
+              </dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Source</dt>
+              <dd className="type-mono">{stateModel.freshness.source}</dd>
+            </div>
+          </dl>
+        </article>
+      ),
+    },
+  ] as const;
+
   return (
-    <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-4 px-6 py-8">
-      <p className="eyebrow">Governance</p>
-      <h1 className="text-3xl font-semibold">Approval and audit control plane</h1>
-      <p className="muted">
-        Story 1.1 scaffold route for dual-approval actions and immutable audit review.
-      </p>
-    </main>
+    <OperatorShellLayout
+      activeRoute="governance"
+      description="Approval and audit shell views with explicit non-destructive fallback states."
+      freshness={stateModel.freshness}
+      p95TargetMs={stateModel.p95TargetMs}
+      title="Governance control plane"
+    >
+      {stateModel.dataState === "ready" ? (
+        <InPageTabs
+          ariaLabel="Governance workflow views"
+          queryKey="view"
+          tabs={tabViews}
+        />
+      ) : (
+        <ShellStatePanel stateModel={stateModel} />
+      )}
+    </OperatorShellLayout>
   );
 }
