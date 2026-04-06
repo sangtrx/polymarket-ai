@@ -1,4 +1,5 @@
 pub mod allocation_policies;
+pub mod api_contract_versions;
 pub mod approvals;
 pub mod attribution_snapshots;
 pub mod audit;

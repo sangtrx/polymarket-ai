@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reporting Risk Events API Contract v1",
+  "type": "object",
+  "required": ["data", "meta", "error"],
+  "properties": {
+    "data": {
+      "type": ["object", "null"],
+      "required": ["rows"],
+      "properties": {
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "report_row_id",
+              "event_type",
+              "severity",
+              "outcome",
+              "event_at_utc",
+              "evidence"
+            ],
+            "properties": {
+              "report_row_id": { "type": "string" },
+              "event_type": { "type": "string" },
+              "severity": { "type": "string" },
+              "outcome": { "type": "string" },
+              "market_id": { "type": ["string", "null"] },
+              "event_at_utc": { "type": "string", "format": "date-time" },
+              "evidence": { "$ref": "#/$defs/evidence" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "meta": { "$ref": "#/$defs/meta" },
+    "error": { "$ref": "#/$defs/error" }
+  },
+  "$defs": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "dataset",
+        "contract_key",
+        "contract_version",
+        "as_of_utc",
+        "source",
+        "reason_code",
+        "correlation_id",
+        "timestamp_utc"
+      ],
+      "properties": {
+        "dataset": { "type": "string" },
+        "contract_key": { "type": "string" },
+        "contract_version": { "type": "string" },
+        "as_of_utc": { "type": "string", "format": "date-time" },
+        "source": { "type": "string" },
+        "reason_code": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "timestamp_utc": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": true
+    },
+    "error": {
+      "type": ["object", "null"],
+      "required": ["code", "message", "field_errors"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "field_errors": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": true
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["as_of_utc", "source", "reason_code", "correlation_id"],
+      "properties": {
+        "as_of_utc": { "type": "string", "format": "date-time" },
+        "source": { "type": "string" },
+        "reason_code": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "run_id": { "type": ["string", "null"] },
+        "snapshot_id": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

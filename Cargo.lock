@@ -3377,11 +3377,17 @@ dependencies = [
 name = "reporting-service"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "common",
  "domain",
  "persistence",
+ "serde",
+ "serde_json",
+ "sha2",
  "sqlx",
+ "time",
  "tokio",
+ "tower",
 ]
 
 [[package]]

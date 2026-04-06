@@ -526,3 +526,30 @@
 
 - `npm run --silent qa:test:story-4-1` ✅
 - `npm test` ✅
+
+---
+
+## Story 4.2 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `services/reporting-service/src/contracts/artifacts.rs` (`contracts::artifacts::tests::`) — validates FR37 dataset contract registry completeness (trades/positions/risk-events/performance/alpha-attribution), schema/changelog JSON parseability, deterministic checksum generation, and required envelope metadata fields (`data/meta/error`, `contract_version`, `reason_code`, `correlation_id`).
+- [x] `services/reporting-service/src/contracts/lifecycle.rs` (`contracts::lifecycle::tests::`) — validates typed contract lifecycle policy enforcement for NFR13 deprecation/support windows, replacement-support boundary checks, and active-status consistency constraints.
+- [x] `crates/persistence/src/postgres/api_contract_versions.rs` (`postgres::api_contract_versions::tests::`) — validates migration scope boundaries (`api_contract_versions` only), lifecycle/index/checksum constraints, active-version fallback SQL semantics, and persistence-level lifecycle/checksum validation behavior.
+- [x] `services/reporting-service/src/api.rs` (`api::tests::`) — validates versioned reporting route behavior for success/empty datasets, explicit `contract_version` override forwarding vs active-version fallback resolution, invalid query-window rejection, unauthorized failures, dependency-unavailable and stale-contract fail-closed responses, plus schema/changelog artifact discoverability and runtime envelope/schema synchronization checks.
+- [x] `tests/contract/story-4-2-reporting-contract-artifacts.test.mjs` — validates contract-level artifact publication/discoverability for all Story 4.2 dataset schemas and changelog metadata in repository-level contract tests.
+
+### Coverage
+
+- Story 4.2 now has deterministic automated coverage for:
+  - `api_contract_versions` lifecycle persistence scope and NFR13 governance windows (90-day notice / 180-day support after replacement),
+  - contract-version resolution precedence (`contract_version` override, active fallback),
+  - read-only versioned reporting route semantics across all required failure classes (invalid payload, unauthorized, dependency unavailable, stale metadata),
+  - machine-readable schema/changelog artifact publication and checksum/path parity validation,
+  - canonical contract envelope guarantees (`data`, `meta`, `error`) with traceability fields (`as_of_utc`, `source`, `reason_code`, `correlation_id`, `contract_version`).
+- Automated Story 4.2 regression inventory in this QA refresh: **27 Story-4.2 tests passing** (`contracts: 7`, `persistence: 6`, `reporting API routes: 11`, `contract artifact tests: 3`).
+
+### Execution Result
+
+- `npm run --silent qa:test:story-4-2` ✅
+- `npm test` ✅

@@ -36,6 +36,7 @@
     "qa:test:story-3-8": "cargo test -p domain recovery_rehearsal::tests:: && cargo test -p persistence postgres::restore_rehearsals::tests:: && cargo test -p governance-service recovery::tests:: && cargo test -p control-api routes::tests::recovery_ && cargo test -p risk-engine tests::approved_recovery_run_requires_valid_resume_verification && npm run web:lint && npm run web:typecheck && npm run web:build && node --test tests/story-3-8/*.test.mjs tests/api/story-3-8*.test.mjs tests/e2e/story-3-8*.test.mjs",
     "qa:test:story-3-9": "npm run web:lint && npm run web:typecheck && npm run web:build && node --test tests/story-3-9/*.test.mjs tests/api/story-3-9*.test.mjs tests/e2e/story-3-9*.test.mjs",
     "qa:test:story-4-1": "cargo test -p domain reporting::tests:: && cargo test -p persistence postgres::reporting_read_models::tests:: && cargo test -p reporting-service read_models::queries::tests::",
+    "qa:test:story-4-2": "cargo test -p reporting-service contracts::artifacts::tests:: && cargo test -p reporting-service contracts::lifecycle::tests:: && cargo test -p persistence postgres::api_contract_versions::tests:: && cargo test -p reporting-service api::tests:: && node --test tests/contract/story-4-2*.test.mjs",
     "rust:fmt": "cargo fmt --all -- --check",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace --all-targets",

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reporting Alpha Attribution API Contract v1",
+  "type": "object",
+  "required": ["data", "meta", "error"],
+  "properties": {
+    "data": {
+      "type": ["object", "null"],
+      "required": ["rows"],
+      "properties": {
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "report_row_id",
+              "market_id",
+              "alpha_id",
+              "period_scope",
+              "period_start_utc",
+              "period_end_utc",
+              "realized_pnl_usd",
+              "unrealized_pnl_usd",
+              "gross_pnl_usd",
+              "net_pnl_usd",
+              "fees_usd",
+              "rebates_usd",
+              "incentives_usd",
+              "evidence"
+            ],
+            "properties": {
+              "report_row_id": { "type": "string" },
+              "market_id": { "type": "string" },
+              "alpha_id": { "type": "string" },
+              "period_scope": { "type": "string" },
+              "period_start_utc": { "type": "string", "format": "date-time" },
+              "period_end_utc": { "type": "string", "format": "date-time" },
+              "realized_pnl_usd": { "type": "number" },
+              "unrealized_pnl_usd": { "type": "number" },
+              "gross_pnl_usd": { "type": "number" },
+              "net_pnl_usd": { "type": "number" },
+              "fees_usd": { "type": "number" },
+              "rebates_usd": { "type": "number" },
+              "incentives_usd": { "type": "number" },
+              "evidence": { "$ref": "#/$defs/evidence" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "meta": { "$ref": "#/$defs/meta" },
+    "error": { "$ref": "#/$defs/error" }
+  },
+  "$defs": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "dataset",
+        "contract_key",
+        "contract_version",
+        "as_of_utc",
+        "source",
+        "reason_code",
+        "correlation_id",
+        "timestamp_utc"
+      ],
+      "properties": {
+        "dataset": { "type": "string" },
+        "contract_key": { "type": "string" },
+        "contract_version": { "type": "string" },
+        "as_of_utc": { "type": "string", "format": "date-time" },
+        "source": { "type": "string" },
+        "reason_code": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "timestamp_utc": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": true
+    },
+    "error": {
+      "type": ["object", "null"],
+      "required": ["code", "message", "field_errors"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "field_errors": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": true
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["as_of_utc", "source", "reason_code", "correlation_id"],
+      "properties": {
+        "as_of_utc": { "type": "string", "format": "date-time" },
+        "source": { "type": "string" },
+        "reason_code": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "run_id": { "type": ["string", "null"] },
+        "snapshot_id": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

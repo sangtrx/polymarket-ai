@@ -1,1 +1,2 @@
-// Reporting contracts begin in Story 4.2.
+pub mod artifacts;
+pub mod lifecycle;

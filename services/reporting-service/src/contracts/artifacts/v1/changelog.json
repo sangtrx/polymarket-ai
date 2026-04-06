@@ -1,0 +1,40 @@
+{
+  "contract_version": "v1",
+  "released_at_utc": "2026-04-07T03:30:11Z",
+  "support_policy": {
+    "minimum_deprecation_notice_days": 90,
+    "minimum_backward_compatibility_days_after_replacement": 180
+  },
+  "entries": [
+    {
+      "dataset": "trades",
+      "change_type": "initial_release",
+      "description": "Initial read-only trades contract aligned to Story 4.1 normalized read models."
+    },
+    {
+      "dataset": "positions",
+      "change_type": "initial_release",
+      "description": "Initial read-only positions contract with deterministic ordering and evidence metadata."
+    },
+    {
+      "dataset": "risk-events",
+      "change_type": "initial_release",
+      "description": "Initial read-only risk-events contract with explicit machine-readable severity/outcome semantics."
+    },
+    {
+      "dataset": "performance",
+      "change_type": "initial_release",
+      "description": "Initial read-only performance contract exposing normalized PnL/cost evidence fields."
+    },
+    {
+      "dataset": "alpha-attribution",
+      "change_type": "initial_release",
+      "description": "Initial read-only alpha-attribution contract reusing performance/attribution lineage from Stories 3.4 and 4.1."
+    }
+  ],
+  "non_goals": [
+    "No report scheduling orchestration in Story 4.2.",
+    "No export workflow orchestration in Story 4.2.",
+    "No public lifecycle mutation endpoints in reporting-service."
+  ]
+}

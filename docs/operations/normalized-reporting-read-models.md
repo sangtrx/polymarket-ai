@@ -108,6 +108,65 @@ Story 4.1 exposes normalized internal read-model contracts for future API consum
 
 Story 4.2 should consume these internal contracts directly without reshaping core records.
 
+## Story 4.2 contract publication and governance operations
+
+Story 4.2 introduces versioned read-only reporting contracts backed by
+`api_contract_versions` and machine-readable schema/changelog artifacts.
+
+### Supported dataset contract keys (v1)
+
+1. `reporting.trades`
+2. `reporting.positions`
+3. `reporting.risk-events`
+4. `reporting.performance`
+5. `reporting.alpha-attribution`
+
+### Contract publication workflow (internal/governed only)
+
+1. Build/refresh versioned schema + changelog artifacts under
+   `services/reporting-service/src/contracts/artifacts/v1/`.
+2. Compute artifact checksums and immutable `record_checksum_sha256` from:
+   `contract_key|contract_version|schema_checksum_sha256|changelog_checksum_sha256`.
+3. Upsert lifecycle metadata into `api_contract_versions` through internal service/persistence
+   flows only (no public mutation endpoints in reporting-service).
+4. Mark exactly one active contract per dataset key (`is_active=true` unique per `contract_key`).
+5. Validate artifact path/checksum parity before exposing contract reads.
+
+### Deprecation and replacement governance (NFR13)
+
+1. `deprecation_notice_at_utc` must be at least `+90 days` from `release_at_utc`.
+2. If `replacement_contract_version` is set, the contract must preserve
+   backward compatibility for at least `+180 days` after replacement release.
+3. Do not sunset a contract before `backward_compatible_until_utc`.
+4. Any lifecycle metadata that violates these constraints is treated as stale and requests fail closed.
+
+### Artifact discovery surfaces
+
+1. `GET /api/v1/reporting/contracts/{dataset}/versions`
+2. `GET /api/v1/reporting/contracts/{dataset}/versions/{contract_version}`
+3. `GET /api/v1/reporting/contracts/{dataset}/versions/{contract_version}/schema`
+4. `GET /api/v1/reporting/contracts/{dataset}/versions/{contract_version}/changelog`
+
+All routes require read-only analytics authorization and return canonical
+`data/meta/error` envelopes with machine-readable failure codes.
+
+### Incident handling: artifact metadata mismatch
+
+If contract routes emit `reporting_stale_dependency` or
+`reporting_dependency_unavailable` due to path/checksum mismatch:
+
+1. Freeze contract promotion (do not activate newer metadata rows).
+2. Compare persisted `schema_artifact_path`/`changelog_artifact_path` and checksums against
+   in-repo artifacts under `services/reporting-service/src/contracts/artifacts/`.
+3. Recompute and republish internal contract metadata checksums.
+4. Re-run Story 4.2 QA (`npm run --silent qa:test:story-4-2`) before re-enabling traffic.
+
+### Explicit Story 4.2 non-goals
+
+1. no recurring summary scheduling orchestration (Story 4.3 scope),
+2. no export job/workflow orchestration (Story 4.4 scope),
+3. no control-plane mutation behavior or public lifecycle mutation endpoints in reporting-service.
+
 ## Explicit non-goals for Story 4.1
 
 1. no endpoint version negotiation
