@@ -5,6 +5,7 @@ import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
+import { getOperatorConsoleEnv } from "@/lib/env";
 import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
   type ShellSearchParams,
@@ -21,6 +22,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     resolvedSearchParams,
     "dashboard.read-model.shell",
   );
+  const { apiBaseUrl } = getOperatorConsoleEnv();
   const riskPosture = resolveRiskPostureViewModel(resolvedSearchParams, stateModel);
 
   const tabViews = [
@@ -32,7 +34,10 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
           <PortfolioSummaryCard freshness={stateModel.freshness} />
           <ExecutionSummaryCard freshness={stateModel.freshness} />
           <GovernanceQueueCard freshness={stateModel.freshness} />
-          <IncidentTimelineCard freshness={stateModel.freshness} />
+          <IncidentTimelineCard
+            baseUrl={apiBaseUrl}
+            freshness={stateModel.freshness}
+          />
         </section>
       ),
     },

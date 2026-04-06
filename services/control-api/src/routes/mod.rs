@@ -23,6 +23,10 @@ use domain::governance::{
     CredentialRotationEvidence, CredentialRotationReasonCode, PrivilegedAuditOutcome,
     PrivilegedAuditRecord,
 };
+use domain::incidents::{
+    IncidentQueryFilters, IncidentReasonCode, IncidentTimelineEvent, IncidentTimelineStage,
+    IncidentValidationIssue, apply_incident_query, build_incident_query_filters,
+};
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
     MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue,
@@ -47,8 +51,10 @@ use governance_service::risk_limits::{
 };
 use governance_service::safety_controls::ExecuteManualSafetyControlInput;
 use persistence::postgres::attribution_snapshots::load_latest_attribution_snapshots;
+use persistence::postgres::incident_query_views::load_incident_forensics_timeline;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::Instant;
 use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 pub fn app_router(state: ControlApiState) -> Router {
@@ -138,6 +144,12 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let incident_forensics_routes = Router::new()
+        .route("/control/incidents/forensics", get(read_incident_forensics))
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
     let emergency_control_routes = Router::new()
         .route("/control/emergency/pause", post(trigger_emergency_pause))
         .route(
@@ -166,6 +178,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(risk_limit_routes)
         .merge(allocation_policy_routes)
         .merge(attribution_routes)
+        .merge(incident_forensics_routes)
         .merge(emergency_control_routes)
         .with_state(state)
 }
@@ -1102,6 +1115,127 @@ pub async fn read_portfolio_attribution(
     )
 }
 
+pub async fn read_incident_forensics(
+    State(state): State<ControlApiState>,
+    Query(query): Query<IncidentForensicsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/incidents/forensics".to_string();
+    let authorization = match authorize_incident_forensics_read(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let started_at = Instant::now();
+
+    let filters = match build_incident_query_filters(
+        query.market_id.as_deref(),
+        query.order_id.as_deref(),
+        query.alpha_id.as_deref(),
+        query.actor_id.as_deref(),
+        query.start_ts.as_deref(),
+        query.end_ts.as_deref(),
+        &authorization.timestamp_utc,
+    ) {
+        Ok(filters) => filters,
+        Err(error) => {
+            return incident_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    let dependency_state = match parse_incident_dependency_state(query.dependency_state.as_deref()) {
+        Ok(state) => state,
+        Err(error) => {
+            return incident_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+    match dependency_state {
+        IncidentDependencyState::DependencyUnavailable => {
+            return incident_service_error_response(
+                IncidentReasonCode::DependencyUnavailable.code(),
+                "incident forensics dependencies are unavailable".to_string(),
+                Vec::new(),
+                "incident_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::StaleEvidence => {
+            return incident_service_error_response(
+                IncidentReasonCode::StaleEvidence.code(),
+                "incident evidence is stale for forensics query".to_string(),
+                Vec::new(),
+                "incident_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::Healthy => {}
+    }
+
+    let events = if let Some(pool) = state.attribution_pool.as_ref() {
+        match load_incident_forensics_timeline(pool, &filters).await {
+            Ok(events) => events,
+            Err(error) => {
+                return incident_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "incident_query",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+    } else {
+        let synthetic = synthetic_incident_timeline(&authorization.timestamp_utc, &actor.correlation_id);
+        match apply_incident_query(&synthetic, &filters) {
+            Ok(events) => events,
+            Err(error) => {
+                return incident_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "incident_query",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+    };
+
+    let query_latency_ms = i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+    incident_forensics_query_response(
+        &state,
+        &actor,
+        filters,
+        events,
+        query_latency_ms,
+        authorization.timestamp_utc.clone(),
+        endpoint,
+    )
+}
+
 pub async fn execute_rebalance_recommendation(
     State(state): State<ControlApiState>,
     Path(recommendation_id): Path<String>,
@@ -1457,6 +1591,54 @@ fn authorize_attribution_read(
         machine_error.message,
         Vec::new(),
         "attribution_query",
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
+}
+
+fn authorize_incident_forensics_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ExecuteControlPlaneAction);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(incident_service_error_response(
+        IncidentReasonCode::Unauthorized.code(),
+        machine_error.message,
+        Vec::new(),
+        "incident_query",
         actor,
         decision.timestamp_utc,
         endpoint.to_string(),
@@ -2647,6 +2829,155 @@ fn parse_attribution_dependency_state(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncidentDependencyState {
+    Healthy,
+    DependencyUnavailable,
+    StaleEvidence,
+}
+
+fn parse_incident_dependency_state(
+    value: Option<&str>,
+) -> Result<IncidentDependencyState, domain::incidents::IncidentContractError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("healthy") => Ok(IncidentDependencyState::Healthy),
+        Some("dependency_unavailable") => Ok(IncidentDependencyState::DependencyUnavailable),
+        Some("stale_evidence") => Ok(IncidentDependencyState::StaleEvidence),
+        Some(other) => Err(domain::incidents::IncidentContractError::invalid_payload_with_issues(
+            format!(
+                "dependency_state `{other}` is not supported; expected healthy, dependency_unavailable, or stale_evidence"
+            ),
+            vec![IncidentValidationIssue {
+                field: "dependency_state",
+                code: IncidentReasonCode::InvalidPayload.code(),
+                message: "dependency_state must be healthy, dependency_unavailable, or stale_evidence".to_string(),
+            }],
+        )),
+    }
+}
+
+fn synthetic_incident_timeline(as_of_utc: &str, correlation_id: &str) -> Vec<IncidentTimelineEvent> {
+    let as_of = OffsetDateTime::parse(as_of_utc, &Rfc3339)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .to_offset(UtcOffset::UTC);
+    let signal_at = (as_of - Duration::minutes(4))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+    let order_at = (as_of - Duration::minutes(3))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+    let fill_at = (as_of - Duration::minutes(2))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+    let pnl_at = (as_of - Duration::minutes(1))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+    let risk_at = (as_of - Duration::seconds(30))
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting must succeed");
+
+    vec![
+        IncidentTimelineEvent {
+            event_id: "incident::signal::run-incident-001".to_string(),
+            occurred_at: signal_at,
+            stage: IncidentTimelineStage::Signal,
+            source: "reconciliation.runs.v1".to_string(),
+            reason_code: "reconciliation_non_critical_mismatch".to_string(),
+            correlation_id: correlation_id.to_string(),
+            summary: "Trigger: reconciliation run detected non-critical mismatch cluster."
+                .to_string(),
+            recommended_next_action:
+                "Inspect correlated order mismatch events before executing recovery controls."
+                    .to_string(),
+            severity: "warning".to_string(),
+            market_id: Some("market-btc-election".to_string()),
+            order_id: None,
+            alpha_id: Some("alpha-momentum".to_string()),
+            actor_id: Some("ops-1".to_string()),
+            run_id: Some("run-incident-001".to_string()),
+            snapshot_id: None,
+        },
+        IncidentTimelineEvent {
+            event_id: "incident::order::run-incident-001::order-101".to_string(),
+            occurred_at: order_at,
+            stage: IncidentTimelineStage::Order,
+            source: "reconciliation.diffs.v1".to_string(),
+            reason_code: "reconciliation_non_critical_mismatch".to_string(),
+            correlation_id: correlation_id.to_string(),
+            summary: "Context: order-101 lifecycle diverged between internal and venue states."
+                .to_string(),
+            recommended_next_action:
+                "Compare internal and venue lifecycle progression for order-101.".to_string(),
+            severity: "warning".to_string(),
+            market_id: Some("market-btc-election".to_string()),
+            order_id: Some("order-101".to_string()),
+            alpha_id: Some("alpha-momentum".to_string()),
+            actor_id: Some("ops-1".to_string()),
+            run_id: Some("run-incident-001".to_string()),
+            snapshot_id: None,
+        },
+        IncidentTimelineEvent {
+            event_id: "incident::fill::snapshot-incident-001".to_string(),
+            occurred_at: fill_at,
+            stage: IncidentTimelineStage::Fill,
+            source: "execution.fills.v1".to_string(),
+            reason_code: "fill_latency_warning".to_string(),
+            correlation_id: correlation_id.to_string(),
+            summary: "Action: fill evidence indicates delayed completion for affected order."
+                .to_string(),
+            recommended_next_action:
+                "Validate venue acknowledgement latency and residual queue pressure.".to_string(),
+            severity: "warning".to_string(),
+            market_id: Some("market-btc-election".to_string()),
+            order_id: Some("order-101".to_string()),
+            alpha_id: Some("alpha-momentum".to_string()),
+            actor_id: Some("ops-1".to_string()),
+            run_id: Some("run-incident-001".to_string()),
+            snapshot_id: Some("snapshot-incident-001".to_string()),
+        },
+        IncidentTimelineEvent {
+            event_id: "incident::pnl::snapshot-incident-001".to_string(),
+            occurred_at: pnl_at,
+            stage: IncidentTimelineStage::Pnl,
+            source: "reconciliation.exposure.v1".to_string(),
+            reason_code: "attribution_ready".to_string(),
+            correlation_id: correlation_id.to_string(),
+            summary:
+                "Verification: cost-aware attribution confirms realized drag for this incident."
+                    .to_string(),
+            recommended_next_action:
+                "Quantify net-cost impact before deciding to de-risk or rebalance.".to_string(),
+            severity: "normal".to_string(),
+            market_id: Some("market-btc-election".to_string()),
+            order_id: Some("order-101".to_string()),
+            alpha_id: Some("alpha-momentum".to_string()),
+            actor_id: Some("ops-1".to_string()),
+            run_id: Some("run-incident-001".to_string()),
+            snapshot_id: Some("snapshot-incident-001".to_string()),
+        },
+        IncidentTimelineEvent {
+            event_id: "incident::risk_action::snapshot-incident-001".to_string(),
+            occurred_at: risk_at,
+            stage: IncidentTimelineStage::RiskAction,
+            source: "risk.controls.v1".to_string(),
+            reason_code: "risk_posture_warning".to_string(),
+            correlation_id: correlation_id.to_string(),
+            summary: "Recommended containment remains reduce-only until mismatch trajectory stabilizes."
+                .to_string(),
+            recommended_next_action:
+                "Keep reduce-only active and re-run incident query after next reconciliation window."
+                    .to_string(),
+            severity: "warning".to_string(),
+            market_id: Some("market-btc-election".to_string()),
+            order_id: Some("order-101".to_string()),
+            alpha_id: Some("alpha-momentum".to_string()),
+            actor_id: Some("ops-1".to_string()),
+            run_id: Some("run-incident-001".to_string()),
+            snapshot_id: Some("snapshot-incident-001".to_string()),
+        },
+    ]
+}
+
 fn synthetic_attribution_observations(
     as_of_utc: &str,
     correlation_id: &str,
@@ -2913,6 +3244,252 @@ fn attribution_service_error_status(code: &str) -> StatusCode {
             StatusCode::SERVICE_UNAVAILABLE
         }
         "attribution_constraint_violation" => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn incident_forensics_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    filters: IncidentQueryFilters,
+    events: Vec<IncidentTimelineEvent>,
+    query_latency_ms: i64,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let start_inclusive_utc = filters.start_ts.clone();
+    let end_exclusive_utc = filters.end_ts.clone();
+    let data_state = if events.is_empty() { "empty" } else { "ready" };
+    let reason_code = if events.is_empty() {
+        IncidentReasonCode::EmptyWindow.code().to_string()
+    } else {
+        IncidentReasonCode::Ready.code().to_string()
+    };
+    let severity = incident_highest_severity(&events).to_string();
+    let recommended_next_action = if events.is_empty() {
+        "No incidents matched this window. Broaden filters or widen the time window for context."
+            .to_string()
+    } else if severity == "critical" {
+        "Trigger pause or reduce-only controls, then verify downstream reconciliation and attribution evidence."
+            .to_string()
+    } else if severity == "degraded" {
+        "Keep containment controls active and validate dependency freshness before resuming privileged operations."
+            .to_string()
+    } else if severity == "warning" {
+        "Inspect order/fill divergence and validate risk posture before executing any privileged mutation."
+            .to_string()
+    } else {
+        "Continue monitoring; no immediate containment action is required for this timeline."
+            .to_string()
+    };
+    let source = events
+        .first()
+        .map(|event| event.source.clone())
+        .unwrap_or_else(|| "incident.forensics.v1".to_string());
+    let correlation_id = actor.correlation_id.clone();
+    let causal_scope = select_causal_flow_scope(&events);
+    let trigger = causal_scope
+        .iter()
+        .find(|event| event.stage == IncidentTimelineStage::Signal)
+        .map(|event| event.summary.clone())
+        .unwrap_or_else(|| "No trigger evidence available for selected incident scope.".to_string());
+    let context = causal_scope
+        .iter()
+        .find(|event| event.stage == IncidentTimelineStage::Order)
+        .map(|event| event.summary.clone())
+        .unwrap_or_else(|| "No order-context evidence available for selected incident scope.".to_string());
+    let action = causal_scope
+        .iter()
+        .find(|event| {
+            event.stage == IncidentTimelineStage::RiskAction
+                || event.stage == IncidentTimelineStage::Fill
+        })
+        .map(|event| event.summary.clone())
+        .unwrap_or_else(|| {
+            "No action evidence available; validate upstream event production health.".to_string()
+        });
+    let verification = causal_scope
+        .iter()
+        .find(|event| event.stage == IncidentTimelineStage::Pnl)
+        .map(|event| event.summary.clone())
+        .unwrap_or_else(|| {
+            "No verification evidence available; confirm attribution/reconciliation dependencies."
+                .to_string()
+        });
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "incident_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "query_latency_ms": query_latency_ms,
+            "p95_latency_target_ms": 5000,
+            "data_state": data_state,
+            "severity": severity.clone(),
+            "event_count": events.len(),
+            "market_id": filters.market_id.clone(),
+            "order_id": filters.order_id.clone(),
+            "alpha_id": filters.alpha_id.clone(),
+            "actor_id_filter": filters.actor_id.clone(),
+            "start_ts": start_inclusive_utc.clone(),
+            "end_ts": end_exclusive_utc.clone(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "incident_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id.clone(),
+            timestamp_utc.clone(),
+        );
+    }
+
+    let filters = IncidentFilterSummary {
+        market_id: filters.market_id,
+        order_id: filters.order_id,
+        alpha_id: filters.alpha_id,
+        actor_id: filters.actor_id,
+    };
+
+    (
+        StatusCode::OK,
+        axum::Json(IncidentForensicsQueryResponse {
+            status: "accepted",
+            action: "incident_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: correlation_id.clone(),
+            timestamp_utc,
+            start_inclusive_utc,
+            end_exclusive_utc,
+            source,
+            reason_code,
+            data_state: data_state.to_string(),
+            severity,
+            query_latency_ms,
+            p95_latency_target_ms: 5_000,
+            recommended_next_action,
+            filters,
+            causal_flow: IncidentCausalFlowSummary {
+                trigger,
+                context,
+                action,
+                verification,
+            },
+            events: events
+                .into_iter()
+                .map(|event| IncidentTimelineEventItem {
+                    event_id: event.event_id,
+                    occurred_at: event.occurred_at,
+                    stage: event.stage.as_str().to_string(),
+                    source: event.source,
+                    reason_code: event.reason_code,
+                    correlation_id: event.correlation_id,
+                    summary: event.summary,
+                    recommended_next_action: event.recommended_next_action,
+                    severity: event.severity,
+                    market_id: event.market_id,
+                    order_id: event.order_id,
+                    alpha_id: event.alpha_id,
+                    actor_id: event.actor_id,
+                    run_id: event.run_id,
+                    snapshot_id: event.snapshot_id,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn incident_highest_severity(events: &[IncidentTimelineEvent]) -> &'static str {
+    if events.iter().any(|event| event.severity == "critical") {
+        "critical"
+    } else if events.iter().any(|event| event.severity == "degraded") {
+        "degraded"
+    } else if events.iter().any(|event| event.severity == "warning") {
+        "warning"
+    } else {
+        "normal"
+    }
+}
+
+fn select_causal_flow_scope(events: &[IncidentTimelineEvent]) -> Vec<&IncidentTimelineEvent> {
+    let Some(primary_event) = events.first() else {
+        return Vec::new();
+    };
+
+    if let Some(primary_run_id) = primary_event.run_id.as_deref() {
+        let grouped = events
+            .iter()
+            .filter(|event| event.run_id.as_deref() == Some(primary_run_id))
+            .collect::<Vec<_>>();
+        if !grouped.is_empty() {
+            return grouped;
+        }
+    }
+
+    events
+        .iter()
+        .filter(|event| event.correlation_id == primary_event.correlation_id)
+        .collect::<Vec<_>>()
+}
+
+fn incident_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<IncidentValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    (
+        incident_service_error_status(error_code),
+        axum::Json(IncidentForensicsServiceErrorResponse {
+            error_code,
+            reason_code: error_code.to_string(),
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc: timestamp_utc.clone(),
+            occurred_at: timestamp_utc,
+            source: "control-api.incident-forensics.v1".to_string(),
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| IncidentFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn incident_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == IncidentReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == IncidentReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
+        code if code == IncidentReasonCode::DependencyUnavailable.code()
+            || code == IncidentReasonCode::StaleEvidence.code() =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -3401,6 +3978,24 @@ pub struct AttributionQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct IncidentForensicsQuery {
+    #[serde(default)]
+    pub market_id: Option<String>,
+    #[serde(default)]
+    pub order_id: Option<String>,
+    #[serde(default)]
+    pub alpha_id: Option<String>,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub start_ts: Option<String>,
+    #[serde(default)]
+    pub end_ts: Option<String>,
+    #[serde(default)]
+    pub dependency_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RebalanceExecutionPayload {
     #[serde(default)]
     pub executed_at_utc: Option<String>,
@@ -3715,6 +4310,97 @@ pub struct AttributionServiceErrorResponse {
 
 #[derive(Debug, Serialize)]
 pub struct AttributionFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentForensicsQueryResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub start_inclusive_utc: String,
+    pub end_exclusive_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub data_state: String,
+    pub severity: String,
+    pub query_latency_ms: i64,
+    pub p95_latency_target_ms: i64,
+    pub recommended_next_action: String,
+    pub filters: IncidentFilterSummary,
+    pub causal_flow: IncidentCausalFlowSummary,
+    pub events: Vec<IncidentTimelineEventItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentFilterSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentCausalFlowSummary {
+    pub trigger: String,
+    pub context: String,
+    pub action: String,
+    pub verification: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentTimelineEventItem {
+    pub event_id: String,
+    pub occurred_at: String,
+    pub stage: String,
+    pub source: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub summary: String,
+    pub recommended_next_action: String,
+    pub severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentForensicsServiceErrorResponse {
+    pub error_code: &'static str,
+    pub reason_code: String,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub occurred_at: String,
+    pub source: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<IncidentFieldError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentFieldError {
     pub field: String,
     pub code: String,
     pub message: String,
@@ -7520,6 +8206,319 @@ mod tests {
 
         assert_eq!(payload["error_code"], "attribution_unauthorized");
         assert_eq!(payload["action"], "attribution_query");
+    }
+
+    #[tokio::test]
+    async fn incident_forensics_route_returns_causal_timeline_with_traceable_metadata() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/forensics?market_id=market-btc-election&start_ts=2025-01-01T00:00:00Z&end_ts=2030-01-01T00:00:00Z")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-incident-route-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action"], "incident_query");
+        assert_eq!(payload["data_state"], "ready");
+        assert_eq!(payload["reason_code"], "incident_ready");
+        assert_eq!(payload["filters"]["market_id"], "market-btc-election");
+        assert_eq!(payload["p95_latency_target_ms"], 5_000);
+        assert!(
+            payload["query_latency_ms"]
+                .as_i64()
+                .expect("query latency should be integer")
+                <= 5_000
+        );
+        assert!(payload["events"].as_array().is_some_and(|events| !events.is_empty()));
+        assert!(payload["events"][0]["occurred_at"].is_string());
+        assert!(payload["events"][0]["reason_code"].is_string());
+        assert!(payload["events"][0]["correlation_id"].is_string());
+        assert!(payload["causal_flow"]["trigger"].is_string());
+        assert!(payload["causal_flow"]["context"].is_string());
+        assert!(payload["causal_flow"]["action"].is_string());
+        assert!(payload["causal_flow"]["verification"].is_string());
+    }
+
+    #[tokio::test]
+    async fn incident_forensics_route_measures_p95_latency_within_target_for_repeated_queries() {
+        let mut latencies = Vec::new();
+
+        for index in 0..20 {
+            let response = test_app()
+                .oneshot(
+                    Request::builder()
+                        .uri("/control/incidents/forensics?market_id=market-btc-election&start_ts=2025-01-01T00:00:00Z&end_ts=2030-01-01T00:00:00Z")
+                        .method("GET")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", format!("corr-incident-p95-{index:03}"))
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body should be readable"),
+            )
+            .expect("payload should be valid json");
+            latencies.push(
+                payload["query_latency_ms"]
+                    .as_i64()
+                    .expect("query_latency_ms should be integer"),
+            );
+        }
+
+        latencies.sort_unstable();
+        let p95_index = (latencies.len() * 95).div_ceil(100) - 1;
+        let p95_latency_ms = latencies[p95_index];
+        assert!(p95_latency_ms <= 5_000);
+    }
+
+    #[test]
+    fn incident_forensics_causal_flow_scope_uses_single_incident_chain() {
+        let events = vec![
+            IncidentTimelineEvent {
+                event_id: "incident::signal::run-a".to_string(),
+                occurred_at: "2026-04-06T15:00:00Z".to_string(),
+                stage: IncidentTimelineStage::Signal,
+                source: "reconciliation.runs.v1".to_string(),
+                reason_code: "incident_ready".to_string(),
+                correlation_id: "corr-a".to_string(),
+                summary: "signal-a".to_string(),
+                recommended_next_action: "act-a".to_string(),
+                severity: "warning".to_string(),
+                market_id: Some("market-btc-election".to_string()),
+                order_id: None,
+                alpha_id: Some("alpha-momentum".to_string()),
+                actor_id: Some("ops-1".to_string()),
+                run_id: Some("run-a".to_string()),
+                snapshot_id: None,
+            },
+            IncidentTimelineEvent {
+                event_id: "incident::order::run-b".to_string(),
+                occurred_at: "2026-04-06T14:59:00Z".to_string(),
+                stage: IncidentTimelineStage::Order,
+                source: "reconciliation.diffs.v1".to_string(),
+                reason_code: "incident_ready".to_string(),
+                correlation_id: "corr-b".to_string(),
+                summary: "order-b".to_string(),
+                recommended_next_action: "act-b".to_string(),
+                severity: "warning".to_string(),
+                market_id: Some("market-btc-election".to_string()),
+                order_id: Some("order-b".to_string()),
+                alpha_id: Some("alpha-momentum".to_string()),
+                actor_id: Some("ops-2".to_string()),
+                run_id: Some("run-b".to_string()),
+                snapshot_id: None,
+            },
+            IncidentTimelineEvent {
+                event_id: "incident::order::run-a".to_string(),
+                occurred_at: "2026-04-06T14:58:00Z".to_string(),
+                stage: IncidentTimelineStage::Order,
+                source: "reconciliation.diffs.v1".to_string(),
+                reason_code: "incident_ready".to_string(),
+                correlation_id: "corr-a".to_string(),
+                summary: "order-a".to_string(),
+                recommended_next_action: "act-a".to_string(),
+                severity: "warning".to_string(),
+                market_id: Some("market-btc-election".to_string()),
+                order_id: Some("order-a".to_string()),
+                alpha_id: Some("alpha-momentum".to_string()),
+                actor_id: Some("ops-1".to_string()),
+                run_id: Some("run-a".to_string()),
+                snapshot_id: None,
+            },
+        ];
+
+        let scoped = select_causal_flow_scope(&events);
+        assert!(!scoped.is_empty());
+        assert!(
+            scoped
+                .iter()
+                .all(|event| event.run_id.as_deref() == Some("run-a"))
+        );
+    }
+
+    #[test]
+    fn incident_highest_severity_preserves_degraded_without_critical() {
+        let events = vec![IncidentTimelineEvent {
+            event_id: "incident::pnl::run-a".to_string(),
+            occurred_at: "2026-04-06T15:00:00Z".to_string(),
+            stage: IncidentTimelineStage::Pnl,
+            source: "incident.forensics.v1".to_string(),
+            reason_code: "incident_ready".to_string(),
+            correlation_id: "corr-a".to_string(),
+            summary: "degraded sample".to_string(),
+            recommended_next_action: "inspect freshness".to_string(),
+            severity: "degraded".to_string(),
+            market_id: Some("market-btc-election".to_string()),
+            order_id: Some("order-a".to_string()),
+            alpha_id: Some("alpha-momentum".to_string()),
+            actor_id: Some("ops-1".to_string()),
+            run_id: Some("run-a".to_string()),
+            snapshot_id: None,
+        }];
+
+        assert_eq!(incident_highest_severity(&events), "degraded");
+    }
+
+    #[tokio::test]
+    async fn incident_forensics_route_returns_actionable_empty_state_for_no_match_windows() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/forensics?market_id=market-no-activity&start_ts=2025-01-01T00:00:00Z&end_ts=2030-01-01T00:00:00Z")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-incident-empty-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["data_state"], "empty");
+        assert_eq!(payload["reason_code"], "incident_empty_window");
+        assert!(payload["events"].as_array().expect("events should be array").is_empty());
+        assert!(
+            payload["recommended_next_action"]
+                .as_str()
+                .expect("recommended action should be string")
+                .contains("Broaden filters")
+        );
+    }
+
+    #[tokio::test]
+    async fn incident_forensics_route_rejects_half_open_time_window() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/forensics?start_ts=2026-04-06T15:00:00Z")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-incident-invalid-window-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["error_code"], "incident_invalid_payload");
+        assert_eq!(payload["action"], "incident_query");
+        assert!(payload["field_errors"]
+            .as_array()
+            .expect("field_errors should be array")
+            .iter()
+            .any(|item| item["field"] == "start_ts"));
+        assert!(payload["field_errors"]
+            .as_array()
+            .expect("field_errors should be array")
+            .iter()
+            .any(|item| item["field"] == "end_ts"));
+    }
+
+    #[tokio::test]
+    async fn incident_forensics_route_surfaces_dependency_unavailable_machine_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/forensics?start_ts=2025-01-01T00:00:00Z&end_ts=2030-01-01T00:00:00Z&dependency_state=dependency_unavailable")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-incident-dependency-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "incident_dependency_unavailable");
+        assert_eq!(payload["reason_code"], "incident_dependency_unavailable");
+        assert_eq!(payload["action"], "incident_query");
+    }
+
+    #[tokio::test]
+    async fn incident_forensics_route_returns_incident_unauthorized_for_denied_reads() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/forensics?start_ts=2025-01-01T00:00:00Z&end_ts=2030-01-01T00:00:00Z")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-incident-denied-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "incident_unauthorized");
+        assert_eq!(payload["action"], "incident_query");
     }
 
     #[tokio::test]

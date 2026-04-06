@@ -195,3 +195,90 @@
 - `npm run web:build` ✅
 - `node --test tests/story-3-4/*.test.mjs tests/api/story-3-4*.test.mjs tests/e2e/story-3-4*.test.mjs` ✅
 - `npm run --silent qa:test:story-3-4` ✅
+
+---
+
+## Story
+
+- 3-5-implement-incident-search-and-causal-timeline-forensics
+
+## Generated Tests
+
+### Domain, Persistence, and Control API
+
+- [x] `crates/domain/src/incidents.rs` — validates canonical reason-code parsing, deterministic tie-break ordering, start-inclusive/end-exclusive boundaries, empty-window behavior, and timeline event contract validation.
+- [x] `crates/persistence/src/postgres/incident_query_views.rs` — validates migration contract scope (`incident_query_views` only), deterministic query ordering/boundaries, and derived causal-stage evidence mapping from reconciliation/attribution seams.
+- [x] `services/control-api/src/routes/mod.rs` — validates authenticated incident forensics route behavior for accepted payloads, actionable empty states, unauthorized access, dependency-unavailable failures, and half-open window rejection.
+
+### Operator Console and Story-Scoped QA
+
+- [x] `tests/story-3-5/incident-forensics.story-3-5.test.mjs` — validates incidents route/client/timeline state-machine contracts and causal-flow rendering requirements.
+- [x] `tests/api/story-3-5-incident-api.test.mjs` — validates canonical endpoint wiring, strict query validation, machine-readable error propagation, and malformed-success contract mismatch handling.
+- [x] `tests/e2e/story-3-5-incident-timeline.e2e.test.mjs` — validates incident timeline UI integration, shell continuity, and risk-rail composition non-regression.
+
+## Coverage
+
+- Story 3.5 incident forensics contracts covered end-to-end across domain, persistence, control-api ingress, operator-console rendering, and story-scoped QA:
+  - canonical single-submit incident filters (`market_id`, `order_id`, `alpha_id`, `actor_id`, `start_ts`, `end_ts`) with explicit field-level validation failures,
+  - deterministic timeline semantics (`start_inclusive`, `end_exclusive`, stable ordering on timestamp ties),
+  - causal Trigger -> Context -> Action -> Verification framing with recommended next-action guidance,
+  - machine-readable unauthorized/dependency-unavailable/malformed-payload failure envelopes with traceable evidence metadata,
+  - shell composition continuity with Story 3.1/3.2/3.4 surfaces.
+- Automated Story 3.5 regression inventory in this QA pass: **29 tests passing** (`rust targeted: 16`, `story/api/e2e node tests: 13`).
+
+## Execution Result
+
+- `cargo test -p domain incidents::tests::` ✅
+- `cargo test -p persistence postgres::incident_query_views::tests::` ✅
+- `cargo test -p control-api routes::tests::incident_forensics_` ✅
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-5/*.test.mjs tests/api/story-3-5*.test.mjs tests/e2e/story-3-5*.test.mjs` ✅
+- `npm run --silent qa:test:story-3-5` ✅
+- `npm test` ✅
+
+---
+
+## Story 3.5 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `tests/api/story-3-5-incident-api.test.mjs` — added canonical full-filter serialization coverage, explicit empty-window response handling, and unauthorized (`403`) machine-error propagation.
+- [x] `tests/e2e/story-3-5-incident-timeline.e2e.test.mjs` — added canonical filter and UTC window control coverage plus alpha/actor query-serialization contract checks.
+
+## Coverage
+
+- Story 3.5 API/E2E critical-flow refresh verifies:
+  - canonical filter serialization for `market_id`, `order_id`, `alpha_id`, and `actor_id`,
+  - explicit no-match/empty-window behavior with actionable guidance,
+  - machine-readable unauthorized incident read failures (`incident_unauthorized`, `403`),
+  - incidents timeline search form completeness with UTC-bounded controls.
+- Automated Story 3.5 regression inventory in this QA refresh: **41 tests passing** (`rust targeted: 20`, `story/api/e2e node tests: 21`).
+
+## Execution Result
+
+- `npm run --silent qa:test:story-3-5` ✅
+
+---
+
+## Story 3.5 Code-Review Remediation Re-Run
+
+- Added regression coverage for review-remediated surfaces:
+  - UTC normalization for datetime-local incident window input,
+  - degraded-severity contract preservation from API to UI parser/state mapping,
+  - single-incident causal-flow scope selection,
+  - repeated-query p95 incident latency assertion.
+- Updated targeted Story 3.5 QA inventory after remediation: **37 tests passing** (`rust targeted: 20`, `story/api/e2e node tests: 17`).
+
+## Execution Result
+
+- `cargo test -p domain incidents::tests::` ✅
+- `cargo test -p persistence postgres::incident_query_views::tests::` ✅
+- `cargo test -p control-api routes::tests::incident_forensics_` ✅
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-5/*.test.mjs tests/api/story-3-5*.test.mjs tests/e2e/story-3-5*.test.mjs` ✅
+- `npm run --silent qa:test:story-3-5` ✅
+- `npm test` ✅

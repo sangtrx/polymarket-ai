@@ -2,6 +2,7 @@ import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
+import { getOperatorConsoleEnv } from "@/lib/env";
 import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
   type ShellSearchParams,
@@ -18,6 +19,7 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
     resolvedSearchParams,
     "incidents.read-model.shell",
   );
+  const { apiBaseUrl } = getOperatorConsoleEnv();
   const riskPosture = resolveRiskPostureViewModel(resolvedSearchParams, stateModel);
 
   const tabViews = [
@@ -26,17 +28,22 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
       label: "Timeline",
       content: (
         <section className="shell-panel-grid">
-          <IncidentTimelineCard freshness={stateModel.freshness} />
+          <IncidentTimelineCard
+            baseUrl={apiBaseUrl}
+            freshness={stateModel.freshness}
+          />
           <article className="shell-panel shell-panel-grid-item">
             <p className="type-eyebrow">Incident context</p>
-            <h2 className="type-heading-m">Root-cause queue</h2>
+            <h2 className="type-heading-m">Forensics workflow summary</h2>
             <p className="type-body text-muted">
-              Route remains traceability-first while incident data is
-              investigated. Persistent safety controls are available in the rail
-              for pause/reduce-only/cancel-all interventions.
+              Route keeps single-submit incident search aligned to Trigger -&gt;
+              Context -&gt; Action -&gt; Verification framing while preserving
+              persistent safety-rail controls for pause/reduce-only/cancel-all
+              interventions.
             </p>
             <p className="type-metadata text-muted">
-              Monitor-first policy applies on mobile breakpoints.
+              p95 incident-query target remains 5,000ms for investigative
+              workflows.
             </p>
           </article>
         </section>
@@ -50,10 +57,10 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
           <p className="type-eyebrow">Triage flow</p>
             <h2 className="type-heading-m">Operator guidance</h2>
             <p className="type-body text-muted">
-              Use this shell route to inspect incident freshness and timeline
-              ordering before any governance escalation. Mutation requests route
-              through explicit safety-rail confirmation and machine-readable
-              outcome evidence.
+              Use this route to validate timeline evidence, then escalate through
+              governance when root cause and recommended action are clear.
+              Mutation requests continue through explicit safety-rail confirmation
+              with machine-readable outcome evidence.
             </p>
           </article>
         ),
@@ -63,7 +70,7 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
   return (
     <OperatorShellLayout
       activeRoute="incidents"
-      description="Timeline and triage shell surfaces with explicit failure evidence."
+      description="Incident search and causal timeline forensics with explicit failure evidence."
       freshness={stateModel.freshness}
       p95TargetMs={stateModel.p95TargetMs}
       riskPosture={riskPosture}

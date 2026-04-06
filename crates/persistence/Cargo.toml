@@ -11,3 +11,4 @@ domain = { path = "../domain" }
 serde_json.workspace = true
 sqlx.workspace = true
 time.workspace = true
+tokio.workspace = true
