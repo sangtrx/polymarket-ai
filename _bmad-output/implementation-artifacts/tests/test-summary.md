@@ -240,6 +240,54 @@
 
 ---
 
+## Story
+
+- 3-7-implement-controlled-recovery-readiness-gates
+
+## Generated Tests
+
+### Domain, Persistence, Governance, Control API, and Risk Runtime
+
+- [x] `crates/domain/src/recovery.rs` — validates deterministic gate boundaries (`freshness <= 30s`, `reconciliation < 0.1%`), strict checksum/signoff contract enforcement, and approved-run verification invariants.
+- [x] `crates/persistence/src/postgres/recovery_gate_runs.rs` — validates migration scope and constraints for `recovery_gate_runs`, canonical identifier normalization, and deterministic latest-query behavior.
+- [x] `services/governance-service/src/recovery/mod.rs` — validates authorization boundaries, blocked vs approved gate decision behavior, and pre-approved run requirements for resume.
+- [x] `services/control-api/src/routes/mod.rs` — validates recovery evaluate/resume/query route envelopes, machine-readable stale-evidence mapping, and correlation-id lookup behavior.
+- [x] `services/risk-engine/src/main.rs` — validates fail-closed release gating that requires approved, verification-backed recovery evidence before removing containment blocks.
+
+### Operator Console, Runbooks, and Story-Scoped QA
+
+- [x] `tests/story-3-7/controlled-recovery.story-3-7.test.mjs` — validates endpoint contracts, deterministic gate semantics, runtime recovery integration seams, migration scope, and runbook cross-link continuity.
+- [x] `tests/api/story-3-7-recovery-api.test.mjs` — validates typed recovery client mapping for evaluate/resume/query paths, blocked-gate evidence parsing, run-id and correlation query selectors, checksum preflight rejection, unauthorized machine-error propagation, malformed-success contract rejection, and posture state transitions for blocked/completed recovery flows.
+- [x] `tests/e2e/story-3-7-controlled-recovery.e2e.test.mjs` — validates safety-rail runtime workflow semantics, blocked-reason rendering order (Trigger -> Context -> Action -> Verification), verification evidence surfaces, accessibility status/escalation semantics, and CSS contract continuity.
+
+## Coverage
+
+- Story 3.7 controlled-recovery contracts covered end-to-end across deterministic gate policy, durable evidence persistence, authenticated control ingress, runtime fail-closed release logic, operator-console workflow, and operations runbooks:
+  - readiness gate boundaries and reason-code behavior for freshness/reconciliation/checksum/signoff,
+  - explicit machine-readable blocked/approved decision envelopes with traceable `run_id`/`correlation_id`,
+  - resume verification evidence propagation into runtime posture and UI verification surfaces,
+  - NFR16 query-latency coverage via repeated recovery query route assertions with `p95 <= 5,000ms`,
+  - NFR6 workflow-timing instrumentation coverage via readiness/resume timestamp evidence bounded to `<= 10 minutes`,
+  - strict malformed-checksum preflight handling with no success-shaped fallback,
+  - runbook operational guidance and cross-links with emergency/incident/alerts procedures.
+- Automated Story 3.7 API/E2E regression inventory in this QA pass: **23 Story-3.7 node tests passing** (`story: 6`, `api: 11`, `e2e: 6`).
+
+## Execution Result
+
+- `cargo test -p domain recovery::tests::` ✅
+- `cargo test -p persistence postgres::recovery_gate_runs::tests::` ✅
+- `cargo test -p governance-service recovery::tests::` ✅
+- `cargo test -p control-api routes::tests::recovery_` ✅
+- `cargo test -p risk-engine tests::approved_recovery_run_requires_valid_resume_verification` ✅
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-7/*.test.mjs tests/api/story-3-7*.test.mjs tests/e2e/story-3-7*.test.mjs` ✅ (23 passing)
+- `npm run --silent qa:test:story-3-7` ✅
+- `npm test` ✅
+
+---
+
 ## Story 3.6 QA Automation Refresh
 
 ### Generated Tests

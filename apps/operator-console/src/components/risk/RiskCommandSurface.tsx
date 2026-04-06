@@ -6,6 +6,8 @@ import { SafetyActionRail } from "@/components/risk/SafetyActionRail";
 import { getOperatorConsoleEnv } from "@/lib/env";
 import {
   type RiskPostureViewModel,
+  withRecoveryReadinessEvidence,
+  withRecoveryResumeEvidence,
   withEmergencyControlEvidence,
 } from "@/lib/risk/posture";
 
@@ -34,8 +36,23 @@ export function RiskCommandSurface({
             withEmergencyControlEvidence(previous, decision),
           );
         }}
+        onRecoveryEvaluated={(decision) => {
+          setActivePosture((previous) =>
+            withRecoveryReadinessEvidence(previous, decision),
+          );
+        }}
+        onRecoveryResumed={(decision) => {
+          setActivePosture((previous) =>
+            withRecoveryResumeEvidence(previous, decision),
+          );
+        }}
         resumeState={activePosture.resumeState}
         resumeStateReason={activePosture.resumeStateReason}
+        resumeFailureDetails={activePosture.resumeFailureDetails}
+        resumeProfileKey={activePosture.resumeProfileKey}
+        resumeReconciliationRunId={activePosture.resumeReconciliationRunId}
+        resumeApprovedChecksum={activePosture.resumeApprovedChecksum}
+        resumeSignoffIntent={activePosture.resumeSignoffIntent}
       />
     </section>
   );

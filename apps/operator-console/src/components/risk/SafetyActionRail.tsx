@@ -4,19 +4,44 @@ import { useMemo, useRef, useState } from "react";
 import {
   EmergencyControlClientError,
   getEmergencyControlActionResult,
+  invokeRecoveryReadinessEvaluation,
+  invokeRecoveryResume,
   invokeEmergencyControlAction,
   normalizeEmergencyAction,
   type EmergencyControlAction,
   type EmergencyControlDecision,
+  type RecoveryReadinessDecision,
+  type RecoveryResumeDecision,
 } from "@/lib/risk/control-actions";
 
-type ActionButtonState = "enabled" | "gated" | "in-progress" | "completed";
+type ActionButtonState =
+  | "enabled"
+  | "gated"
+  | "in-progress"
+  | "completed"
+  | "blocked-with-reasons";
+
+interface ResumeFailureDetail {
+  gate: string;
+  reasonCode: string;
+  trigger: string;
+  context: string;
+  action: string;
+  verification: string;
+}
 
 interface SafetyActionRailProps {
   baseUrl: string;
-  resumeState: "gated";
+  resumeState: "gated" | "in-progress" | "completed" | "blocked-with-reasons";
   resumeStateReason: string;
+  resumeFailureDetails: ResumeFailureDetail[];
+  resumeProfileKey: string;
+  resumeReconciliationRunId: string;
+  resumeApprovedChecksum: string;
+  resumeSignoffIntent: string;
   onActionConfirmed: (decision: EmergencyControlDecision) => void;
+  onRecoveryEvaluated: (decision: RecoveryReadinessDecision) => void;
+  onRecoveryResumed: (decision: RecoveryResumeDecision) => void;
 }
 
 interface ActionTimingEvidence {
@@ -44,7 +69,7 @@ const ACTION_HIERARCHY: Record<EmergencyControlAction, "danger" | "secondary"> =
 };
 
 const DEFAULT_RESUME_STATE_REASON =
-  "Resume is gated until Story 3.7 introduces controlled recovery readiness gates.";
+  "Resume remains gated until controlled recovery readiness evaluation succeeds.";
 
 const ACKNOWLEDGEMENT_TARGET_MS = 1_000;
 const REFLECTION_TARGET_MS = 5_000;
@@ -75,7 +100,7 @@ function toClientError(
       error instanceof Error
         ? error.message
         : "Emergency control request failed unexpectedly.",
-    action: action === "resume" ? "emergency_control_resume_gated" : action,
+    action: action === "resume" ? "recovery_resume_execute" : action,
     endpoint: "operator-console-ui",
     timestampUtc: new Date().toISOString(),
   });
@@ -183,17 +208,30 @@ export function SafetyActionRail({
   baseUrl,
   resumeState,
   resumeStateReason,
+  resumeFailureDetails,
+  resumeProfileKey,
+  resumeReconciliationRunId,
+  resumeApprovedChecksum,
+  resumeSignoffIntent,
   onActionConfirmed,
+  onRecoveryEvaluated,
+  onRecoveryResumed,
 }: SafetyActionRailProps) {
   const actionInFlightRef = useRef(false);
   const [pendingDangerAction, setPendingDangerAction] =
     useState<EmergencyControlAction | null>(null);
-  const [activeAction, setActiveAction] = useState<EmergencyControlAction | null>(
+  const [activeAction, setActiveAction] = useState<
+    EmergencyControlAction | "resume" | null
+  >(
     null,
   );
   const [lastDecision, setLastDecision] = useState<EmergencyControlDecision | null>(
     null,
   );
+  const [lastRecoveryReadiness, setLastRecoveryReadiness] =
+    useState<RecoveryReadinessDecision | null>(null);
+  const [lastRecoveryResume, setLastRecoveryResume] =
+    useState<RecoveryResumeDecision | null>(null);
   const [timingEvidence, setTimingEvidence] = useState<ActionTimingEvidence | null>(
     null,
   );
@@ -217,7 +255,22 @@ export function SafetyActionRail({
 
   const resolveState = (action: EmergencyControlAction | "resume"): ActionButtonState => {
     if (action === "resume") {
-      return resumeState;
+      if (activeAction === "resume") {
+        return "in-progress";
+      }
+      if (isBusy) {
+        return "gated";
+      }
+      if (lastRecoveryResume || resumeState === "completed") {
+        return "completed";
+      }
+      if (
+        lastRecoveryReadiness?.readinessStatus === "blocked" ||
+        resumeState === "blocked-with-reasons"
+      ) {
+        return "blocked-with-reasons";
+      }
+      return "enabled";
     }
     if (activeAction === action) {
       return "in-progress";
@@ -230,6 +283,24 @@ export function SafetyActionRail({
     }
     return "enabled";
   };
+
+  const effectiveResumeReason =
+    lastRecoveryReadiness?.recommendedNextAction ||
+    resumeStateReason ||
+    DEFAULT_RESUME_STATE_REASON;
+  const effectiveResumeFailures: ResumeFailureDetail[] =
+    lastRecoveryReadiness?.readinessStatus === "blocked"
+      ? lastRecoveryReadiness.gateOutcomes
+          .filter((outcome) => !outcome.passed)
+          .map((outcome) => ({
+            gate: outcome.gate,
+            reasonCode: outcome.reasonCode,
+            trigger: outcome.trigger,
+            context: outcome.context,
+            action: outcome.action,
+            verification: outcome.verification,
+          }))
+      : resumeFailureDetails;
 
   const executeAction = async (action: EmergencyControlAction) => {
     if (actionInFlightRef.current) {
@@ -279,6 +350,64 @@ export function SafetyActionRail({
       onActionConfirmed(confirmed);
     } catch (caughtError) {
       setError(toClientError(caughtError, action));
+    } finally {
+      actionInFlightRef.current = false;
+      setActiveAction(null);
+    }
+  };
+
+  const executeResumeWorkflow = async () => {
+    if (actionInFlightRef.current) {
+      return;
+    }
+
+    actionInFlightRef.current = true;
+    setPendingDangerAction(null);
+    setError(null);
+    setTimingEvidence(null);
+    setTimingWarning(null);
+    setActiveAction("resume");
+
+    const commandStart = Date.now();
+    const auditReference = `operator-console-recovery-${commandStart}`;
+
+    try {
+      const readiness = await invokeRecoveryReadinessEvaluation({
+        baseUrl,
+        profileKey: resumeProfileKey,
+        reconciliationRunId: resumeReconciliationRunId,
+        approvedChecksum: resumeApprovedChecksum,
+        signoffIntent: resumeSignoffIntent,
+        auditReference,
+      });
+      const acknowledgementMs = Date.now() - commandStart;
+      setLastRecoveryReadiness(readiness);
+      onRecoveryEvaluated(readiness);
+
+      if (readiness.readinessStatus !== "approved") {
+        setTimingEvidence({
+          acknowledgementMs,
+          reflectionMs: acknowledgementMs,
+          confirmationMs: acknowledgementMs,
+        });
+        return;
+      }
+
+      const resumed = await invokeRecoveryResume({
+        baseUrl,
+        runId: readiness.runId,
+        resumedAtUtc: new Date().toISOString(),
+      });
+      const confirmationMs = Date.now() - commandStart;
+      setLastRecoveryResume(resumed);
+      setTimingEvidence({
+        acknowledgementMs,
+        reflectionMs: confirmationMs,
+        confirmationMs,
+      });
+      onRecoveryResumed(resumed);
+    } catch (caughtError) {
+      setError(toClientError(caughtError, "resume"));
     } finally {
       actionInFlightRef.current = false;
       setActiveAction(null);
@@ -341,19 +470,34 @@ export function SafetyActionRail({
         })}
 
         <li>
-          <button
-            aria-disabled="true"
-            className="safety-action-button"
-            data-hierarchy="tertiary"
-            data-state={resolveState("resume")}
-            disabled
-            type="button"
-          >
-            Resume
-          </button>
-          <p className="type-metadata text-muted">
-            {resumeStateReason || DEFAULT_RESUME_STATE_REASON}
-          </p>
+          {(() => {
+            const resumeButtonState = resolveState("resume");
+            const resumeButtonDisabled =
+              resumeButtonState === "gated" || resumeButtonState === "in-progress";
+            return (
+              <>
+                <button
+                  aria-disabled={resumeButtonDisabled}
+                  className="safety-action-button"
+                  data-hierarchy="tertiary"
+                  data-state={resumeButtonState}
+                  disabled={resumeButtonDisabled}
+                  onClick={() => {
+                    if (resumeButtonDisabled) {
+                      return;
+                    }
+                    void executeResumeWorkflow();
+                  }}
+                  type="button"
+                >
+                  Resume
+                </button>
+                <p className="type-metadata text-muted">
+                  {effectiveResumeReason}
+                </p>
+              </>
+            );
+          })()}
         </li>
       </ul>
 
@@ -455,6 +599,95 @@ export function SafetyActionRail({
                 <time dateTime={lastDecision.timestampUtc}>
                   {lastDecision.timestampUtc}
                 </time>
+              </dd>
+            </div>
+          </dl>
+        </section>
+      ) : null}
+
+      {(resolveState("resume") === "blocked-with-reasons" &&
+        effectiveResumeFailures.length > 0) ? (
+        <section className="safety-action-recovery-blocked" role="status">
+          <p className="type-eyebrow">Recovery resume blocked</p>
+          <p className="type-body text-muted">{effectiveResumeReason}</p>
+          <div className="safety-action-recovery-failures">
+            {effectiveResumeFailures.map((failure) => (
+              <article
+                className="safety-action-recovery-failure"
+                key={`${failure.gate}:${failure.reasonCode}`}
+              >
+                <h3 className="type-heading-m">{failure.gate}</h3>
+                <p className="type-metadata text-muted">
+                  <code>{failure.reasonCode}</code>
+                </p>
+                <ol className="type-metadata text-muted">
+                  <li>
+                    <strong>Trigger:</strong> {failure.trigger}
+                  </li>
+                  <li>
+                    <strong>Context:</strong> {failure.context}
+                  </li>
+                  <li>
+                    <strong>Action:</strong> {failure.action}
+                  </li>
+                  <li>
+                    <strong>Verification:</strong> {failure.verification}
+                  </li>
+                </ol>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {lastRecoveryResume ? (
+        <section className="safety-action-recovery-evidence" role="status">
+          <p className="type-eyebrow">Controlled recovery verification</p>
+          <dl className="risk-evidence-grid">
+            <div>
+              <dt className="type-metadata text-muted">Run ID</dt>
+              <dd className="type-mono">{lastRecoveryResume.runId}</dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Readiness status</dt>
+              <dd className="type-mono">{lastRecoveryResume.readinessStatus}</dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Reason code</dt>
+              <dd className="type-mono">
+                <code>{lastRecoveryResume.reasonCode}</code>
+              </dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Verification reason</dt>
+              <dd className="type-mono">
+                <code>{lastRecoveryResume.verificationReasonCode}</code>
+              </dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Resumed at</dt>
+              <dd className="type-mono">
+                <time dateTime={lastRecoveryResume.resumedAtUtc}>
+                  {lastRecoveryResume.resumedAtUtc}
+                </time>
+              </dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Verification timestamp</dt>
+              <dd className="type-mono">
+                <time dateTime={lastRecoveryResume.verificationTimestampUtc}>
+                  {lastRecoveryResume.verificationTimestampUtc}
+                </time>
+              </dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Correlation ID</dt>
+              <dd className="type-mono">{lastRecoveryResume.correlationId}</dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Audit reference</dt>
+              <dd className="type-mono">
+                {lastRecoveryResume.auditReference ?? "n/a"}
               </dd>
             </div>
           </dl>

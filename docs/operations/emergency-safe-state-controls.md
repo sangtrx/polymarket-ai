@@ -62,3 +62,4 @@ Expected response evidence fields:
 
 1. severity alert delivery and channel fallback: `docs/operations/severity-alert-delivery.md`
 2. incident forensics timeline search: `docs/operations/incident-search-causal-timeline-forensics.md`
+3. controlled recovery readiness gates and resume verification: `docs/operations/controlled-recovery-readiness-gates.md`

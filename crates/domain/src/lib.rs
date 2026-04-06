@@ -6,4 +6,5 @@ pub mod governance;
 pub mod incidents;
 pub mod order;
 pub mod reconciliation;
+pub mod recovery;
 pub mod risk;

@@ -16,6 +16,7 @@ use governance_service::approvals::{ApprovalOrchestrator, GovernanceApprovalServ
 use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
 use governance_service::credentials::{CredentialRotationOrchestrator, CredentialRotationService};
 use governance_service::market_policy::{MarketPolicyOrchestrator, MarketPolicyService};
+use governance_service::recovery::{RecoveryOrchestrator, RecoveryService};
 use governance_service::risk_limits::{RiskLimitOrchestrator, RiskLimitService};
 use governance_service::safety_controls::{SafetyControlOrchestrator, SafetyControlService};
 use serde::Serialize;
@@ -219,6 +220,7 @@ pub struct ControlApiState {
     pub market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
     pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
+    pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
 
@@ -269,6 +271,7 @@ impl ControlApiState {
             Arc::new(MarketPolicyService::default()),
             Arc::new(RiskLimitService::default()),
             Arc::new(SafetyControlService::default()),
+            Arc::new(RecoveryService::default()),
         )
     }
 
@@ -283,6 +286,7 @@ impl ControlApiState {
         market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
         risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
         safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
+        recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     ) -> Self {
         Self {
             authorization_guard,
@@ -294,6 +298,7 @@ impl ControlApiState {
             market_policy_orchestrator,
             risk_limit_orchestrator,
             safety_control_orchestrator,
+            recovery_orchestrator,
             attribution_pool: None,
         }
     }

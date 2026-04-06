@@ -4,6 +4,10 @@ mod safe_state;
 
 use common::time::timestamp_utc;
 use domain::reconciliation::ReconciliationReasonCode;
+use domain::recovery::{
+    RecoveryGateRunEvidence, RecoveryReadinessStatus, RecoveryReasonCode,
+    validate_recovery_gate_run_evidence,
+};
 use domain::risk::{
     EmergencyControlMode, MarketPolicyReasonCode, MarketSnapshot, PreTradeReasonCode,
     RiskLimitReasonCode,
@@ -16,6 +20,7 @@ use persistence::postgres::market_stream::load_latest_market_stream_health;
 use persistence::postgres::pretrade_gate::{
     PreTradeGatePersistenceError, insert_pretrade_gate_decision,
 };
+use persistence::postgres::recovery_gate_runs::load_latest_recovery_gate_run;
 use persistence::postgres::risk_limits::{
     load_active_risk_limit_profile_bundle, load_pending_risk_limit_profile_bundles,
 };
@@ -366,7 +371,43 @@ async fn hydrate_latest_safety_mode_state(
     pool: &PgPool,
 ) {
     match load_current_effective_safety_mode(pool).await {
-        Ok(Some(mode)) => apply_safety_mode_containment(runtime_policy_state, mode.resulting_mode),
+        Ok(Some(mode)) => {
+            let recovery_release_approved = match mode.resulting_mode {
+                EmergencyControlMode::Paused => false,
+                EmergencyControlMode::Normal | EmergencyControlMode::ReduceOnly => {
+                    match load_latest_recovery_gate_run(pool).await {
+                        Ok(Some(run)) => {
+                            if is_approved_recovery_resume_run(&run) {
+                                true
+                            } else {
+                                println!(
+                                    "risk-engine bootstrap found recovery run `{}` but containment release is not approved",
+                                    run.run_id
+                                );
+                                false
+                            }
+                        }
+                        Ok(None) => {
+                            println!(
+                                "risk-engine bootstrap found no recovery gate run, preserving fail-closed containment"
+                            );
+                            false
+                        }
+                        Err(error) => {
+                            println!(
+                                "risk-engine bootstrap could not hydrate recovery gate run, preserving fail-closed containment: {error}"
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+            apply_safety_mode_containment(
+                runtime_policy_state,
+                mode.resulting_mode,
+                recovery_release_approved,
+            );
+        }
         Ok(None) => {
             runtime_policy_state.set_user_stream_auth_block(true);
             println!(
@@ -385,10 +426,28 @@ async fn hydrate_latest_safety_mode_state(
 fn apply_safety_mode_containment(
     runtime_policy_state: &gates::InMemoryRuntimePolicyState,
     mode: EmergencyControlMode,
+    recovery_release_approved: bool,
 ) {
     if mode == EmergencyControlMode::Paused {
         runtime_policy_state.set_user_stream_auth_block(true);
+        return;
     }
+    runtime_policy_state.set_user_stream_auth_block(!recovery_release_approved);
+}
+
+fn is_approved_recovery_resume_run(run: &RecoveryGateRunEvidence) -> bool {
+    if validate_recovery_gate_run_evidence(run).is_err() {
+        return false;
+    }
+    if run.readiness_status != RecoveryReadinessStatus::Approved {
+        return false;
+    }
+    if run.reason_code != RecoveryReasonCode::ResumeApproved.code() {
+        return false;
+    }
+    run.resumed_at_utc
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn load_market_snapshot_from_env(config: &BootstrapRuntimeConfig) -> Option<MarketSnapshot> {
@@ -584,34 +643,163 @@ mod tests {
     fn paused_mode_forces_fail_closed_user_stream_auth_block() {
         let runtime_policy_state = gates::InMemoryRuntimePolicyState::default();
         runtime_policy_state.set_user_stream_auth_block(false);
-        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Paused);
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Paused, false);
         assert!(
             gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
         );
     }
 
     #[test]
-    fn normal_and_reduce_only_modes_preserve_existing_user_stream_auth_block_state() {
+    fn normal_and_reduce_only_require_approved_recovery_release() {
         let runtime_policy_state = gates::InMemoryRuntimePolicyState::default();
 
-        runtime_policy_state.set_user_stream_auth_block(false);
-        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Normal);
+        runtime_policy_state.set_user_stream_auth_block(true);
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Normal, false);
         assert!(
-            !gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+            gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
         );
-        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::ReduceOnly);
+        apply_safety_mode_containment(
+            &runtime_policy_state,
+            EmergencyControlMode::ReduceOnly,
+            false,
+        );
         assert!(
-            !gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+            gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
         );
 
         runtime_policy_state.set_user_stream_auth_block(true);
-        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Normal);
+        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::Normal, true);
         assert!(
-            gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+            !gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
         );
-        apply_safety_mode_containment(&runtime_policy_state, EmergencyControlMode::ReduceOnly);
+        runtime_policy_state.set_user_stream_auth_block(true);
+        apply_safety_mode_containment(
+            &runtime_policy_state,
+            EmergencyControlMode::ReduceOnly,
+            true,
+        );
         assert!(
-            gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
+            !gates::RuntimePolicyStateReader::user_stream_auth_block_active(&runtime_policy_state)
         );
+    }
+
+    #[test]
+    fn approved_recovery_run_requires_valid_resume_verification() {
+        let approved = sample_recovery_run(RecoveryReadinessStatus::Approved, true);
+        assert!(is_approved_recovery_resume_run(&approved));
+
+        let missing_verification = sample_recovery_run(RecoveryReadinessStatus::Approved, false);
+        assert!(!is_approved_recovery_resume_run(&missing_verification));
+
+        let blocked = sample_recovery_run(RecoveryReadinessStatus::Blocked, false);
+        assert!(!is_approved_recovery_resume_run(&blocked));
+    }
+
+    fn sample_recovery_run(
+        readiness_status: RecoveryReadinessStatus,
+        include_resume_verification: bool,
+    ) -> RecoveryGateRunEvidence {
+        let approved = readiness_status == RecoveryReadinessStatus::Approved;
+        RecoveryGateRunEvidence {
+            run_id: "run-1".to_string(),
+            correlation_id: "corr-1".to_string(),
+            readiness_status,
+            reason_code: if approved {
+                RecoveryReasonCode::ResumeApproved.code().to_string()
+            } else {
+                RecoveryReasonCode::ResumeBlocked.code().to_string()
+            },
+            actor_id: "ops-1".to_string(),
+            actor_role: "operational_control".to_string(),
+            profile_key: "default".to_string(),
+            requested_at_utc: "2026-04-06T12:00:00Z".to_string(),
+            evaluated_at_utc: "2026-04-06T12:00:01Z".to_string(),
+            resumed_at_utc: if include_resume_verification {
+                Some("2026-04-06T12:00:02Z".to_string())
+            } else {
+                None
+            },
+            freshness_age_seconds: Some(if approved { 10.0 } else { 45.0 }),
+            freshness_observed_at_utc: Some("2026-04-06T12:00:00Z".to_string()),
+            reconciliation_run_id: Some("recon-1".to_string()),
+            reconciliation_mismatch_rate: Some(if approved { 0.0002 } else { 0.01 }),
+            approved_checksum: Some("a".repeat(64)),
+            computed_checksum: Some(if approved {
+                "a".repeat(64)
+            } else {
+                "b".repeat(64)
+            }),
+            signoff: Some(domain::recovery::RecoveryOperatorSignoff {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                signoff_intent: "approve controlled recovery".to_string(),
+                signed_at_utc: "2026-04-06T12:00:00Z".to_string(),
+                audit_reference: Some("arb-1".to_string()),
+            }),
+            gate_outcomes: vec![
+                domain::recovery::RecoveryGateOutcome {
+                    gate: domain::recovery::RecoveryGateName::Freshness,
+                    passed: approved,
+                    reason_code: if approved {
+                        RecoveryReasonCode::FreshnessPass.code().to_string()
+                    } else {
+                        RecoveryReasonCode::FreshnessStale.code().to_string()
+                    },
+                    trigger: "freshness <= 30s".to_string(),
+                    context: "freshness evaluation".to_string(),
+                    action: "apply freshness gate".to_string(),
+                    verification: "freshness evidence".to_string(),
+                },
+                domain::recovery::RecoveryGateOutcome {
+                    gate: domain::recovery::RecoveryGateName::Reconciliation,
+                    passed: approved,
+                    reason_code: if approved {
+                        RecoveryReasonCode::ReconciliationPass.code().to_string()
+                    } else {
+                        RecoveryReasonCode::ReconciliationMismatch
+                            .code()
+                            .to_string()
+                    },
+                    trigger: "reconciliation < 0.1%".to_string(),
+                    context: "reconciliation evaluation".to_string(),
+                    action: "apply reconciliation gate".to_string(),
+                    verification: "reconciliation evidence".to_string(),
+                },
+                domain::recovery::RecoveryGateOutcome {
+                    gate: domain::recovery::RecoveryGateName::RiskChecksum,
+                    passed: approved,
+                    reason_code: if approved {
+                        RecoveryReasonCode::ChecksumMatch.code().to_string()
+                    } else {
+                        RecoveryReasonCode::ChecksumMismatch.code().to_string()
+                    },
+                    trigger: "checksum match".to_string(),
+                    context: "checksum evaluation".to_string(),
+                    action: "apply checksum gate".to_string(),
+                    verification: "checksum evidence".to_string(),
+                },
+                domain::recovery::RecoveryGateOutcome {
+                    gate: domain::recovery::RecoveryGateName::OperatorSignoff,
+                    passed: true,
+                    reason_code: RecoveryReasonCode::SignoffRecorded.code().to_string(),
+                    trigger: "signoff recorded".to_string(),
+                    context: "signoff evaluation".to_string(),
+                    action: "apply signoff gate".to_string(),
+                    verification: "signoff evidence".to_string(),
+                },
+            ],
+            failing_gate_codes: if approved {
+                Vec::new()
+            } else {
+                vec![
+                    RecoveryReasonCode::FreshnessStale.code().to_string(),
+                    RecoveryReasonCode::ReconciliationMismatch
+                        .code()
+                        .to_string(),
+                    RecoveryReasonCode::ChecksumMismatch.code().to_string(),
+                ]
+            },
+            audit_reference: Some("arb-1".to_string()),
+        }
     }
 }

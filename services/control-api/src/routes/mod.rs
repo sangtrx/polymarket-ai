@@ -33,6 +33,7 @@ use domain::incidents::{
     IncidentQueryFilters, IncidentReasonCode, IncidentTimelineEvent, IncidentTimelineStage,
     IncidentValidationIssue, apply_incident_query, build_incident_query_filters,
 };
+use domain::recovery::RecoveryReasonCode;
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
     MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue,
@@ -51,6 +52,10 @@ use governance_service::credentials::{
     TriggerEmergencyRotationInput, TriggerScheduledRotationInput,
 };
 use governance_service::market_policy::{ToggleMarketClusterInput, UpsertMarketPolicyProfileInput};
+use governance_service::recovery::{
+    EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput, QueryRecoveryGateRunInput,
+    RecoveryResumeExecutionEvidence,
+};
 use governance_service::risk_limits::{
     PendingRiskLimitProfilesInput, RiskLimitProfileMutationEvidence, RiskLimitRuleInput,
     UpsertRiskLimitProfileInput,
@@ -186,6 +191,21 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let recovery_routes = Router::new()
+        .route(
+            "/control/recovery/readiness/evaluate",
+            post(evaluate_recovery_readiness),
+        )
+        .route("/control/recovery/resume", post(execute_recovery_resume))
+        .route(
+            "/control/recovery/runs/{run_id}",
+            get(query_recovery_gate_run_by_run_id),
+        )
+        .route("/control/recovery/runs", get(query_recovery_gate_run))
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -198,6 +218,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(attribution_routes)
         .merge(incident_forensics_routes)
         .merge(emergency_control_routes)
+        .merge(recovery_routes)
         .with_state(state)
 }
 
@@ -2248,6 +2269,194 @@ pub async fn get_emergency_control_action_result(
         result,
         endpoint,
         "emergency_control_action_query",
+        "GET",
+        StatusCode::OK,
+    )
+}
+
+pub async fn evaluate_recovery_readiness(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<RecoveryReadinessEvaluatePayload>,
+) -> Response {
+    let endpoint = "/control/recovery/readiness/evaluate".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let run = match state.recovery_orchestrator.evaluate_recovery_readiness(
+        EvaluateRecoveryReadinessInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+            profile_key: payload.profile_key,
+            reconciliation_run_id: payload.reconciliation_run_id,
+            approved_checksum: payload.approved_checksum,
+            signoff_intent: payload.signoff_intent,
+            audit_reference: payload.audit_reference,
+        },
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            return recovery_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "recovery_readiness_evaluate",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    recovery_readiness_response(
+        &state,
+        &actor,
+        run,
+        endpoint,
+        "recovery_readiness_evaluate",
+        "POST",
+        StatusCode::OK,
+    )
+}
+
+pub async fn execute_recovery_resume(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<RecoveryResumePayload>,
+) -> Response {
+    let endpoint = "/control/recovery/resume".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let resumed_at_utc = payload
+        .resumed_at_utc
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let decision =
+        match state
+            .recovery_orchestrator
+            .execute_recovery_resume(ExecuteRecoveryResumeInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                resumed_at_utc: resumed_at_utc.clone(),
+                run_id: payload.run_id,
+            }) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return recovery_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "recovery_resume_execute",
+                    &actor,
+                    resumed_at_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    recovery_resume_response(
+        &state,
+        &actor,
+        decision,
+        endpoint,
+        "recovery_resume_execute",
+        "POST",
+    )
+}
+
+pub async fn query_recovery_gate_run_by_run_id(
+    State(state): State<ControlApiState>,
+    Path(run_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/recovery/runs/{run_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let run = match state
+        .recovery_orchestrator
+        .query_recovery_gate_run(QueryRecoveryGateRunInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+            run_id: Some(run_id),
+            query_correlation_id: None,
+        }) {
+        Ok(run) => run,
+        Err(error) => {
+            return recovery_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "recovery_readiness_query",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    recovery_readiness_response(
+        &state,
+        &actor,
+        run,
+        endpoint,
+        "recovery_readiness_query",
+        "GET",
+        StatusCode::OK,
+    )
+}
+
+pub async fn query_recovery_gate_run(
+    State(state): State<ControlApiState>,
+    Query(query): Query<RecoveryGateRunQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/recovery/runs".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let run = match state
+        .recovery_orchestrator
+        .query_recovery_gate_run(QueryRecoveryGateRunInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+            run_id: None,
+            query_correlation_id: query.correlation_id,
+        }) {
+        Ok(run) => run,
+        Err(error) => {
+            return recovery_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "recovery_readiness_query",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    recovery_readiness_response(
+        &state,
+        &actor,
+        run,
+        endpoint,
+        "recovery_readiness_query",
         "GET",
         StatusCode::OK,
     )
@@ -4728,6 +4937,214 @@ fn emergency_control_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn recovery_readiness_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    run: domain::recovery::RecoveryGateRunEvidence,
+    endpoint: String,
+    action_type: &'static str,
+    http_method: &'static str,
+    status: StatusCode,
+) -> Response {
+    let recommended_next_action = if run.readiness_status.as_str() == "approved" {
+        "Resume verification is approved; execute controlled recovery resume with recorded evidence."
+            .to_string()
+    } else {
+        "Remain in containment and resolve failed recovery gates before resuming.".to_string()
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action_type.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "run_id": run.run_id.clone(),
+            "profile_key": run.profile_key.clone(),
+            "readiness_status": run.readiness_status.as_str(),
+            "reason_code": run.reason_code.clone(),
+        }),
+        approval_reference: run.audit_reference.clone(),
+        timestamp: run.evaluated_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: run.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: run.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action_type.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            run.correlation_id.clone(),
+            run.evaluated_at_utc.clone(),
+        );
+    }
+
+    (
+        status,
+        axum::Json(RecoveryReadinessDecisionResponse {
+            status: "accepted",
+            action: action_type.to_string(),
+            run_id: run.run_id,
+            readiness_status: run.readiness_status.as_str().to_string(),
+            reason_code: run.reason_code,
+            profile_key: run.profile_key,
+            actor_id: run.actor_id,
+            actor_role: run.actor_role,
+            correlation_id: run.correlation_id,
+            requested_at_utc: run.requested_at_utc,
+            evaluated_at_utc: run.evaluated_at_utc.clone(),
+            resumed_at_utc: run.resumed_at_utc,
+            freshness_age_seconds: run.freshness_age_seconds,
+            freshness_observed_at_utc: run.freshness_observed_at_utc,
+            reconciliation_run_id: run.reconciliation_run_id,
+            reconciliation_mismatch_rate: run.reconciliation_mismatch_rate,
+            approved_checksum: run.approved_checksum,
+            computed_checksum: run.computed_checksum,
+            failing_gate_codes: run.failing_gate_codes,
+            gate_outcomes: run
+                .gate_outcomes
+                .into_iter()
+                .map(recovery_gate_outcome_item)
+                .collect(),
+            recommended_next_action,
+            audit_reference: run.audit_reference,
+            timestamp_utc: run.evaluated_at_utc,
+        }),
+    )
+        .into_response()
+}
+
+fn recovery_resume_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: RecoveryResumeExecutionEvidence,
+    endpoint: String,
+    action_type: &'static str,
+    http_method: &'static str,
+) -> Response {
+    let run = decision.run;
+    let verification = decision.verification;
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action_type.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "run_id": run.run_id.clone(),
+            "verification_reason_code": verification.reason_code.clone(),
+            "readiness_status": run.readiness_status.as_str(),
+        }),
+        approval_reference: run.audit_reference.clone(),
+        timestamp: verification.verified_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: verification.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: run.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action_type.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            run.correlation_id.clone(),
+            verification.verified_at_utc.clone(),
+        );
+    }
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(RecoveryResumeDecisionResponse {
+            status: "accepted",
+            action: action_type.to_string(),
+            run_id: run.run_id,
+            readiness_status: run.readiness_status.as_str().to_string(),
+            reason_code: run.reason_code,
+            verification_reason_code: verification.reason_code,
+            actor_id: run.actor_id,
+            actor_role: run.actor_role,
+            correlation_id: run.correlation_id,
+            resumed_at_utc: verification.verified_at_utc.clone(),
+            verification_timestamp_utc: verification.verified_at_utc,
+            timestamp_utc: run.evaluated_at_utc,
+            audit_reference: run.audit_reference,
+        }),
+    )
+        .into_response()
+}
+
+fn recovery_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<domain::recovery::RecoveryValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    (
+        recovery_service_error_status(error_code),
+        axum::Json(RecoveryServiceErrorResponse {
+            error_code,
+            reason_code: error_code.to_string(),
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| RecoveryFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn recovery_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == RecoveryReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == RecoveryReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
+        code if code == RecoveryReasonCode::NotFound.code() => StatusCode::NOT_FOUND,
+        code if code == RecoveryReasonCode::StaleEvidence.code() => StatusCode::CONFLICT,
+        code if code == RecoveryReasonCode::DependencyUnavailable.code()
+            || code == RecoveryReasonCode::PersistenceUnavailable.code()
+            || code == "recovery_gate_query_failed"
+            || code == "recovery_gate_row_decode_failed"
+            || code == "recovery_gate_runtime_unavailable" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        "recovery_gate_constraint_violation" => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn recovery_gate_outcome_item(
+    outcome: domain::recovery::RecoveryGateOutcome,
+) -> RecoveryGateOutcomeItem {
+    RecoveryGateOutcomeItem {
+        gate: outcome.gate.as_str().to_string(),
+        passed: outcome.passed,
+        reason_code: outcome.reason_code,
+        trigger: outcome.trigger,
+        context: outcome.context,
+        action: outcome.action,
+        verification: outcome.verification,
+    }
+}
+
 fn critical_approval_audit_outcome(
     outcome: ApprovalDecisionOutcome,
 ) -> Option<PrivilegedAuditOutcome> {
@@ -5219,6 +5636,29 @@ pub struct RiskLimitProfilePayload {
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoveryReadinessEvaluatePayload {
+    pub profile_key: String,
+    pub reconciliation_run_id: String,
+    pub approved_checksum: String,
+    pub signoff_intent: String,
+    #[serde(default)]
+    pub audit_reference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoveryResumePayload {
+    pub run_id: String,
+    #[serde(default)]
+    pub resumed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoveryGateRunQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5800,6 +6240,94 @@ pub struct EmergencyControlServiceErrorResponse {
     pub endpoint: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecoveryReadinessDecisionResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub run_id: String,
+    pub readiness_status: String,
+    pub reason_code: String,
+    pub profile_key: String,
+    pub actor_id: String,
+    pub actor_role: String,
+    pub correlation_id: String,
+    pub requested_at_utc: String,
+    pub evaluated_at_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at_utc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_age_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_observed_at_utc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation_mismatch_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_checksum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computed_checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failing_gate_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_outcomes: Vec<RecoveryGateOutcomeItem>,
+    pub recommended_next_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_reference: Option<String>,
+    pub timestamp_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryResumeDecisionResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub run_id: String,
+    pub readiness_status: String,
+    pub reason_code: String,
+    pub verification_reason_code: String,
+    pub actor_id: String,
+    pub actor_role: String,
+    pub correlation_id: String,
+    pub resumed_at_utc: String,
+    pub verification_timestamp_utc: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryServiceErrorResponse {
+    pub error_code: &'static str,
+    pub reason_code: String,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<RecoveryFieldError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryGateOutcomeItem {
+    pub gate: String,
+    pub passed: bool,
+    pub reason_code: String,
+    pub trigger: String,
+    pub context: String,
+    pub action: String,
+    pub verification: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5815,6 +6343,10 @@ mod tests {
     use domain::governance::{
         AuthorizationDecision, AuthorizationEvaluator, ControlAction, PrivilegedAuditOutcome,
         PrivilegedAuditRecord,
+    };
+    use domain::recovery::{
+        RecoveryGateName, RecoveryGateOutcome, RecoveryGateRunEvidence, RecoveryOperatorSignoff,
+        RecoveryReadinessStatus, RecoveryReasonCode, RecoveryResumeVerificationEnvelope,
     };
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
@@ -5833,6 +6365,11 @@ mod tests {
         market_policy::{
             MarketClusterToggleEvidence, MarketPolicyOrchestrator, MarketPolicyProfileEvidence,
             MarketPolicyServiceError, ToggleMarketClusterInput, UpsertMarketPolicyProfileInput,
+        },
+        recovery::{
+            EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput, QueryRecoveryGateRunInput,
+            RecoveryOrchestrator, RecoveryResumeExecutionEvidence, RecoveryService,
+            RecoveryServiceError,
         },
         risk_limits::{
             PendingRiskLimitProfilesInput, RiskLimitOrchestrator, RiskLimitProfileMutationEvidence,
@@ -5853,7 +6390,10 @@ mod tests {
     }
 
     fn unique_correlation_id(prefix: &str) -> String {
-        format!("{prefix}-{}", OffsetDateTime::now_utc().unix_timestamp_nanos())
+        format!(
+            "{prefix}-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        )
     }
 
     #[derive(Debug, Default)]
@@ -6404,6 +6944,210 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct StubRecoveryOrchestrator {
+        evaluate_error: Option<(&'static str, &'static str)>,
+        resume_error: Option<(&'static str, &'static str)>,
+        query_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl RecoveryOrchestrator for StubRecoveryOrchestrator {
+        fn evaluate_recovery_readiness(
+            &self,
+            input: EvaluateRecoveryReadinessInput,
+        ) -> Result<RecoveryGateRunEvidence, RecoveryServiceError> {
+            if let Some((code, message)) = self.evaluate_error {
+                return Err(RecoveryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            Ok(sample_recovery_gate_run(
+                format!("run::{}", input.correlation_id),
+                input.correlation_id,
+                input.profile_key,
+                RecoveryReadinessStatus::Approved,
+            ))
+        }
+
+        fn execute_recovery_resume(
+            &self,
+            input: ExecuteRecoveryResumeInput,
+        ) -> Result<RecoveryResumeExecutionEvidence, RecoveryServiceError> {
+            if let Some((code, message)) = self.resume_error {
+                return Err(RecoveryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            let run = sample_recovery_gate_run(
+                input.run_id.clone(),
+                input.correlation_id,
+                "default".to_string(),
+                RecoveryReadinessStatus::Approved,
+            );
+            Ok(RecoveryResumeExecutionEvidence {
+                verification: RecoveryResumeVerificationEnvelope {
+                    run_id: run.run_id.clone(),
+                    correlation_id: run.correlation_id.clone(),
+                    readiness_status: RecoveryReadinessStatus::Approved,
+                    reason_code: RecoveryReasonCode::ResumeApproved.code().to_string(),
+                    verified_at_utc: input.resumed_at_utc,
+                },
+                run,
+            })
+        }
+
+        fn query_recovery_gate_run(
+            &self,
+            input: QueryRecoveryGateRunInput,
+        ) -> Result<RecoveryGateRunEvidence, RecoveryServiceError> {
+            if let Some((code, message)) = self.query_error {
+                return Err(RecoveryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            if let Some(run_id) = input.run_id {
+                return Ok(sample_recovery_gate_run(
+                    run_id,
+                    input.correlation_id,
+                    "default".to_string(),
+                    RecoveryReadinessStatus::Approved,
+                ));
+            }
+            if let Some(query_correlation_id) = input.query_correlation_id {
+                return Ok(sample_recovery_gate_run(
+                    format!("run::{query_correlation_id}"),
+                    query_correlation_id,
+                    "default".to_string(),
+                    RecoveryReadinessStatus::Blocked,
+                ));
+            }
+
+            Err(RecoveryServiceError {
+                code: RecoveryReasonCode::InvalidPayload.code(),
+                message: "query missing run_id and correlation".to_string(),
+                field_errors: Vec::new(),
+            })
+        }
+    }
+
+    fn sample_recovery_gate_run(
+        run_id: String,
+        correlation_id: String,
+        profile_key: String,
+        readiness_status: RecoveryReadinessStatus,
+    ) -> RecoveryGateRunEvidence {
+        let approved = readiness_status == RecoveryReadinessStatus::Approved;
+        RecoveryGateRunEvidence {
+            run_id,
+            correlation_id,
+            readiness_status,
+            reason_code: if approved {
+                RecoveryReasonCode::ResumeApproved.code().to_string()
+            } else {
+                RecoveryReasonCode::ResumeBlocked.code().to_string()
+            },
+            actor_id: "ops-1".to_string(),
+            actor_role: "operational_control".to_string(),
+            profile_key,
+            requested_at_utc: "2026-04-06T12:00:00Z".to_string(),
+            evaluated_at_utc: "2026-04-06T12:00:01Z".to_string(),
+            resumed_at_utc: if approved {
+                Some("2026-04-06T12:00:02Z".to_string())
+            } else {
+                None
+            },
+            freshness_age_seconds: Some(if approved { 10.0 } else { 45.0 }),
+            freshness_observed_at_utc: Some("2026-04-06T12:00:00Z".to_string()),
+            reconciliation_run_id: Some("recon-1".to_string()),
+            reconciliation_mismatch_rate: Some(if approved { 0.0002 } else { 0.01 }),
+            approved_checksum: Some("a".repeat(64)),
+            computed_checksum: Some(if approved {
+                "a".repeat(64)
+            } else {
+                "b".repeat(64)
+            }),
+            signoff: Some(RecoveryOperatorSignoff {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                signoff_intent: "approve controlled recovery".to_string(),
+                signed_at_utc: "2026-04-06T12:00:00Z".to_string(),
+                audit_reference: Some("arb-2026-0007".to_string()),
+            }),
+            gate_outcomes: vec![
+                RecoveryGateOutcome {
+                    gate: RecoveryGateName::Freshness,
+                    passed: approved,
+                    reason_code: if approved {
+                        RecoveryReasonCode::FreshnessPass.code().to_string()
+                    } else {
+                        RecoveryReasonCode::FreshnessStale.code().to_string()
+                    },
+                    trigger: "freshness <= 30s".to_string(),
+                    context: "freshness telemetry observed".to_string(),
+                    action: "apply freshness gate".to_string(),
+                    verification: "freshness validated".to_string(),
+                },
+                RecoveryGateOutcome {
+                    gate: RecoveryGateName::Reconciliation,
+                    passed: approved,
+                    reason_code: if approved {
+                        RecoveryReasonCode::ReconciliationPass.code().to_string()
+                    } else {
+                        RecoveryReasonCode::ReconciliationMismatch
+                            .code()
+                            .to_string()
+                    },
+                    trigger: "reconciliation mismatch < 0.1%".to_string(),
+                    context: "reconciliation evidence observed".to_string(),
+                    action: "apply reconciliation gate".to_string(),
+                    verification: "reconciliation validated".to_string(),
+                },
+                RecoveryGateOutcome {
+                    gate: RecoveryGateName::RiskChecksum,
+                    passed: approved,
+                    reason_code: if approved {
+                        RecoveryReasonCode::ChecksumMatch.code().to_string()
+                    } else {
+                        RecoveryReasonCode::ChecksumMismatch.code().to_string()
+                    },
+                    trigger: "checksum exact match".to_string(),
+                    context: "checksum evidence observed".to_string(),
+                    action: "apply checksum gate".to_string(),
+                    verification: "checksum validated".to_string(),
+                },
+                RecoveryGateOutcome {
+                    gate: RecoveryGateName::OperatorSignoff,
+                    passed: true,
+                    reason_code: RecoveryReasonCode::SignoffRecorded.code().to_string(),
+                    trigger: "signoff recorded".to_string(),
+                    context: "signoff evidence observed".to_string(),
+                    action: "apply signoff gate".to_string(),
+                    verification: "signoff validated".to_string(),
+                },
+            ],
+            failing_gate_codes: if approved {
+                Vec::new()
+            } else {
+                vec![
+                    RecoveryReasonCode::FreshnessStale.code().to_string(),
+                    RecoveryReasonCode::ReconciliationMismatch
+                        .code()
+                        .to_string(),
+                    RecoveryReasonCode::ChecksumMismatch.code().to_string(),
+                ]
+            },
+            audit_reference: Some("arb-2026-0007".to_string()),
+        }
+    }
+
     fn test_app_with_market_policy_orchestrator(
         market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     ) -> Router {
@@ -6419,6 +7163,7 @@ mod tests {
             market_policy_orchestrator,
             Arc::new(RiskLimitService::default()),
             Arc::new(SafetyControlService::default()),
+            Arc::new(RecoveryService::default()),
         ))
     }
 
@@ -6437,6 +7182,7 @@ mod tests {
             Arc::new(StubMarketPolicyOrchestrator::default()),
             Arc::new(RiskLimitService::default()),
             Arc::new(SafetyControlService::default()),
+            Arc::new(RecoveryService::default()),
         ))
     }
 
@@ -6455,6 +7201,7 @@ mod tests {
             Arc::new(StubMarketPolicyOrchestrator::default()),
             risk_limit_orchestrator,
             Arc::new(SafetyControlService::default()),
+            Arc::new(RecoveryService::default()),
         ))
     }
 
@@ -6473,6 +7220,26 @@ mod tests {
             Arc::new(StubMarketPolicyOrchestrator::default()),
             Arc::new(RiskLimitService::default()),
             safety_control_orchestrator,
+            Arc::new(RecoveryService::default()),
+        ))
+    }
+
+    fn test_app_with_recovery_orchestrator(
+        recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
+    ) -> Router {
+        test_app_with_state(ControlApiState::with_all_orchestrators(
+            Arc::new(GovernanceAuthorizationGuard::new(
+                AuthorizationEvaluator::default(),
+            )),
+            Arc::new(HeaderTokenAuthenticator),
+            Arc::new(CapturingAuditAppender::default()),
+            Arc::new(GovernanceApprovalService::default()),
+            Arc::new(CredentialRotationService::default()),
+            Arc::new(AllocationPolicyService::default()),
+            Arc::new(StubMarketPolicyOrchestrator::default()),
+            Arc::new(RiskLimitService::default()),
+            Arc::new(SafetyControlService::default()),
+            recovery_orchestrator,
         ))
     }
 
@@ -6490,6 +7257,175 @@ mod tests {
             .expect("health request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn recovery_readiness_endpoint_returns_gate_evidence() {
+        let response = test_app_with_recovery_orchestrator(Arc::new(
+            StubRecoveryOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/recovery/readiness/evaluate")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-recovery-evaluate-001")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "profile_key": "default",
+                        "reconciliation_run_id": "recon-1",
+                        "approved_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "signoff_intent": "approve controlled recovery",
+                        "audit_reference": "arb-2026-0007"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["readiness_status"], "approved");
+        assert_eq!(payload["reason_code"], "recovery_resume_approved");
+        assert_eq!(payload["gate_outcomes"].as_array().map(Vec::len), Some(4));
+    }
+
+    #[tokio::test]
+    async fn recovery_resume_endpoint_maps_stale_evidence_errors() {
+        let response = test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator {
+            resume_error: Some((RecoveryReasonCode::StaleEvidence.code(), "resume blocked")),
+            ..StubRecoveryOrchestrator::default()
+        }))
+        .oneshot(
+            Request::builder()
+                .uri("/control/recovery/resume")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-recovery-resume-001")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "run_id": "run::corr-recovery-resume-001",
+                        "resumed_at_utc": "2026-04-06T12:00:05Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            RecoveryReasonCode::StaleEvidence.code()
+        );
+        assert_eq!(payload["action"], "recovery_resume_execute");
+    }
+
+    #[tokio::test]
+    async fn recovery_query_endpoint_supports_correlation_lookup() {
+        let response =
+            test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator::default()))
+                .oneshot(
+                    Request::builder()
+                        .uri("/control/recovery/runs?correlation_id=corr-recovery-query-001")
+                        .method("GET")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", "corr-recovery-query-request-001")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["readiness_status"], "blocked");
+        assert_eq!(payload["reason_code"], "recovery_resume_blocked");
+        assert!(
+            payload["failing_gate_codes"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_query_endpoint_measures_p95_latency_within_target_for_repeated_queries() {
+        let app =
+            test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator::default()));
+        let mut latencies = Vec::with_capacity(40);
+
+        for index in 0..40 {
+            let correlation = format!("corr-recovery-query-p95-{index:03}");
+            let uri = format!("/control/recovery/runs?correlation_id={correlation}");
+            let started = std::time::Instant::now();
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri.as_str())
+                        .method("GET")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", correlation)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body should be readable"),
+            )
+            .expect("payload should be valid json");
+            assert_eq!(payload["readiness_status"], "blocked");
+
+            latencies.push(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+        }
+
+        latencies.sort_unstable();
+        let p95_index = (latencies.len() * 95).div_ceil(100) - 1;
+        let p95_latency_ms = latencies[p95_index];
+        assert!(
+            p95_latency_ms <= 5_000,
+            "recovery query p95 latency should remain <= 5000ms, got {p95_latency_ms}",
+        );
     }
 
     #[tokio::test]

@@ -287,6 +287,12 @@ a {
   color: var(--safety-action-completed-text);
 }
 
+.safety-action-button[data-state="blocked-with-reasons"] {
+  background: var(--status-warning-bg);
+  border-color: var(--risk-warning);
+  color: var(--safety-action-gated-text);
+}
+
 .safety-action-confirmation {
   background: var(--risk-required-action-bg);
   border: 1px solid var(--risk-required-action-border);
@@ -307,6 +313,38 @@ a {
   background: var(--surface-muted);
   border: 1px solid var(--border-subtle);
   border-radius: var(--foundation-radius-12);
+  padding: var(--foundation-space-1);
+}
+
+.safety-action-recovery-evidence {
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--foundation-radius-12);
+  padding: var(--foundation-space-1);
+}
+
+.safety-action-recovery-blocked {
+  background: var(--status-warning-bg);
+  border: 1px solid var(--risk-warning);
+  border-radius: var(--foundation-radius-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--foundation-space-1);
+  padding: var(--foundation-space-1);
+}
+
+.safety-action-recovery-failures {
+  display: grid;
+  gap: var(--foundation-space-1);
+}
+
+.safety-action-recovery-failure {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--foundation-radius-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--foundation-space-1);
   padding: var(--foundation-space-1);
 }
 

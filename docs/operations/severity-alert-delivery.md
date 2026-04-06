@@ -88,3 +88,4 @@ For each delivery attempt:
 
 1. Incident forensics timeline: `docs/operations/incident-search-causal-timeline-forensics.md`
 2. Emergency containment controls: `docs/operations/emergency-safe-state-controls.md`
+3. Controlled recovery readiness gates: `docs/operations/controlled-recovery-readiness-gates.md`

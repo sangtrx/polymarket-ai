@@ -1,3 +1,9 @@
+import type {
+  RecoveryGateOutcomeEvidence,
+  RecoveryReadinessDecision,
+  RecoveryResumeDecision,
+} from "./control-actions";
+
 export type ShellSearchParams = Record<string, string | string[] | undefined>;
 
 export interface ShellReadModelSnapshotLike {
@@ -34,9 +40,25 @@ export interface RiskPostureViewModel {
   acknowledgementTargetMs: 1_000;
   reflectionTargetMs: 5_000;
   confirmationTargetMs: 10_000;
-  resumeState: "gated";
+  resumeState: "gated" | "in-progress" | "completed" | "blocked-with-reasons";
   resumeStateReason: string;
+  resumeFailureDetails: RecoveryGateFailureDetail[];
+  resumeRunId?: string;
+  resumeVerifiedAtIso?: string;
+  resumeProfileKey: string;
+  resumeReconciliationRunId: string;
+  resumeApprovedChecksum: string;
+  resumeSignoffIntent: string;
   evidence: RiskPostureEvidence;
+}
+
+export interface RecoveryGateFailureDetail {
+  gate: string;
+  reasonCode: string;
+  trigger: string;
+  context: string;
+  action: string;
+  verification: string;
 }
 
 export interface EmergencyControlEvidenceInput {
@@ -51,7 +73,13 @@ export interface EmergencyControlEvidenceInput {
 }
 
 const RESUME_GATED_REASON =
-  "Resume is gated until Story 3.7 introduces controlled recovery readiness gates.";
+  "Run controlled recovery readiness evaluation before resuming normal trading.";
+const DEFAULT_RESUME_PROFILE_KEY = "default";
+const DEFAULT_RESUME_RECONCILIATION_RUN_ID = "recon-default";
+const DEFAULT_RESUME_APPROVED_CHECKSUM =
+  "0000000000000000000000000000000000000000000000000000000000000000";
+const DEFAULT_RESUME_SIGNOFF_INTENT =
+  "Operator confirms controlled recovery readiness evidence.";
 
 const SOURCE_PATTERN = /^[a-z0-9._:-]+$/i;
 
@@ -106,7 +134,7 @@ const POSTURE_DETAILS: Record<
     recommendedNextAction:
       "Maintain containment and follow governance recovery checklist.",
     requiredActionGuidance:
-      "Required action: keep locked-safe mode active until Story 3.7 recovery gates are available.",
+      "Required action: run controlled recovery readiness evaluation before executing resume.",
     fallbackMode: "paused",
     fallbackReasonCode: "risk_posture_locked_safe",
   },
@@ -158,6 +186,17 @@ function normalizeTimestamp(raw: string | undefined, fallback: string): string {
     return new Date(fallbackParsed).toISOString();
   }
   return new Date().toISOString();
+}
+
+function normalizeOptionalTimestamp(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const parsed = Date.parse(raw);
+  if (Number.isNaN(parsed)) {
+    return undefined;
+  }
+  return new Date(parsed).toISOString();
 }
 
 function normalizePosture(value: string | undefined): RiskPosture | undefined {
@@ -222,6 +261,35 @@ function normalizeReasonCode(value: string | undefined, posture: RiskPosture): s
   );
 }
 
+function normalizeResumeState(
+  value: string | undefined,
+): RiskPostureViewModel["resumeState"] | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (
+    normalized === "gated" ||
+    normalized === "in-progress" ||
+    normalized === "completed" ||
+    normalized === "blocked-with-reasons" ||
+    normalized === "blocked_with_reasons"
+  ) {
+    return normalized === "blocked_with_reasons"
+      ? "blocked-with-reasons"
+      : (normalized as RiskPostureViewModel["resumeState"]);
+  }
+  return undefined;
+}
+
+function normalizeChecksum(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized || !/^[0-9a-f]{64}$/.test(normalized)) {
+    return undefined;
+  }
+  return normalized;
+}
+
 export function deriveRiskPostureFromMode(mode: string): RiskPosture {
   const normalized = mode.trim().toLowerCase();
   if (normalized === "paused") {
@@ -254,6 +322,12 @@ export function resolveRiskPostureViewModel(
     shellSnapshot.freshness.lastUpdatedIso,
   );
 
+  const resumeState =
+    normalizeResumeState(firstValue(searchParams.resumeState)) ?? "gated";
+  const resumeStateReason =
+    normalizeOptionalToken(firstValue(searchParams.resumeStateReason), 240) ??
+    RESUME_GATED_REASON;
+
   return {
     posture,
     headline: details.headline,
@@ -265,8 +339,27 @@ export function resolveRiskPostureViewModel(
     acknowledgementTargetMs: 1_000,
     reflectionTargetMs: 5_000,
     confirmationTargetMs: 10_000,
-    resumeState: "gated",
-    resumeStateReason: RESUME_GATED_REASON,
+    resumeState,
+    resumeStateReason,
+    resumeFailureDetails: [],
+    resumeRunId: normalizeOptionalToken(firstValue(searchParams.resumeRunId), 180),
+    resumeVerifiedAtIso: normalizeOptionalTimestamp(
+      firstValue(searchParams.resumeVerifiedAtUtc),
+    ),
+    resumeProfileKey:
+      normalizeOptionalToken(firstValue(searchParams.resumeProfileKey), 120) ??
+      DEFAULT_RESUME_PROFILE_KEY,
+    resumeReconciliationRunId:
+      normalizeOptionalToken(
+        firstValue(searchParams.resumeReconciliationRunId),
+        180,
+      ) ?? DEFAULT_RESUME_RECONCILIATION_RUN_ID,
+    resumeApprovedChecksum:
+      normalizeChecksum(firstValue(searchParams.resumeApprovedChecksum)) ??
+      DEFAULT_RESUME_APPROVED_CHECKSUM,
+    resumeSignoffIntent:
+      normalizeOptionalToken(firstValue(searchParams.resumeSignoffIntent), 200) ??
+      DEFAULT_RESUME_SIGNOFF_INTENT,
     evidence: {
       lastUpdatedIso,
       source: evidenceSource,
@@ -302,6 +395,11 @@ export function withEmergencyControlEvidence(
     recommendedNextAction: details.recommendedNextAction,
     requiredActionGuidance: details.requiredActionGuidance,
     ariaLive: resolveAriaLive(posture),
+    resumeState: "gated",
+    resumeStateReason: RESUME_GATED_REASON,
+    resumeFailureDetails: [],
+    resumeRunId: undefined,
+    resumeVerifiedAtIso: undefined,
     evidence: {
       ...current.evidence,
       lastUpdatedIso: normalizeTimestamp(
@@ -321,6 +419,101 @@ export function withEmergencyControlEvidence(
       auditReference:
         normalizeOptionalToken(evidence.auditReference, 180) ??
         current.evidence.auditReference,
+    },
+  };
+}
+
+function toRecoveryGateFailureDetail(
+  outcome: RecoveryGateOutcomeEvidence,
+): RecoveryGateFailureDetail {
+  return {
+    gate: outcome.gate,
+    reasonCode: outcome.reasonCode,
+    trigger: outcome.trigger,
+    context: outcome.context,
+    action: outcome.action,
+    verification: outcome.verification,
+  };
+}
+
+export function withRecoveryReadinessEvidence(
+  current: RiskPostureViewModel,
+  decision: RecoveryReadinessDecision,
+): RiskPostureViewModel {
+  const blockedFailures = decision.gateOutcomes
+    .filter((outcome) => !outcome.passed)
+    .map(toRecoveryGateFailureDetail);
+  const isApproved = decision.readinessStatus === "approved";
+  const posture = isApproved ? "locked-safe" : "locked-safe";
+  const details = POSTURE_DETAILS[posture];
+
+  return {
+    ...current,
+    posture,
+    headline: details.headline,
+    summary: details.summary,
+    recommendedNextAction: details.recommendedNextAction,
+    requiredActionGuidance: details.requiredActionGuidance,
+    ariaLive: resolveAriaLive(posture),
+    resumeState: isApproved ? "in-progress" : "blocked-with-reasons",
+    resumeStateReason: decision.recommendedNextAction,
+    resumeFailureDetails: blockedFailures,
+    resumeRunId: decision.runId,
+    resumeVerifiedAtIso: undefined,
+    resumeProfileKey: decision.profileKey,
+    resumeReconciliationRunId:
+      decision.reconciliationRunId ?? current.resumeReconciliationRunId,
+    resumeApprovedChecksum:
+      decision.approvedChecksum ?? current.resumeApprovedChecksum,
+    evidence: {
+      ...current.evidence,
+      lastUpdatedIso: normalizeTimestamp(
+        decision.evaluatedAtUtc,
+        current.evidence.lastUpdatedIso,
+      ),
+      source: "control_api.recovery.readiness",
+      reasonCode: decision.reasonCode,
+      actionId: decision.runId,
+      correlationId: decision.correlationId,
+      auditReference: decision.auditReference ?? current.evidence.auditReference,
+    },
+  };
+}
+
+export function withRecoveryResumeEvidence(
+  current: RiskPostureViewModel,
+  decision: RecoveryResumeDecision,
+): RiskPostureViewModel {
+  const details = POSTURE_DETAILS.normal;
+  return {
+    ...current,
+    posture: "normal",
+    headline: details.headline,
+    summary: details.summary,
+    recommendedNextAction: details.recommendedNextAction,
+    requiredActionGuidance: details.requiredActionGuidance,
+    ariaLive: resolveAriaLive("normal"),
+    resumeState: "completed",
+    resumeStateReason:
+      "Controlled recovery resume is verified. Continue monitoring post-resume telemetry.",
+    resumeFailureDetails: [],
+    resumeRunId: decision.runId,
+    resumeVerifiedAtIso: normalizeTimestamp(
+      decision.verificationTimestampUtc,
+      current.evidence.lastUpdatedIso,
+    ),
+    evidence: {
+      ...current.evidence,
+      lastUpdatedIso: normalizeTimestamp(
+        decision.verificationTimestampUtc,
+        current.evidence.lastUpdatedIso,
+      ),
+      source: "control_api.recovery.resume",
+      resultingMode: "normal",
+      reasonCode: decision.verificationReasonCode,
+      actionId: decision.runId,
+      correlationId: decision.correlationId,
+      auditReference: decision.auditReference ?? current.evidence.auditReference,
     },
   };
 }
