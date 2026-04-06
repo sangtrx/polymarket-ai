@@ -57,3 +57,8 @@ Out of scope:
 
 1. severity-based alert delivery and channel routing (Story 3.6)
 2. controlled recovery readiness gate execution (Story 3.7)
+
+## Related runbooks
+
+1. severity alert delivery and fallback policy: `docs/operations/severity-alert-delivery.md`
+2. emergency containment controls: `docs/operations/emergency-safe-state-controls.md`

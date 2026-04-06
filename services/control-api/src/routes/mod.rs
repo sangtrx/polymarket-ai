@@ -9,6 +9,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use domain::alerts::{
+    AlertContractError, AlertDeliveryAttempt, AlertDeliveryChannel, AlertDeliveryOutcome,
+    AlertDispatchStatus, AlertReasonCode, AlertSeverity, AlertTriggerDecision, AlertTriggerInput,
+    AlertValidationIssue, IncidentAlert, compose_alert_identifier, critical_dispatch_within_sla,
+    evaluate_fr29_trigger, normalize_alert_identifier, should_emit_alert,
+};
 use domain::allocation::{
     DEFAULT_EXPOSURE_DRIFT_THRESHOLD_PCT, DEFAULT_POLICY_STALE_AFTER_SECONDS,
     DEFAULT_RELATIVE_ALPHA_DRIFT_THRESHOLD_PCT, RebalanceReasonCode,
@@ -51,6 +57,10 @@ use governance_service::risk_limits::{
 };
 use governance_service::safety_controls::ExecuteManualSafetyControlInput;
 use persistence::postgres::attribution_snapshots::load_latest_attribution_snapshots;
+use persistence::postgres::incident_alerts::{
+    append_alert_delivery_attempt, create_incident_alert, load_alert_delivery_attempts,
+    load_recent_incident_alerts, update_incident_alert_status,
+};
 use persistence::postgres::incident_query_views::load_incident_forensics_timeline;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -139,13 +149,21 @@ pub fn app_router(state: ControlApiState) -> Router {
             require_authenticated_actor,
         ));
     let attribution_routes = Router::new()
-        .route("/control/portfolio/attribution", get(read_portfolio_attribution))
+        .route(
+            "/control/portfolio/attribution",
+            get(read_portfolio_attribution),
+        )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
             require_authenticated_actor,
         ));
     let incident_forensics_routes = Router::new()
         .route("/control/incidents/forensics", get(read_incident_forensics))
+        .route("/control/incidents/alerts", get(list_incident_alerts))
+        .route(
+            "/control/incidents/alerts/dispatch",
+            post(dispatch_incident_alert),
+        )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
             require_authenticated_actor,
@@ -241,7 +259,9 @@ pub async fn rebalance_portfolio(
     }
 
     let mut approval_reference = None;
-    if payload.require_execution && let Some(request_id) = approval_request_id {
+    if payload.require_execution
+        && let Some(request_id) = approval_request_id
+    {
         let approval_decision =
             match state
                 .approval_orchestrator
@@ -972,21 +992,21 @@ pub async fn read_portfolio_attribution(
         .as_of_utc
         .clone()
         .unwrap_or_else(|| authorization.timestamp_utc.clone());
-    let dependency_state = match parse_attribution_dependency_state(query.dependency_state.as_deref())
-    {
-        Ok(state) => state,
-        Err(error) => {
-            return attribution_service_error_response(
-                error.code,
-                error.message,
-                error.field_errors,
-                "attribution_query",
-                &actor,
-                authorization.timestamp_utc.clone(),
-                endpoint,
-            );
-        }
-    };
+    let dependency_state =
+        match parse_attribution_dependency_state(query.dependency_state.as_deref()) {
+            Ok(state) => state,
+            Err(error) => {
+                return attribution_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "attribution_query",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
 
     match dependency_state {
         AttributionDependencyState::ProjectionUnavailable => {
@@ -1150,7 +1170,8 @@ pub async fn read_incident_forensics(
         }
     };
 
-    let dependency_state = match parse_incident_dependency_state(query.dependency_state.as_deref()) {
+    let dependency_state = match parse_incident_dependency_state(query.dependency_state.as_deref())
+    {
         Ok(state) => state,
         Err(error) => {
             return incident_service_error_response(
@@ -1206,7 +1227,8 @@ pub async fn read_incident_forensics(
             }
         }
     } else {
-        let synthetic = synthetic_incident_timeline(&authorization.timestamp_utc, &actor.correlation_id);
+        let synthetic =
+            synthetic_incident_timeline(&authorization.timestamp_utc, &actor.correlation_id);
         match apply_incident_query(&synthetic, &filters) {
             Ok(events) => events,
             Err(error) => {
@@ -1234,6 +1256,800 @@ pub async fn read_incident_forensics(
         authorization.timestamp_utc.clone(),
         endpoint,
     )
+}
+
+pub async fn list_incident_alerts(
+    State(state): State<ControlApiState>,
+    Query(query): Query<IncidentAlertsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/incidents/alerts".to_string();
+    let authorization = match authorize_incident_alert_action(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "incident_alerts_query",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let limit = match parse_alert_limit(query.limit) {
+        Ok(limit) => limit,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    let dependency_state = match parse_incident_dependency_state(query.dependency_state.as_deref())
+    {
+        Ok(state) => state,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::InvalidPayload.code(),
+                error.message,
+                error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlertValidationIssue {
+                        field: issue.field,
+                        code: issue.code,
+                        message: issue.message,
+                    })
+                    .collect(),
+                "incident_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    match dependency_state {
+        IncidentDependencyState::DependencyUnavailable => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::DependencyUnavailable.code(),
+                "incident alert dependencies are unavailable".to_string(),
+                Vec::new(),
+                "incident_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::StaleEvidence => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::StaleEvidence.code(),
+                "incident alert evidence is stale".to_string(),
+                Vec::new(),
+                "incident_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::Healthy => {}
+    }
+
+    let mut alerts = if let Some(pool) = state.attribution_pool.as_ref() {
+        match load_recent_incident_alerts(pool, limit).await {
+            Ok(alerts) => alerts,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "incident_alerts_query",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+    } else {
+        synthetic_incident_alerts(&authorization.timestamp_utc, &actor.correlation_id)
+    };
+
+    let mut alert_items = Vec::new();
+    for alert in alerts.drain(..) {
+        let attempts = if let Some(pool) = state.attribution_pool.as_ref() {
+            match load_alert_delivery_attempts(pool, &alert.alert_id, 16).await {
+                Ok(attempts) => attempts,
+                Err(error) => {
+                    return incident_alert_service_error_response(
+                        error.code,
+                        error.message,
+                        error.field_errors,
+                        "incident_alerts_query",
+                        &actor,
+                        authorization.timestamp_utc.clone(),
+                        endpoint,
+                    );
+                }
+            }
+        } else {
+            synthetic_alert_delivery_attempts(&alert)
+        };
+
+        alert_items.push(IncidentAlertItem {
+            alert_id: alert.alert_id,
+            severity: alert.severity.as_str().to_string(),
+            impacted_subsystem: alert.impacted_subsystem,
+            cause: alert.cause,
+            recommended_next_action: alert.recommended_next_action,
+            evidence_link: alert.evidence_link,
+            issued_at: alert.issued_at,
+            correlation_id: alert.correlation_id,
+            reason_code: alert.reason_code,
+            status: alert.status.as_str().to_string(),
+            delivered_at: alert.delivered_at,
+            failed_at: alert.failed_at,
+            attempts: attempts
+                .into_iter()
+                .map(|attempt| IncidentAlertDeliveryAttemptItem {
+                    attempt_number: i64::from(attempt.attempt_number),
+                    channel: attempt.channel.as_str().to_string(),
+                    outcome: attempt.outcome.as_str().to_string(),
+                    reason_code: attempt.reason_code,
+                    attempted_at: attempt.attempted_at,
+                    delivered_at: attempt.delivered_at,
+                    failed_at: attempt.failed_at,
+                })
+                .collect(),
+        });
+    }
+
+    incident_alert_query_response(
+        &state,
+        &actor,
+        alert_items,
+        authorization.timestamp_utc.clone(),
+        endpoint,
+    )
+}
+
+pub async fn dispatch_incident_alert(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<IncidentAlertDispatchPayload>,
+) -> Response {
+    let endpoint = "/control/incidents/alerts/dispatch".to_string();
+    let authorization = match authorize_incident_alert_action(
+        &state,
+        &actor,
+        &endpoint,
+        "POST",
+        "incident_alert_dispatch",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let dependency_state =
+        match parse_incident_dependency_state(payload.dependency_state.as_deref()) {
+            Ok(state) => state,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    AlertReasonCode::InvalidPayload.code(),
+                    error.message,
+                    error
+                        .field_errors
+                        .into_iter()
+                        .map(|issue| AlertValidationIssue {
+                            field: issue.field,
+                            code: issue.code,
+                            message: issue.message,
+                        })
+                        .collect(),
+                    "incident_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+
+    match dependency_state {
+        IncidentDependencyState::DependencyUnavailable => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::DependencyUnavailable.code(),
+                "incident alert dispatch dependencies are unavailable".to_string(),
+                Vec::new(),
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::StaleEvidence => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::StaleEvidence.code(),
+                "incident alert dispatch evidence is stale".to_string(),
+                Vec::new(),
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::Healthy => {}
+    }
+
+    let correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(normalize_alert_identifier)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| normalize_alert_identifier(&actor.correlation_id));
+    let observed_at = payload
+        .observed_at
+        .clone()
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let trigger_input = AlertTriggerInput {
+        drawdown_pct_of_daily_limit: payload.drawdown_pct_of_daily_limit.unwrap_or(0.0),
+        stream_disconnect_seconds: payload.stream_disconnect_seconds.unwrap_or(0),
+        reconciliation_lag_seconds: payload.reconciliation_lag_seconds.unwrap_or(0),
+        stale_data_detected: payload.stale_data_detected.unwrap_or(false),
+        policy_bypass_attempt: payload.policy_bypass_attempt.unwrap_or(false),
+        correlation_id: correlation_id.clone(),
+        observed_at,
+    };
+    let trigger_decision = match evaluate_fr29_trigger(&trigger_input) {
+        Ok(Some(decision)) => decision,
+        Ok(None) => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::NoTrigger.code(),
+                "no FR29 trigger threshold was breached; alert dispatch not executed".to_string(),
+                Vec::new(),
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    let issued_at = payload
+        .issued_at
+        .clone()
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let reason_code = trigger_decision.reason_code;
+    let alert_id = match compose_alert_identifier(&correlation_id, reason_code, &issued_at) {
+        Ok(identifier) => identifier,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    let effective_decision = AlertTriggerDecision {
+        severity: trigger_decision.severity,
+        reason_code: trigger_decision.reason_code,
+        impacted_subsystem: payload
+            .impacted_subsystem
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(trigger_decision.impacted_subsystem.as_str())
+            .to_string(),
+        cause: payload
+            .cause
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(trigger_decision.cause.as_str())
+            .to_string(),
+        recommended_next_action: payload
+            .recommended_next_action
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(trigger_decision.recommended_next_action.as_str())
+            .to_string(),
+    };
+
+    let evidence_link = payload
+        .evidence_link
+        .as_deref()
+        .unwrap_or("https://docs.example.com/operations/severity-alert-delivery")
+        .to_string();
+    let mut alert = match domain::alerts::build_incident_alert(
+        &effective_decision,
+        &alert_id,
+        &issued_at,
+        &correlation_id,
+        &evidence_link,
+        Some(&effective_decision.recommended_next_action),
+    ) {
+        Ok(alert) => alert,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+    alert.cause = effective_decision.cause.clone();
+
+    let dedupe_window_seconds = payload.dedupe_window_seconds.unwrap_or(300);
+    let prior_alerts = if let Some(pool) = state.attribution_pool.as_ref() {
+        match load_recent_incident_alerts(pool, 200).await {
+            Ok(alerts) => alerts,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "incident_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let should_emit = match should_emit_alert(
+        &prior_alerts,
+        alert.reason_code.as_str(),
+        &alert.correlation_id,
+        &alert.issued_at,
+        dedupe_window_seconds,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+    if !should_emit {
+        return incident_alert_service_error_response(
+            AlertReasonCode::DuplicateSuppressed.code(),
+            "duplicate alert suppressed for this correlation and dedupe window".to_string(),
+            Vec::new(),
+            "incident_alert_dispatch",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    }
+
+    if let Some(pool) = state.attribution_pool.as_ref() {
+        if let Err(error) = create_incident_alert(pool, &alert).await {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    }
+
+    let simulation = match simulate_alert_dispatch(&alert, &payload) {
+        Ok(simulation) => simulation,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    if let Some(pool) = state.attribution_pool.as_ref() {
+        for attempt in &simulation.attempts {
+            if let Err(error) = append_alert_delivery_attempt(pool, attempt).await {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "incident_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+        if let Err(error) = update_incident_alert_status(
+            pool,
+            &simulation.alert.alert_id,
+            simulation.alert.status,
+            &simulation.alert.reason_code,
+            simulation.alert.delivered_at.as_deref(),
+            simulation.alert.failed_at.as_deref(),
+        )
+        .await
+        {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "incident_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    }
+
+    if let Some((failure_code, failure_message)) = simulation.failure {
+        return incident_alert_service_error_response(
+            failure_code.code(),
+            failure_message,
+            Vec::new(),
+            "incident_alert_dispatch",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    }
+
+    incident_alert_dispatch_response(
+        &state,
+        &actor,
+        simulation,
+        authorization.timestamp_utc.clone(),
+        endpoint,
+    )
+}
+
+struct AlertDispatchSimulation {
+    alert: IncidentAlert,
+    attempts: Vec<AlertDeliveryAttempt>,
+    fallback_used: bool,
+    dispatch_latency_seconds: i64,
+    failure: Option<(AlertReasonCode, String)>,
+}
+
+fn simulate_alert_dispatch(
+    alert: &IncidentAlert,
+    payload: &IncidentAlertDispatchPayload,
+) -> Result<AlertDispatchSimulation, AlertContractError> {
+    let primary_channel = payload.primary_channel.as_deref().unwrap_or("pagerduty");
+    let primary_channel = AlertDeliveryChannel::parse(primary_channel)?;
+    let fallback_channel = payload.fallback_channel.as_deref().unwrap_or("slack");
+    let fallback_channel = AlertDeliveryChannel::parse(fallback_channel)?;
+    let simulated_delay_seconds = payload.simulated_delivery_delay_seconds.unwrap_or(5);
+    if simulated_delay_seconds < 0 {
+        return Err(AlertContractError::invalid_payload_with_issues(
+            "simulated_delivery_delay_seconds must be >= 0",
+            vec![AlertValidationIssue {
+                field: "simulated_delivery_delay_seconds",
+                code: AlertReasonCode::InvalidPayload.code(),
+                message: "simulated_delivery_delay_seconds must be >= 0".to_string(),
+            }],
+        ));
+    }
+
+    let issued = OffsetDateTime::parse(&alert.issued_at, &Rfc3339).map_err(|_| {
+        AlertContractError::invalid_payload_with_issues(
+            "issued_at must be an RFC3339 UTC timestamp",
+            vec![AlertValidationIssue {
+                field: "issued_at",
+                code: AlertReasonCode::InvalidPayload.code(),
+                message: "issued_at must be an RFC3339 UTC timestamp".to_string(),
+            }],
+        )
+    })?;
+
+    let primary_fails = payload.simulate_primary_failure.unwrap_or(false)
+        || (alert.severity == AlertSeverity::Critical && simulated_delay_seconds > 30);
+    let fallback_fails = payload.simulate_fallback_failure.unwrap_or(false);
+    let primary_attempt_time = issued + Duration::seconds(1);
+    let primary_attempt_time = format_timestamp(primary_attempt_time);
+
+    let mut attempts = Vec::new();
+    let mut outcome_alert = alert.clone();
+    let mut fallback_used = false;
+    let mut failure = None;
+
+    if primary_fails {
+        let primary_failure_code = if payload.simulate_primary_failure.unwrap_or(false) {
+            AlertReasonCode::DeliveryPrimaryFailed
+        } else {
+            AlertReasonCode::DeliverySlaBreached
+        };
+        attempts.push(AlertDeliveryAttempt {
+            alert_id: alert.alert_id.clone(),
+            attempt_number: 1,
+            channel: primary_channel,
+            outcome: AlertDeliveryOutcome::Failed,
+            reason_code: primary_failure_code.code().to_string(),
+            correlation_id: alert.correlation_id.clone(),
+            attempted_at: primary_attempt_time.clone(),
+            delivered_at: None,
+            failed_at: Some(primary_attempt_time),
+        });
+        fallback_used = true;
+
+        let fallback_attempt_time = format_timestamp(issued + Duration::seconds(20));
+        if fallback_fails {
+            attempts.push(AlertDeliveryAttempt {
+                alert_id: alert.alert_id.clone(),
+                attempt_number: 2,
+                channel: fallback_channel,
+                outcome: AlertDeliveryOutcome::Failed,
+                reason_code: AlertReasonCode::DeliveryFallbackFailed.code().to_string(),
+                correlation_id: alert.correlation_id.clone(),
+                attempted_at: fallback_attempt_time.clone(),
+                delivered_at: None,
+                failed_at: Some(fallback_attempt_time.clone()),
+            });
+            outcome_alert.status = AlertDispatchStatus::Failed;
+            outcome_alert.failed_at = Some(fallback_attempt_time);
+            outcome_alert.delivered_at = None;
+            outcome_alert.reason_code = AlertReasonCode::DeliveryFallbackFailed.code().to_string();
+            failure = Some((
+                AlertReasonCode::DeliveryFallbackFailed,
+                "primary channel failed and fallback delivery failed".to_string(),
+            ));
+        } else {
+            let fallback_delivered_at = format_timestamp(issued + Duration::seconds(25));
+            attempts.push(AlertDeliveryAttempt {
+                alert_id: alert.alert_id.clone(),
+                attempt_number: 2,
+                channel: fallback_channel,
+                outcome: AlertDeliveryOutcome::Delivered,
+                reason_code: AlertReasonCode::Ready.code().to_string(),
+                correlation_id: alert.correlation_id.clone(),
+                attempted_at: fallback_attempt_time,
+                delivered_at: Some(fallback_delivered_at.clone()),
+                failed_at: None,
+            });
+            if !critical_dispatch_within_sla(&outcome_alert, &fallback_delivered_at, 30)? {
+                outcome_alert.status = AlertDispatchStatus::Failed;
+                outcome_alert.failed_at = Some(fallback_delivered_at.clone());
+                outcome_alert.delivered_at = None;
+                outcome_alert.reason_code = AlertReasonCode::DeliverySlaBreached.code().to_string();
+                failure = Some((
+                    AlertReasonCode::DeliverySlaBreached,
+                    "critical alert dispatch breached 30-second SLA".to_string(),
+                ));
+            } else {
+                outcome_alert.status = AlertDispatchStatus::Delivered;
+                outcome_alert.delivered_at = Some(fallback_delivered_at);
+                outcome_alert.failed_at = None;
+            }
+        }
+    } else {
+        let delivered_at = format_timestamp(issued + Duration::seconds(simulated_delay_seconds));
+        attempts.push(AlertDeliveryAttempt {
+            alert_id: alert.alert_id.clone(),
+            attempt_number: 1,
+            channel: primary_channel,
+            outcome: AlertDeliveryOutcome::Delivered,
+            reason_code: AlertReasonCode::Ready.code().to_string(),
+            correlation_id: alert.correlation_id.clone(),
+            attempted_at: primary_attempt_time,
+            delivered_at: Some(delivered_at.clone()),
+            failed_at: None,
+        });
+        outcome_alert.status = AlertDispatchStatus::Delivered;
+        outcome_alert.delivered_at = Some(delivered_at.clone());
+        outcome_alert.failed_at = None;
+        if !critical_dispatch_within_sla(&outcome_alert, &delivered_at, 30)? {
+            outcome_alert.status = AlertDispatchStatus::Failed;
+            outcome_alert.delivered_at = None;
+            outcome_alert.failed_at = Some(delivered_at.clone());
+            outcome_alert.reason_code = AlertReasonCode::DeliverySlaBreached.code().to_string();
+            failure = Some((
+                AlertReasonCode::DeliverySlaBreached,
+                "critical alert dispatch breached 30-second SLA".to_string(),
+            ));
+        }
+    }
+
+    for attempt in &attempts {
+        domain::alerts::validate_alert_delivery_attempt(attempt)?;
+    }
+    domain::alerts::validate_incident_alert(&outcome_alert)?;
+
+    let terminal_time = outcome_alert
+        .delivered_at
+        .clone()
+        .or_else(|| outcome_alert.failed_at.clone())
+        .unwrap_or_else(|| outcome_alert.issued_at.clone());
+    let terminal = OffsetDateTime::parse(&terminal_time, &Rfc3339).map_err(|_| {
+        AlertContractError::invalid_payload_with_issues(
+            "terminal dispatch timestamp must be an RFC3339 UTC timestamp",
+            vec![AlertValidationIssue {
+                field: "terminal_time",
+                code: AlertReasonCode::InvalidPayload.code(),
+                message: "terminal dispatch timestamp must be an RFC3339 UTC timestamp".to_string(),
+            }],
+        )
+    })?;
+    let dispatch_latency_seconds = (terminal - issued).whole_seconds();
+
+    Ok(AlertDispatchSimulation {
+        alert: outcome_alert,
+        attempts,
+        fallback_used,
+        dispatch_latency_seconds,
+        failure,
+    })
+}
+
+fn parse_alert_limit(limit: Option<i64>) -> Result<i64, AlertContractError> {
+    let limit = limit.unwrap_or(25);
+    if !(1..=200).contains(&limit) {
+        return Err(AlertContractError::invalid_payload_with_issues(
+            "limit must be between 1 and 200",
+            vec![AlertValidationIssue {
+                field: "limit",
+                code: AlertReasonCode::InvalidPayload.code(),
+                message: "limit must be between 1 and 200".to_string(),
+            }],
+        ));
+    }
+    Ok(limit)
+}
+
+fn format_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp
+        .to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting for UTC timestamp must succeed")
+}
+
+fn synthetic_incident_alerts(as_of_utc: &str, correlation_id: &str) -> Vec<IncidentAlert> {
+    let as_of = OffsetDateTime::parse(as_of_utc, &Rfc3339)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .to_offset(UtcOffset::UTC);
+    let issued_critical = format_timestamp(as_of - Duration::seconds(20));
+    let issued_warning = format_timestamp(as_of - Duration::minutes(3));
+
+    vec![
+        IncidentAlert {
+            alert_id: compose_alert_identifier(
+                correlation_id,
+                AlertReasonCode::StreamDisconnectExceeded,
+                &issued_critical,
+            )
+            .unwrap_or_else(|_| "incident::alert::stream::synthetic::critical".to_string()),
+            severity: AlertSeverity::Critical,
+            impacted_subsystem: "market-stream".to_string(),
+            cause: "Market stream disconnect exceeded 5 minutes in active trading window."
+                .to_string(),
+            recommended_next_action:
+                "Pause submissions and validate stream recovery before resuming privileged actions."
+                    .to_string(),
+            evidence_link:
+                "https://docs.example.com/operations/severity-alert-delivery#stream-disconnect"
+                    .to_string(),
+            issued_at: issued_critical.clone(),
+            correlation_id: normalize_alert_identifier(correlation_id),
+            reason_code: AlertReasonCode::StreamDisconnectExceeded.code().to_string(),
+            status: AlertDispatchStatus::Delivered,
+            delivered_at: Some(format_timestamp(as_of - Duration::seconds(10))),
+            failed_at: None,
+        },
+        IncidentAlert {
+            alert_id: compose_alert_identifier(
+                correlation_id,
+                AlertReasonCode::ReconciliationLagExceeded,
+                &issued_warning,
+            )
+            .unwrap_or_else(|_| "incident::alert::reconciliation::synthetic::warning".to_string()),
+            severity: AlertSeverity::Warning,
+            impacted_subsystem: "reconciliation".to_string(),
+            cause: "Reconciliation lag exceeded 60 seconds for active portfolios.".to_string(),
+            recommended_next_action:
+                "Inspect reconciliation backlog and verify lifecycle parity before escalation."
+                    .to_string(),
+            evidence_link:
+                "https://docs.example.com/operations/severity-alert-delivery#reconciliation-lag"
+                    .to_string(),
+            issued_at: issued_warning,
+            correlation_id: normalize_alert_identifier(correlation_id),
+            reason_code: AlertReasonCode::ReconciliationLagExceeded
+                .code()
+                .to_string(),
+            status: AlertDispatchStatus::Delivered,
+            delivered_at: Some(format_timestamp(as_of - Duration::minutes(2))),
+            failed_at: None,
+        },
+    ]
+}
+
+fn synthetic_alert_delivery_attempts(alert: &IncidentAlert) -> Vec<AlertDeliveryAttempt> {
+    let issued = OffsetDateTime::parse(&alert.issued_at, &Rfc3339)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .to_offset(UtcOffset::UTC);
+    let first_attempt_time = format_timestamp(issued + Duration::seconds(1));
+    if alert.status == AlertDispatchStatus::Delivered {
+        let delivered_at = alert
+            .delivered_at
+            .clone()
+            .unwrap_or_else(|| format_timestamp(issued + Duration::seconds(5)));
+        return vec![AlertDeliveryAttempt {
+            alert_id: alert.alert_id.clone(),
+            attempt_number: 1,
+            channel: AlertDeliveryChannel::PagerDuty,
+            outcome: AlertDeliveryOutcome::Delivered,
+            reason_code: AlertReasonCode::Ready.code().to_string(),
+            correlation_id: alert.correlation_id.clone(),
+            attempted_at: first_attempt_time,
+            delivered_at: Some(delivered_at),
+            failed_at: None,
+        }];
+    }
+
+    vec![
+        AlertDeliveryAttempt {
+            alert_id: alert.alert_id.clone(),
+            attempt_number: 1,
+            channel: AlertDeliveryChannel::PagerDuty,
+            outcome: AlertDeliveryOutcome::Failed,
+            reason_code: AlertReasonCode::DeliveryPrimaryFailed.code().to_string(),
+            correlation_id: alert.correlation_id.clone(),
+            attempted_at: first_attempt_time.clone(),
+            delivered_at: None,
+            failed_at: Some(first_attempt_time),
+        },
+        AlertDeliveryAttempt {
+            alert_id: alert.alert_id.clone(),
+            attempt_number: 2,
+            channel: AlertDeliveryChannel::Slack,
+            outcome: AlertDeliveryOutcome::Failed,
+            reason_code: AlertReasonCode::DeliveryFallbackFailed.code().to_string(),
+            correlation_id: alert.correlation_id.clone(),
+            attempted_at: alert
+                .failed_at
+                .clone()
+                .unwrap_or_else(|| format_timestamp(issued + Duration::seconds(8))),
+            delivered_at: None,
+            failed_at: alert.failed_at.clone(),
+        },
+    ]
 }
 
 pub async fn execute_rebalance_recommendation(
@@ -1639,6 +2455,57 @@ fn authorize_incident_forensics_read(
         machine_error.message,
         Vec::new(),
         "incident_query",
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
+}
+
+fn authorize_incident_alert_action(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ExecuteControlPlaneAction);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "action": action,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(incident_alert_service_error_response(
+        AlertReasonCode::Unauthorized.code(),
+        machine_error.message,
+        Vec::new(),
+        action,
         actor,
         decision.timestamp_utc,
         endpoint.to_string(),
@@ -2856,7 +3723,10 @@ fn parse_incident_dependency_state(
     }
 }
 
-fn synthetic_incident_timeline(as_of_utc: &str, correlation_id: &str) -> Vec<IncidentTimelineEvent> {
+fn synthetic_incident_timeline(
+    as_of_utc: &str,
+    correlation_id: &str,
+) -> Vec<IncidentTimelineEvent> {
     let as_of = OffsetDateTime::parse(as_of_utc, &Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
         .to_offset(UtcOffset::UTC);
@@ -2981,8 +3851,10 @@ fn synthetic_incident_timeline(as_of_utc: &str, correlation_id: &str) -> Vec<Inc
 fn synthetic_attribution_observations(
     as_of_utc: &str,
     correlation_id: &str,
-) -> Result<Vec<domain::attribution::AttributionObservation>, domain::attribution::AttributionContractError>
-{
+) -> Result<
+    Vec<domain::attribution::AttributionObservation>,
+    domain::attribution::AttributionContractError,
+> {
     let as_of = OffsetDateTime::parse(as_of_utc, &Rfc3339)
         .map_err(|_| {
             domain::attribution::AttributionContractError::invalid_payload_with_issues(
@@ -3248,6 +4120,244 @@ fn attribution_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn incident_alert_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    alerts: Vec<IncidentAlertItem>,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let data_state = if alerts.is_empty() { "empty" } else { "ready" };
+    let reason_code = if alerts.is_empty() {
+        AlertReasonCode::NoTrigger.code().to_string()
+    } else {
+        AlertReasonCode::Ready.code().to_string()
+    };
+    let highest_severity = incident_alert_highest_severity(&alerts);
+    let recommended_next_action = if alerts.is_empty() {
+        "No active warning/critical alerts. Continue monitoring trigger evidence.".to_string()
+    } else if highest_severity == "critical" {
+        "Critical alert present: execute containment controls and follow runbook evidence immediately."
+            .to_string()
+    } else {
+        "Review warning alerts and apply the recommended next action for each impacted subsystem."
+            .to_string()
+    };
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "incident_alerts_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "alert_count": alerts.len(),
+            "data_state": data_state,
+            "highest_severity": highest_severity,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "incident_alerts_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(IncidentAlertsQueryResponse {
+            status: "accepted",
+            action: "incident_alerts_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            source: "control-api.incident-alerts.v1".to_string(),
+            reason_code,
+            data_state: data_state.to_string(),
+            recommended_next_action,
+            alerts,
+        }),
+    )
+        .into_response()
+}
+
+fn incident_alert_dispatch_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    simulation: AlertDispatchSimulation,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let AlertDispatchSimulation {
+        alert,
+        attempts,
+        fallback_used,
+        dispatch_latency_seconds,
+        failure: _,
+    } = simulation;
+    let reason_code = alert.reason_code.clone();
+    let status = alert.status.as_str().to_string();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "incident_alert_dispatch".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+            "alert_id": alert.alert_id,
+            "severity": alert.severity.as_str(),
+            "status": status,
+            "fallback_used": fallback_used,
+            "dispatch_latency_seconds": dispatch_latency_seconds,
+            "attempt_count": attempts.len(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "incident_alert_dispatch".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc.clone(),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(IncidentAlertDispatchResponse {
+            status: "accepted",
+            action: "incident_alert_dispatch".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            source: "control-api.incident-alerts.v1".to_string(),
+            reason_code,
+            fallback_used,
+            dispatch_latency_seconds,
+            alert: IncidentAlertItem {
+                alert_id: alert.alert_id,
+                severity: alert.severity.as_str().to_string(),
+                impacted_subsystem: alert.impacted_subsystem,
+                cause: alert.cause,
+                recommended_next_action: alert.recommended_next_action,
+                evidence_link: alert.evidence_link,
+                issued_at: alert.issued_at,
+                correlation_id: alert.correlation_id,
+                reason_code: alert.reason_code,
+                status: alert.status.as_str().to_string(),
+                delivered_at: alert.delivered_at,
+                failed_at: alert.failed_at,
+                attempts: attempts
+                    .into_iter()
+                    .map(|attempt| IncidentAlertDeliveryAttemptItem {
+                        attempt_number: i64::from(attempt.attempt_number),
+                        channel: attempt.channel.as_str().to_string(),
+                        outcome: attempt.outcome.as_str().to_string(),
+                        reason_code: attempt.reason_code,
+                        attempted_at: attempt.attempted_at,
+                        delivered_at: attempt.delivered_at,
+                        failed_at: attempt.failed_at,
+                    })
+                    .collect(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn incident_alert_highest_severity(alerts: &[IncidentAlertItem]) -> &'static str {
+    if alerts.is_empty() {
+        return "normal";
+    }
+    if alerts
+        .iter()
+        .any(|alert| alert.severity == AlertSeverity::Critical.as_str())
+    {
+        AlertSeverity::Critical.as_str()
+    } else {
+        AlertSeverity::Warning.as_str()
+    }
+}
+
+fn incident_alert_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<AlertValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    (
+        incident_alert_service_error_status(error_code),
+        axum::Json(IncidentAlertsServiceErrorResponse {
+            error_code,
+            reason_code: error_code.to_string(),
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc: timestamp_utc.clone(),
+            occurred_at: timestamp_utc,
+            source: "control-api.incident-alerts.v1".to_string(),
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| IncidentAlertFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn incident_alert_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == AlertReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == AlertReasonCode::NoTrigger.code() => StatusCode::BAD_REQUEST,
+        code if code == AlertReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
+        code if code == AlertReasonCode::DuplicateSuppressed.code() => StatusCode::CONFLICT,
+        code if code == AlertReasonCode::DependencyUnavailable.code()
+            || code == AlertReasonCode::StaleEvidence.code()
+            || code == AlertReasonCode::DeliveryPrimaryFailed.code()
+            || code == AlertReasonCode::DeliveryFallbackFailed.code()
+            || code == AlertReasonCode::DeliverySlaBreached.code()
+            || code == "alert_query_failed"
+            || code == "alert_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        "alert_constraint_violation" => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn incident_forensics_query_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -3292,12 +4402,16 @@ fn incident_forensics_query_response(
         .iter()
         .find(|event| event.stage == IncidentTimelineStage::Signal)
         .map(|event| event.summary.clone())
-        .unwrap_or_else(|| "No trigger evidence available for selected incident scope.".to_string());
+        .unwrap_or_else(|| {
+            "No trigger evidence available for selected incident scope.".to_string()
+        });
     let context = causal_scope
         .iter()
         .find(|event| event.stage == IncidentTimelineStage::Order)
         .map(|event| event.summary.clone())
-        .unwrap_or_else(|| "No order-context evidence available for selected incident scope.".to_string());
+        .unwrap_or_else(|| {
+            "No order-context evidence available for selected incident scope.".to_string()
+        });
     let action = causal_scope
         .iter()
         .find(|event| {
@@ -3996,6 +5110,56 @@ pub struct IncidentForensicsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct IncidentAlertsQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub dependency_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IncidentAlertDispatchPayload {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub issued_at: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub impacted_subsystem: Option<String>,
+    #[serde(default)]
+    pub cause: Option<String>,
+    #[serde(default)]
+    pub recommended_next_action: Option<String>,
+    #[serde(default)]
+    pub evidence_link: Option<String>,
+    #[serde(default)]
+    pub drawdown_pct_of_daily_limit: Option<f64>,
+    #[serde(default)]
+    pub stream_disconnect_seconds: Option<i64>,
+    #[serde(default)]
+    pub reconciliation_lag_seconds: Option<i64>,
+    #[serde(default)]
+    pub stale_data_detected: Option<bool>,
+    #[serde(default)]
+    pub policy_bypass_attempt: Option<bool>,
+    #[serde(default)]
+    pub simulate_primary_failure: Option<bool>,
+    #[serde(default)]
+    pub simulate_fallback_failure: Option<bool>,
+    #[serde(default)]
+    pub simulated_delivery_delay_seconds: Option<i64>,
+    #[serde(default)]
+    pub dedupe_window_seconds: Option<i64>,
+    #[serde(default)]
+    pub primary_channel: Option<String>,
+    #[serde(default)]
+    pub fallback_channel: Option<String>,
+    #[serde(default)]
+    pub dependency_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RebalanceExecutionPayload {
     #[serde(default)]
     pub executed_at_utc: Option<String>,
@@ -4316,6 +5480,92 @@ pub struct AttributionFieldError {
 }
 
 #[derive(Debug, Serialize)]
+pub struct IncidentAlertsQueryResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub data_state: String,
+    pub recommended_next_action: String,
+    pub alerts: Vec<IncidentAlertItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentAlertDispatchResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub fallback_used: bool,
+    pub dispatch_latency_seconds: i64,
+    pub alert: IncidentAlertItem,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentAlertItem {
+    pub alert_id: String,
+    pub severity: String,
+    pub impacted_subsystem: String,
+    pub cause: String,
+    pub recommended_next_action: String,
+    pub evidence_link: String,
+    pub issued_at: String,
+    pub correlation_id: String,
+    pub reason_code: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<String>,
+    pub attempts: Vec<IncidentAlertDeliveryAttemptItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentAlertDeliveryAttemptItem {
+    pub attempt_number: i64,
+    pub channel: String,
+    pub outcome: String,
+    pub reason_code: String,
+    pub attempted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentAlertsServiceErrorResponse {
+    pub error_code: &'static str,
+    pub reason_code: String,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub occurred_at: String,
+    pub source: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<IncidentAlertFieldError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncidentAlertFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct IncidentForensicsQueryResponse {
     pub status: &'static str,
     pub action: String,
@@ -4600,6 +5850,10 @@ mod tests {
 
     fn bearer_token(actor_id: &str, role: &str, expires_unix: i64) -> String {
         format!("Bearer {actor_id}:{role}:{expires_unix}")
+    }
+
+    fn unique_correlation_id(prefix: &str) -> String {
+        format!("{prefix}-{}", OffsetDateTime::now_utc().unix_timestamp_nanos())
     }
 
     #[derive(Debug, Default)]
@@ -7735,7 +8989,10 @@ mod tests {
                         "authorization",
                         bearer_token("ops-1", "operational_control", 4_102_444_800),
                     )
-                    .header("x-correlation-id", "corr-allocation-policy-invalid-approval-ref-001")
+                    .header(
+                        "x-correlation-id",
+                        "corr-allocation-policy-invalid-approval-ref-001",
+                    )
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{
@@ -7826,7 +9083,10 @@ mod tests {
                         "authorization",
                         bearer_token("ops-1", "operational_control", 4_102_444_800),
                     )
-                    .header("x-correlation-id", "corr-rebalance-invalid-approval-ref-001")
+                    .header(
+                        "x-correlation-id",
+                        "corr-rebalance-invalid-approval-ref-001",
+                    )
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{
@@ -7944,9 +9204,14 @@ mod tests {
                         "authorization",
                         bearer_token("admin-1", "administrative_actions", 4_102_444_800),
                     )
-                    .header("x-correlation-id", "corr-rebalance-execute-invalid-approval-ref-001")
+                    .header(
+                        "x-correlation-id",
+                        "corr-rebalance-execute-invalid-approval-ref-001",
+                    )
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"approval_reference":"apr-unsafe-client-value"}"#))
+                    .body(Body::from(
+                        r#"{"approval_reference":"apr-unsafe-client-value"}"#,
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -8044,7 +9309,10 @@ mod tests {
         assert!(payload["rows"][0]["as_of_utc"].is_string());
         assert_eq!(payload["rows"][0]["source"], "reconciliation.exposure.v1");
         assert_eq!(payload["rows"][0]["reason_code"], "attribution_ready");
-        assert_eq!(payload["rows"][0]["correlation_id"], "corr-attribution-route-001");
+        assert_eq!(
+            payload["rows"][0]["correlation_id"],
+            "corr-attribution-route-001"
+        );
     }
 
     #[tokio::test]
@@ -8106,7 +9374,12 @@ mod tests {
 
         assert_eq!(payload["data_state"], "empty");
         assert_eq!(payload["reason_code"], "attribution_empty_window");
-        assert!(payload["rows"].as_array().expect("rows should be array").is_empty());
+        assert!(
+            payload["rows"]
+                .as_array()
+                .expect("rows should be array")
+                .is_empty()
+        );
         assert!(
             payload["recommended_next_action"]
                 .as_str()
@@ -8246,7 +9519,11 @@ mod tests {
                 .expect("query latency should be integer")
                 <= 5_000
         );
-        assert!(payload["events"].as_array().is_some_and(|events| !events.is_empty()));
+        assert!(
+            payload["events"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty())
+        );
         assert!(payload["events"][0]["occurred_at"].is_string());
         assert!(payload["events"][0]["reason_code"].is_string());
         assert!(payload["events"][0]["correlation_id"].is_string());
@@ -8413,7 +9690,12 @@ mod tests {
 
         assert_eq!(payload["data_state"], "empty");
         assert_eq!(payload["reason_code"], "incident_empty_window");
-        assert!(payload["events"].as_array().expect("events should be array").is_empty());
+        assert!(
+            payload["events"]
+                .as_array()
+                .expect("events should be array")
+                .is_empty()
+        );
         assert!(
             payload["recommended_next_action"]
                 .as_str()
@@ -8450,16 +9732,20 @@ mod tests {
 
         assert_eq!(payload["error_code"], "incident_invalid_payload");
         assert_eq!(payload["action"], "incident_query");
-        assert!(payload["field_errors"]
-            .as_array()
-            .expect("field_errors should be array")
-            .iter()
-            .any(|item| item["field"] == "start_ts"));
-        assert!(payload["field_errors"]
-            .as_array()
-            .expect("field_errors should be array")
-            .iter()
-            .any(|item| item["field"] == "end_ts"));
+        assert!(
+            payload["field_errors"]
+                .as_array()
+                .expect("field_errors should be array")
+                .iter()
+                .any(|item| item["field"] == "start_ts")
+        );
+        assert!(
+            payload["field_errors"]
+                .as_array()
+                .expect("field_errors should be array")
+                .iter()
+                .any(|item| item["field"] == "end_ts")
+        );
     }
 
     #[tokio::test]
@@ -8519,6 +9805,294 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "incident_unauthorized");
         assert_eq!(payload["action"], "incident_query");
+    }
+
+    #[tokio::test]
+    async fn incident_alert_query_route_returns_guidance_rich_alert_payload() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/alerts?limit=10")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alert-query-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action"], "incident_alerts_query");
+        assert_eq!(payload["data_state"], "ready");
+        assert!(
+            payload["alerts"]
+                .as_array()
+                .is_some_and(|alerts| !alerts.is_empty())
+        );
+        assert!(payload["alerts"][0]["recommended_next_action"].is_string());
+        assert!(payload["alerts"][0]["evidence_link"].is_string());
+        assert!(payload["alerts"][0]["issued_at"].is_string());
+        assert!(payload["alerts"][0]["severity"].is_string());
+        assert!(payload["alerts"][0]["impacted_subsystem"].is_string());
+        assert!(
+            payload["alerts"][0]["attempts"]
+                .as_array()
+                .is_some_and(|attempts| !attempts.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn incident_alert_dispatch_route_returns_delivered_response_within_sla() {
+        let correlation_id = unique_correlation_id("corr-alert-dispatch");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/alerts/dispatch")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", correlation_id.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "drawdown_pct_of_daily_limit": 82.5,
+                            "evidence_link": "https://docs.example.com/operations/severity-alert-delivery#drawdown"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["action"], "incident_alert_dispatch");
+        assert_eq!(payload["alert"]["severity"], "critical");
+        assert_eq!(payload["alert"]["status"], "delivered");
+        assert_eq!(payload["fallback_used"], false);
+        assert!(
+            payload["dispatch_latency_seconds"]
+                .as_i64()
+                .expect("dispatch latency should be integer")
+                <= 30
+        );
+        assert_eq!(payload["alert"]["attempts"][0]["outcome"], "delivered");
+    }
+
+    #[tokio::test]
+    async fn incident_alert_dispatch_route_attempts_fallback_when_primary_fails() {
+        let correlation_id = unique_correlation_id("corr-alert-fallback");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/alerts/dispatch")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", correlation_id.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "stream_disconnect_seconds": 420,
+                            "simulate_primary_failure": true,
+                            "evidence_link": "https://docs.example.com/operations/severity-alert-delivery#stream-disconnect"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        let status = response.status();
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected fallback payload: {payload}"
+        );
+
+        assert_eq!(payload["fallback_used"], true);
+        assert_eq!(payload["alert"]["status"], "delivered");
+        assert_eq!(payload["alert"]["attempts"][0]["outcome"], "failed");
+        assert_eq!(payload["alert"]["attempts"][1]["outcome"], "delivered");
+    }
+
+    #[tokio::test]
+    async fn incident_alert_dispatch_route_surfaces_final_failure_when_fallback_fails() {
+        let correlation_id = unique_correlation_id("corr-alert-fallback-fail");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/alerts/dispatch")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", correlation_id.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "stream_disconnect_seconds": 420,
+                            "simulate_primary_failure": true,
+                            "simulate_fallback_failure": true,
+                            "evidence_link": "https://docs.example.com/operations/severity-alert-delivery#stream-disconnect"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        let status = response.status();
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected fallback-fail payload: {payload}"
+        );
+        assert_eq!(payload["error_code"], "alert_delivery_fallback_failed");
+        assert_eq!(payload["action"], "incident_alert_dispatch");
+    }
+
+    #[tokio::test]
+    async fn incident_alert_dispatch_route_rejects_boundary_non_trigger_payloads() {
+        let correlation_id = unique_correlation_id("corr-alert-boundary");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/alerts/dispatch")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", correlation_id.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "drawdown_pct_of_daily_limit": 80.0,
+                            "stream_disconnect_seconds": 300,
+                            "reconciliation_lag_seconds": 60
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "alert_no_trigger");
+        assert_eq!(payload["action"], "incident_alert_dispatch");
+    }
+
+    #[tokio::test]
+    async fn incident_alert_dispatch_route_rejects_malformed_evidence_links() {
+        let correlation_id = unique_correlation_id("corr-alert-link-invalid");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/alerts/dispatch")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", correlation_id.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "stale_data_detected": true,
+                            "evidence_link": "docs/local/runbook"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "alert_invalid_payload");
+        assert!(
+            payload["field_errors"]
+                .as_array()
+                .expect("field_errors should be array")
+                .iter()
+                .any(|item| item["field"] == "evidence_link")
+        );
+    }
+
+    #[tokio::test]
+    async fn incident_alert_query_route_returns_alert_unauthorized_for_denied_reads() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/alerts")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alert-denied-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "alert_unauthorized");
+        assert_eq!(payload["action"], "incident_alerts_query");
     }
 
     #[tokio::test]

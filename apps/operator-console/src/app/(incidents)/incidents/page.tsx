@@ -1,6 +1,7 @@
 import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
+import { IncidentAlertsPanel } from "@/components/timeline/IncidentAlertsPanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
 import { getOperatorConsoleEnv } from "@/lib/env";
 import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
@@ -29,6 +30,10 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
       content: (
         <section className="shell-panel-grid">
           <IncidentTimelineCard
+            baseUrl={apiBaseUrl}
+            freshness={stateModel.freshness}
+          />
+          <IncidentAlertsPanel
             baseUrl={apiBaseUrl}
             freshness={stateModel.freshness}
           />

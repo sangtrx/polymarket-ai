@@ -240,6 +240,74 @@
 
 ---
 
+## Story 3.6 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `tests/api/story-3-6-alerts-api.test.mjs` — added critical-dispatch latency (`<= 30s`) assertions, explicit fallback attempt ordering/channel assertions, unauthorized (`401`) machine-error propagation checks, and malformed `evidence_link` contract rejection coverage.
+- [x] `tests/e2e/story-3-6-alerts-dashboard.e2e.test.mjs` — added fallback delivery-attempt evidence trail assertions and accessible status/error semantic coverage.
+
+## Coverage
+
+- Story 3.6 API/E2E critical-flow refresh verifies:
+  - canonical critical alert dispatch latency remains within `<= 30s` using `issued_at` -> `delivered_at` evidence assertions,
+  - fallback-attempt evidence trail integrity (`attempt_number`, channel, outcome, attempted/failed timestamps),
+  - machine-readable unauthorized behavior for restricted alert queries (`alert_unauthorized`, `401`),
+  - strict `evidence_link` URL validation plus accessible alert-panel semantics (`aria-label`, `role="status"`, `role="alert"`).
+- Automated Story 3.6 regression inventory in this QA refresh: **19 tests passing** (`story: 5`, `api: 8`, `e2e: 6`).
+
+## Execution Result
+
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-6/*.test.mjs tests/api/story-3-6*.test.mjs tests/e2e/story-3-6*.test.mjs` ✅
+- `npm run qa:test:story-3-6` ⚠️ (`cargo` unavailable in this runtime)
+
+---
+
+## Story
+
+- 3-6-add-severity-based-alerts-with-recommended-operator-actions
+
+## Generated Tests
+
+### Domain, Persistence, and Control API
+
+- [x] `crates/domain/src/alerts.rs` — validates FR29 trigger threshold semantics (`>` boundaries), reason-code parsing, canonical identifier composition, dedupe suppression windows, payload/attempt contract constraints, and critical-dispatch SLA guards.
+- [x] `crates/persistence/src/postgres/incident_alerts.rs` — validates migration scope (`incident_alerts`, `alert_delivery_attempts` only), constraint/index coverage, canonical lookup enforcement, and deterministic adapter query ordering.
+- [x] `services/control-api/src/routes/mod.rs` — validates authenticated alert query/dispatch route behavior for delivered path, primary-failure fallback path, fallback-failure terminal path, threshold boundary rejection, malformed evidence-link rejection, and unauthorized read behavior.
+
+### Operator Console and Story-Scoped QA
+
+- [x] `tests/story-3-6/severity-alerts.story-3-6.test.mjs` — validates incidents/dashboard alert-panel composition, required actionable guidance fields, runbook continuity, and command wiring.
+- [x] `tests/api/story-3-6-alerts-api.test.mjs` — validates typed alert client contract parsing, dependency-unavailable machine-error propagation, and malformed-success payload rejection.
+- [x] `tests/e2e/story-3-6-alerts-dashboard.e2e.test.mjs` — validates dashboard/incidents alert surface integration and style-contract continuity.
+
+## Coverage
+
+- Story 3.6 severity-alert contracts covered end-to-end across domain trigger evaluation, durable delivery evidence persistence, control-api dispatch/query behavior, and operator-console rendering:
+  - deterministic FR29 threshold and dedupe behavior with exact-boundary assertions,
+  - required warning/critical guidance metadata (`recommended_next_action`, `evidence_link`, `issued_at`),
+  - auditable primary→fallback delivery attempts with explicit machine-readable failure codes,
+  - critical dispatch timing assertions for `<= 30s` path behavior,
+  - runbook continuity links across incident forensics, alert delivery, and emergency controls.
+- Automated Story 3.6 regression inventory in this QA pass: **34 tests passing** (`rust targeted: 22`, `story/api/e2e node tests: 12`).
+
+## Execution Result
+
+- `cargo test -p domain alerts::tests::` ✅
+- `cargo test -p persistence postgres::incident_alerts::tests::` ✅
+- `cargo test -p control-api routes::tests::incident_alert_` ✅
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-6/*.test.mjs tests/api/story-3-6*.test.mjs tests/e2e/story-3-6*.test.mjs` ✅
+- `npm run qa:test:story-3-6` ✅
+- `npm test` ✅
+
+---
+
 ## Story 3.5 QA Automation Refresh
 
 ### Generated Tests

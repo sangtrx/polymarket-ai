@@ -1,5 +1,5 @@
 # generated: 2026-04-04T17:40:16Z
-# last_updated: 2026-04-06T11:30:41Z
+# last_updated: 2026-04-06T19:50:00Z
 # project: polymarket-ai
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-04T17:40:16Z
-last_updated: 2026-04-06T11:30:41Z
+last_updated: 2026-04-06T19:50:00Z
 project: polymarket-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -67,7 +67,7 @@ development_status:
   3-3-deliver-allocation-policy-and-drift-rebalance-workflows: done
   3-4-build-cost-aware-pnl-and-attribution-surfaces: done
   3-5-implement-incident-search-and-causal-timeline-forensics: done
-  3-6-add-severity-based-alerts-with-recommended-operator-actions: backlog
+  3-6-add-severity-based-alerts-with-recommended-operator-actions: done
   3-7-implement-controlled-recovery-readiness-gates: backlog
   3-8-add-backup-integrity-validation-and-deterministic-restore-rehearsal: backlog
   3-9-enforce-accessibility-and-reduced-motion-standards-in-critical-flows: backlog

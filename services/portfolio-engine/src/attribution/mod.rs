@@ -221,9 +221,11 @@ mod tests {
             AttributionReasonCode::EmptyWindow.code()
         );
         assert!(read_model.rows.is_empty());
-        assert!(read_model
-            .recommended_next_action
-            .contains("Expand to a wider window"));
+        assert!(
+            read_model
+                .recommended_next_action
+                .contains("Expand to a wider window")
+        );
     }
 
     #[test]

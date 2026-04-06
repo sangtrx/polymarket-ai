@@ -4,6 +4,7 @@ import { PortfolioSummaryCard } from "@/components/portfolio/PortfolioSummaryCar
 import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
+import { IncidentAlertsPanel } from "@/components/timeline/IncidentAlertsPanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
 import { getOperatorConsoleEnv } from "@/lib/env";
 import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
@@ -35,6 +36,10 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
           <ExecutionSummaryCard freshness={stateModel.freshness} />
           <GovernanceQueueCard freshness={stateModel.freshness} />
           <IncidentTimelineCard
+            baseUrl={apiBaseUrl}
+            freshness={stateModel.freshness}
+          />
+          <IncidentAlertsPanel
             baseUrl={apiBaseUrl}
             freshness={stateModel.freshness}
           />

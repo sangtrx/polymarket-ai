@@ -1,9 +1,10 @@
 pub mod allocation_policies;
-pub mod attribution_snapshots;
 pub mod approvals;
+pub mod attribution_snapshots;
 pub mod audit;
 pub mod credential_rotation;
 pub mod freshness_gate;
+pub mod incident_alerts;
 pub mod incident_query_views;
 pub mod market_policy;
 pub mod market_stream;

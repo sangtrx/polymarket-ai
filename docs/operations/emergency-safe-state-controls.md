@@ -57,3 +57,8 @@ Expected response evidence fields:
 2. Verify safety mode and recent emergency actions through query endpoint.
 3. Validate submit behavior matches expected containment mode.
 4. Record incident closure in audit trail using final recovery control command reference.
+
+## Related runbooks
+
+1. severity alert delivery and channel fallback: `docs/operations/severity-alert-delivery.md`
+2. incident forensics timeline search: `docs/operations/incident-search-causal-timeline-forensics.md`

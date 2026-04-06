@@ -154,8 +154,10 @@ pub async fn upsert_attribution_snapshot(
             ))
         });
     let normalized_run_id = row.run_id.as_deref().map(normalize_attribution_identifier);
-    let normalized_upstream_snapshot_id =
-        row.snapshot_id.as_deref().map(normalize_attribution_identifier);
+    let normalized_upstream_snapshot_id = row
+        .snapshot_id
+        .as_deref()
+        .map(normalize_attribution_identifier);
 
     let result = sqlx::query(UPSERT_ATTRIBUTION_SNAPSHOT_SQL)
         .bind(snapshot_id)
@@ -261,9 +263,9 @@ fn decode_attribution_row(
     let rebates_usd = row
         .try_get("rebates_usd")
         .map_err(|error| AttributionPersistenceError::row_decode_failure("rebates_usd", error))?;
-    let incentives_usd = row
-        .try_get("incentives_usd")
-        .map_err(|error| AttributionPersistenceError::row_decode_failure("incentives_usd", error))?;
+    let incentives_usd = row.try_get("incentives_usd").map_err(|error| {
+        AttributionPersistenceError::row_decode_failure("incentives_usd", error)
+    })?;
 
     let decoded = AttributionRow {
         market_id: row
@@ -285,12 +287,12 @@ fn decode_attribution_row(
         unrealized_pnl_usd: row.try_get("unrealized_pnl_usd").map_err(|error| {
             AttributionPersistenceError::row_decode_failure("unrealized_pnl_usd", error)
         })?,
-        gross_pnl_usd: row
-            .try_get("gross_pnl_usd")
-            .map_err(|error| AttributionPersistenceError::row_decode_failure("gross_pnl_usd", error))?,
-        net_pnl_usd: row
-            .try_get("net_pnl_usd")
-            .map_err(|error| AttributionPersistenceError::row_decode_failure("net_pnl_usd", error))?,
+        gross_pnl_usd: row.try_get("gross_pnl_usd").map_err(|error| {
+            AttributionPersistenceError::row_decode_failure("gross_pnl_usd", error)
+        })?,
+        net_pnl_usd: row.try_get("net_pnl_usd").map_err(|error| {
+            AttributionPersistenceError::row_decode_failure("net_pnl_usd", error)
+        })?,
         costs: domain::attribution::AttributionCostBreakdown {
             fees_usd,
             rebates_usd,
@@ -364,7 +366,10 @@ fn map_contract_error(error: AttributionContractError) -> AttributionPersistence
     }
 }
 
-fn classify_query_error(operation: &'static str, error: sqlx::Error) -> AttributionPersistenceError {
+fn classify_query_error(
+    operation: &'static str,
+    error: sqlx::Error,
+) -> AttributionPersistenceError {
     if is_constraint_error(&error) {
         return AttributionPersistenceError::constraint_violation(operation, error);
     }
@@ -429,9 +434,10 @@ mod tests {
         assert!(ATTRIBUTION_MIGRATION_SQL.contains("attribution_stale_source"));
         assert!(ATTRIBUTION_MIGRATION_SQL.contains("isfinite(realized_pnl_usd)"));
         assert!(ATTRIBUTION_MIGRATION_SQL.contains("isfinite(net_pnl_usd)"));
-        assert!(ATTRIBUTION_MIGRATION_SQL.contains(
-            "abs(gross_pnl_usd - (realized_pnl_usd + unrealized_pnl_usd)) <= 1e-9"
-        ));
+        assert!(
+            ATTRIBUTION_MIGRATION_SQL
+                .contains("abs(gross_pnl_usd - (realized_pnl_usd + unrealized_pnl_usd)) <= 1e-9")
+        );
         assert!(ATTRIBUTION_MIGRATION_SQL.contains(
             "abs(net_pnl_usd - (gross_pnl_usd - (fees_usd - rebates_usd - incentives_usd))) <= 1e-9"
         ));
@@ -453,7 +459,12 @@ mod tests {
         let error =
             validate_attribution_row(&row).expect_err("non-finite fees should fail validation");
         assert_eq!(error.code, AttributionReasonCode::InvalidPayload.code());
-        assert!(error.field_errors.iter().any(|issue| issue.field == "fees_usd"));
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "fees_usd")
+        );
     }
 
     #[test]

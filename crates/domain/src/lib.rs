@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod allocation;
 pub mod attribution;
 pub mod events;

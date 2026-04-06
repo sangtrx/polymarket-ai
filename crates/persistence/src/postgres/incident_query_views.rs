@@ -2,7 +2,8 @@ use crate::postgres::attribution_snapshots::{
     AttributionPersistenceError, load_latest_attribution_snapshots,
 };
 use crate::postgres::reconciliation::{
-    ReconciliationIncidentEvidence, ReconciliationPersistenceError, load_reconciliation_incident_evidence,
+    ReconciliationIncidentEvidence, ReconciliationPersistenceError,
+    load_reconciliation_incident_evidence,
 };
 use domain::attribution::{AttributionPeriod, AttributionRow};
 use domain::incidents::{
@@ -268,14 +269,17 @@ fn derive_incident_events_from_evidence(
                 "Fill evidence contributed to attribution for market {} and alpha {}",
                 row.market_id, row.alpha_id
             ),
-            recommended_next_action:
-                "Verify fill quality and slippage before escalating controls.".to_string(),
+            recommended_next_action: "Verify fill quality and slippage before escalating controls."
+                .to_string(),
             severity: attribution_severity(&row.reason_code).to_string(),
             market_id: Some(normalize_incident_identifier(&row.market_id)),
             order_id: None,
             alpha_id: Some(normalize_incident_identifier(&row.alpha_id)),
             actor_id: None,
-            run_id: row.run_id.clone().map(|value| normalize_incident_identifier(&value)),
+            run_id: row
+                .run_id
+                .clone()
+                .map(|value| normalize_incident_identifier(&value)),
             snapshot_id: row
                 .snapshot_id
                 .clone()
@@ -299,7 +303,10 @@ fn derive_incident_events_from_evidence(
             order_id: None,
             alpha_id: Some(normalize_incident_identifier(&row.alpha_id)),
             actor_id: None,
-            run_id: row.run_id.clone().map(|value| normalize_incident_identifier(&value)),
+            run_id: row
+                .run_id
+                .clone()
+                .map(|value| normalize_incident_identifier(&value)),
             snapshot_id: row
                 .snapshot_id
                 .clone()
@@ -462,7 +469,9 @@ fn map_contract_error(error: IncidentContractError) -> IncidentQueryPersistenceE
     }
 }
 
-fn map_reconciliation_error(error: ReconciliationPersistenceError) -> IncidentQueryPersistenceError {
+fn map_reconciliation_error(
+    error: ReconciliationPersistenceError,
+) -> IncidentQueryPersistenceError {
     IncidentQueryPersistenceError::dependency_unavailable(
         "load_reconciliation_incident_evidence",
         error.message,
@@ -594,7 +603,9 @@ mod tests {
             INCIDENT_QUERY_VIEWS_MIGRATION_SQL
                 .contains("severity IN ('normal', 'warning', 'critical', 'degraded')")
         );
-        assert!(INCIDENT_QUERY_VIEWS_MIGRATION_SQL.contains("idx_incident_query_views_window_lookup"));
+        assert!(
+            INCIDENT_QUERY_VIEWS_MIGRATION_SQL.contains("idx_incident_query_views_window_lookup")
+        );
         assert!(
             INCIDENT_QUERY_VIEWS_MIGRATION_SQL.contains("idx_incident_query_views_market_window")
         );
@@ -627,10 +638,26 @@ mod tests {
         by_run.insert("run-1".to_string(), sample_reconciliation_evidence());
         let events = derive_incident_events_from_evidence(&attribution, &by_run);
 
-        assert!(events.iter().any(|event| event.stage == IncidentTimelineStage::Signal));
-        assert!(events.iter().any(|event| event.stage == IncidentTimelineStage::Order));
-        assert!(events.iter().any(|event| event.stage == IncidentTimelineStage::Fill));
-        assert!(events.iter().any(|event| event.stage == IncidentTimelineStage::Pnl));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == IncidentTimelineStage::Signal)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == IncidentTimelineStage::Order)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == IncidentTimelineStage::Fill)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == IncidentTimelineStage::Pnl)
+        );
         assert!(
             events
                 .iter()

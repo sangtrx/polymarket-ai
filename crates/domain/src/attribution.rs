@@ -229,10 +229,18 @@ pub fn build_cost_aware_attribution_rows(
 
         let market_id = normalize_attribution_identifier(&observation.market_id);
         let alpha_id = normalize_attribution_identifier(&observation.alpha_id);
-        if scope.market_id.as_deref().is_some_and(|value| value != market_id) {
+        if scope
+            .market_id
+            .as_deref()
+            .is_some_and(|value| value != market_id)
+        {
             continue;
         }
-        if scope.alpha_id.as_deref().is_some_and(|value| value != alpha_id) {
+        if scope
+            .alpha_id
+            .as_deref()
+            .is_some_and(|value| value != alpha_id)
+        {
             continue;
         }
 
@@ -241,21 +249,22 @@ pub fn build_cost_aware_attribution_rows(
             continue;
         }
 
-        let accumulator = groups
-            .entry((market_id, alpha_id))
-            .or_insert_with(|| AttributionAccumulator {
-                realized_pnl_usd: 0.0,
-                unrealized_pnl_usd: 0.0,
-                fees_usd: 0.0,
-                rebates_usd: 0.0,
-                incentives_usd: 0.0,
-                latest_period_end: period_end,
-                source: observation.source.clone(),
-                reason_code: observation.reason_code.clone(),
-                correlation_id: observation.correlation_id.clone(),
-                snapshot_id: observation.snapshot_id.clone(),
-                run_id: observation.run_id.clone(),
-            });
+        let accumulator =
+            groups
+                .entry((market_id, alpha_id))
+                .or_insert_with(|| AttributionAccumulator {
+                    realized_pnl_usd: 0.0,
+                    unrealized_pnl_usd: 0.0,
+                    fees_usd: 0.0,
+                    rebates_usd: 0.0,
+                    incentives_usd: 0.0,
+                    latest_period_end: period_end,
+                    source: observation.source.clone(),
+                    reason_code: observation.reason_code.clone(),
+                    correlation_id: observation.correlation_id.clone(),
+                    snapshot_id: observation.snapshot_id.clone(),
+                    run_id: observation.run_id.clone(),
+                });
 
         accumulator.realized_pnl_usd += observation.realized_pnl_usd;
         accumulator.unrealized_pnl_usd += observation.unrealized_pnl_usd;
@@ -331,7 +340,11 @@ pub fn validate_attribution_observation(
         "correlation_id",
         &observation.correlation_id,
     );
-    validate_utc_timestamp_field(&mut field_errors, "period_end_utc", &observation.period_end_utc);
+    validate_utc_timestamp_field(
+        &mut field_errors,
+        "period_end_utc",
+        &observation.period_end_utc,
+    );
     validate_utc_timestamp_field(&mut field_errors, "as_of_utc", &observation.as_of_utc);
     validate_canonical_identifier_field(&mut field_errors, "market_id", &observation.market_id);
     validate_canonical_identifier_field(&mut field_errors, "alpha_id", &observation.alpha_id);
@@ -426,7 +439,11 @@ pub fn validate_attribution_row(row: &AttributionRow) -> Result<(), AttributionC
     validate_finite_number(&mut field_errors, "net_pnl_usd", row.net_pnl_usd);
     validate_finite_number(&mut field_errors, "fees_usd", row.costs.fees_usd);
     validate_finite_number(&mut field_errors, "rebates_usd", row.costs.rebates_usd);
-    validate_finite_number(&mut field_errors, "incentives_usd", row.costs.incentives_usd);
+    validate_finite_number(
+        &mut field_errors,
+        "incentives_usd",
+        row.costs.incentives_usd,
+    );
     validate_finite_number(
         &mut field_errors,
         "net_cost_impact_usd",
@@ -446,9 +463,8 @@ pub fn validate_attribution_row(row: &AttributionRow) -> Result<(), AttributionC
         field_errors.push(AttributionValidationIssue {
             field: "net_cost_impact_usd",
             code: AttributionReasonCode::InvalidPayload.code(),
-            message:
-                "net_cost_impact_usd must equal fees_usd - rebates_usd - incentives_usd"
-                    .to_string(),
+            message: "net_cost_impact_usd must equal fees_usd - rebates_usd - incentives_usd"
+                .to_string(),
         });
     }
     let expected_net = row.gross_pnl_usd - row.costs.net_cost_impact_usd;
@@ -509,10 +525,9 @@ fn validate_canonical_identifier_field(
             message: format!("{field} must contain 3-120 canonical characters"),
         });
     }
-    if !normalized
-        .chars()
-        .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || "._:-".contains(character))
-    {
+    if !normalized.chars().all(|character| {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || "._:-".contains(character)
+    }) {
         field_errors.push(AttributionValidationIssue {
             field,
             code: AttributionReasonCode::InvalidPayload.code(),
