@@ -49,6 +49,10 @@ export interface RiskPostureViewModel {
   resumeReconciliationRunId: string;
   resumeApprovedChecksum: string;
   resumeSignoffIntent: string;
+  resumeArtifactId?: string;
+  resumeIncidentCorrelationId?: string;
+  resumeIncidentSeverity?: string;
+  resumeRehearsalRunId?: string;
   evidence: RiskPostureEvidence;
 }
 
@@ -360,6 +364,22 @@ export function resolveRiskPostureViewModel(
     resumeSignoffIntent:
       normalizeOptionalToken(firstValue(searchParams.resumeSignoffIntent), 200) ??
       DEFAULT_RESUME_SIGNOFF_INTENT,
+    resumeArtifactId: normalizeOptionalToken(
+      firstValue(searchParams.resumeArtifactId),
+      180,
+    ),
+    resumeIncidentCorrelationId: normalizeOptionalToken(
+      firstValue(searchParams.resumeIncidentCorrelationId),
+      180,
+    ),
+    resumeIncidentSeverity: normalizeOptionalToken(
+      firstValue(searchParams.resumeIncidentSeverity),
+      40,
+    )?.toLowerCase(),
+    resumeRehearsalRunId: normalizeOptionalToken(
+      firstValue(searchParams.resumeRehearsalRunId),
+      180,
+    ),
     evidence: {
       lastUpdatedIso,
       source: evidenceSource,

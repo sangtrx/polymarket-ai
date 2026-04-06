@@ -6,11 +6,14 @@ import {
   getEmergencyControlActionResult,
   invokeRecoveryReadinessEvaluation,
   invokeRecoveryResume,
+  queryRestoreRehearsalByRunId,
+  queryRestoreRehearsals,
   invokeEmergencyControlAction,
   normalizeEmergencyAction,
   type EmergencyControlAction,
   type EmergencyControlDecision,
   type RecoveryReadinessDecision,
+  type RecoveryRehearsalDecision,
   type RecoveryResumeDecision,
 } from "@/lib/risk/control-actions";
 
@@ -39,6 +42,10 @@ interface SafetyActionRailProps {
   resumeReconciliationRunId: string;
   resumeApprovedChecksum: string;
   resumeSignoffIntent: string;
+  resumeArtifactId?: string;
+  resumeIncidentCorrelationId?: string;
+  resumeIncidentSeverity?: string;
+  resumeRehearsalRunId?: string;
   onActionConfirmed: (decision: EmergencyControlDecision) => void;
   onRecoveryEvaluated: (decision: RecoveryReadinessDecision) => void;
   onRecoveryResumed: (decision: RecoveryResumeDecision) => void;
@@ -108,6 +115,11 @@ function toClientError(
 
 function isDangerAction(action: EmergencyControlAction): boolean {
   return action === "pause" || action === "cancel-all";
+}
+
+function isSevereIncidentSeverity(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "severity_1" || normalized === "severity_2";
 }
 
 function sleep(delayMs: number): Promise<void> {
@@ -213,6 +225,10 @@ export function SafetyActionRail({
   resumeReconciliationRunId,
   resumeApprovedChecksum,
   resumeSignoffIntent,
+  resumeArtifactId,
+  resumeIncidentCorrelationId,
+  resumeIncidentSeverity,
+  resumeRehearsalRunId,
   onActionConfirmed,
   onRecoveryEvaluated,
   onRecoveryResumed,
@@ -232,6 +248,8 @@ export function SafetyActionRail({
     useState<RecoveryReadinessDecision | null>(null);
   const [lastRecoveryResume, setLastRecoveryResume] =
     useState<RecoveryResumeDecision | null>(null);
+  const [lastRestoreRehearsal, setLastRestoreRehearsal] =
+    useState<RecoveryRehearsalDecision | null>(null);
   const [timingEvidence, setTimingEvidence] = useState<ActionTimingEvidence | null>(
     null,
   );
@@ -265,6 +283,12 @@ export function SafetyActionRail({
         return "completed";
       }
       if (
+        isSevereIncidentSeverity(resumeIncidentSeverity) &&
+        lastRestoreRehearsal?.rehearsalStatus === "failed"
+      ) {
+        return "blocked-with-reasons";
+      }
+      if (
         lastRecoveryReadiness?.readinessStatus === "blocked" ||
         resumeState === "blocked-with-reasons"
       ) {
@@ -284,8 +308,26 @@ export function SafetyActionRail({
     return "enabled";
   };
 
+  const rehearsalFailureDetails: ResumeFailureDetail[] =
+    lastRestoreRehearsal?.integrityChecks
+      .filter((check) => !check.passed)
+      .map((check) => ({
+        gate: check.checkName,
+        reasonCode: check.reasonCode,
+        trigger: "Restore rehearsal integrity check",
+        context: check.details,
+        action: lastRestoreRehearsal.recommendedNextAction,
+        verification:
+          check.observedValue && check.expectedValue
+            ? `expected=${check.expectedValue} observed=${check.observedValue}`
+            : check.details,
+      })) ?? [];
+
   const effectiveResumeReason =
     lastRecoveryReadiness?.recommendedNextAction ||
+    (isSevereIncidentSeverity(resumeIncidentSeverity)
+      ? lastRestoreRehearsal?.recommendedNextAction
+      : undefined) ||
     resumeStateReason ||
     DEFAULT_RESUME_STATE_REASON;
   const effectiveResumeFailures: ResumeFailureDetail[] =
@@ -300,7 +342,10 @@ export function SafetyActionRail({
             action: outcome.action,
             verification: outcome.verification,
           }))
-      : resumeFailureDetails;
+      : isSevereIncidentSeverity(resumeIncidentSeverity) &&
+          rehearsalFailureDetails.length > 0
+        ? rehearsalFailureDetails
+        : resumeFailureDetails;
 
   const executeAction = async (action: EmergencyControlAction) => {
     if (actionInFlightRef.current) {
@@ -367,11 +412,64 @@ export function SafetyActionRail({
     setTimingEvidence(null);
     setTimingWarning(null);
     setActiveAction("resume");
+    setLastRestoreRehearsal(null);
 
     const commandStart = Date.now();
     const auditReference = `operator-console-recovery-${commandStart}`;
 
     try {
+      const severeIncident = isSevereIncidentSeverity(resumeIncidentSeverity);
+      let rehearsalEvidence: RecoveryRehearsalDecision | null = null;
+      if (resumeRehearsalRunId?.trim()) {
+        rehearsalEvidence = await queryRestoreRehearsalByRunId({
+          baseUrl,
+          runId: resumeRehearsalRunId,
+        });
+      } else if (resumeIncidentCorrelationId?.trim() || resumeArtifactId?.trim()) {
+        const rehearsalQuery = await queryRestoreRehearsals({
+          baseUrl,
+          correlationId: resumeIncidentCorrelationId,
+          artifactId: resumeIncidentCorrelationId ? undefined : resumeArtifactId,
+          limit: 1,
+        });
+        const latestRun = rehearsalQuery.rehearsals[0];
+        if (latestRun) {
+          rehearsalEvidence = await queryRestoreRehearsalByRunId({
+            baseUrl,
+            runId: latestRun.runId,
+          });
+        }
+      }
+      if (rehearsalEvidence) {
+        setLastRestoreRehearsal(rehearsalEvidence);
+      }
+      if (
+        severeIncident &&
+        !rehearsalEvidence &&
+        !resumeRehearsalRunId &&
+        !resumeIncidentCorrelationId &&
+        !resumeArtifactId
+      ) {
+        throw new EmergencyControlClientError({
+          status: 400,
+          errorCode: "recovery_rehearsal_selector_required",
+          message:
+            "Severity-1/Severity-2 resume requires rehearsal selector metadata (incident correlation, artifact, or rehearsal run).",
+          action: "recovery_resume_execute",
+          endpoint: "/control/recovery/resume",
+          timestampUtc: new Date().toISOString(),
+        });
+      }
+      if (severeIncident && rehearsalEvidence?.rehearsalStatus === "failed") {
+        const acknowledgementMs = Date.now() - commandStart;
+        setTimingEvidence({
+          acknowledgementMs,
+          reflectionMs: acknowledgementMs,
+          confirmationMs: acknowledgementMs,
+        });
+        return;
+      }
+
       const readiness = await invokeRecoveryReadinessEvaluation({
         baseUrl,
         profileKey: resumeProfileKey,
@@ -397,6 +495,12 @@ export function SafetyActionRail({
         baseUrl,
         runId: readiness.runId,
         resumedAtUtc: new Date().toISOString(),
+        incidentCorrelationId:
+          resumeIncidentCorrelationId ??
+          rehearsalEvidence?.incidentCorrelationId,
+        artifactId: resumeArtifactId ?? rehearsalEvidence?.artifactId,
+        incidentSeverity: resumeIncidentSeverity,
+        rehearsalRunId: resumeRehearsalRunId ?? rehearsalEvidence?.runId,
       });
       const confirmationMs = Date.now() - commandStart;
       setLastRecoveryResume(resumed);
@@ -637,6 +741,69 @@ export function SafetyActionRail({
               </article>
             ))}
           </div>
+        </section>
+      ) : null}
+
+      {lastRestoreRehearsal ? (
+        <section className="safety-action-recovery-evidence" role="status">
+          <p className="type-eyebrow">Restore rehearsal evidence</p>
+          <p className="type-body text-muted">
+            {lastRestoreRehearsal.recommendedNextAction}
+          </p>
+          <dl className="risk-evidence-grid">
+            <div>
+              <dt className="type-metadata text-muted">Run ID</dt>
+              <dd className="type-mono">{lastRestoreRehearsal.runId}</dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Rehearsal status</dt>
+              <dd className="type-mono">{lastRestoreRehearsal.rehearsalStatus}</dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Reason code</dt>
+              <dd className="type-mono">
+                <code>{lastRestoreRehearsal.reasonCode}</code>
+              </dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Artifact ID</dt>
+              <dd className="type-mono">{lastRestoreRehearsal.artifactId}</dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Deterministic replay</dt>
+              <dd className="type-mono">
+                {lastRestoreRehearsal.deterministicSignature.deterministicMatch === false
+                  ? "mismatch"
+                  : lastRestoreRehearsal.deterministicSignature.deterministicMatch === true
+                    ? "match"
+                    : "baseline"}
+              </dd>
+            </div>
+            <div>
+              <dt className="type-metadata text-muted">Deterministic signature</dt>
+              <dd className="type-mono">
+                {lastRestoreRehearsal.deterministicSignature.deterministicSignature}
+              </dd>
+            </div>
+          </dl>
+          {lastRestoreRehearsal.integrityChecks.some((check) => !check.passed) ? (
+            <div className="safety-action-recovery-failures">
+              {lastRestoreRehearsal.integrityChecks
+                .filter((check) => !check.passed)
+                .map((check) => (
+                  <article
+                    className="safety-action-recovery-failure"
+                    key={`${check.checkName}:${check.reasonCode}`}
+                  >
+                    <h3 className="type-heading-m">{check.checkName}</h3>
+                    <p className="type-metadata text-muted">
+                      <code>{check.reasonCode}</code>
+                    </p>
+                    <p className="type-metadata text-muted">{check.details}</p>
+                  </article>
+                ))}
+            </div>
+          ) : null}
         </section>
       ) : null}
 

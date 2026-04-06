@@ -288,6 +288,53 @@
 
 ---
 
+## Story
+
+- 3-8-add-backup-integrity-validation-and-deterministic-restore-rehearsal
+
+## Generated Tests
+
+### Domain, Persistence, Governance, Control API, and Runtime Guardrails
+
+- [x] `crates/domain/src/recovery_rehearsal.rs` — validates strict lowercase 64-hex checksum boundaries, deterministic canonicalization/signature behavior, metadata-exclusion rules, and rehearsal evidence contract invariants.
+- [x] `crates/persistence/src/postgres/restore_rehearsals.rs` — validates Story 3.8 migration scope (`restore_rehearsal_runs`, `backup_integrity_checks` only), canonical adapter normalization, deterministic query ordering, and selector behavior by artifact/correlation.
+- [x] `services/governance-service/src/recovery/mod.rs` — validates rehearsal execution success/failure evidence, severe-incident resume fail-closed behavior when rehearsal evidence is missing/failed, and successful severe resume when latest relevant rehearsal passes.
+- [x] `services/control-api/src/routes/mod.rs` — validates rehearsal execute/query routes (`POST /control/recovery/rehearsals`, `GET /control/recovery/rehearsals/{run_id}`, selector query routes), machine-readable error mapping, and response evidence envelopes.
+- [x] `services/risk-engine/src/main.rs` — regression verifies runtime containment release remains gated by approved verification evidence (Story 3.7 semantics preserved while Story 3.8 severe gating is enforced upstream).
+
+### Operator Console, Runbooks, and Story-Scoped QA
+
+- [x] `apps/operator-console/src/lib/risk/control-actions.ts` and `apps/operator-console/src/components/risk/SafetyActionRail.tsx` — typed rehearsal execute/query client contracts, severe selector pass-through, rehearsal evidence rendering (status/failing checks/deterministic replay), and actionable operator guidance.
+- [x] `apps/operator-console/src/lib/risk/posture.ts` and `apps/operator-console/src/components/risk/RiskCommandSurface.tsx` — rehearsal selector wiring (`resumeArtifactId`, incident severity/correlation, rehearsal run override) into resume workflow.
+- [x] `tests/story-3-8/backup-integrity-rehearsal.story-3-8.test.mjs` — story-surface contract checks for recovery route wiring, deterministic signature/domain constraints, migration scope boundaries, severe gating orchestration seams, operator-console rehearsal visibility, and runbook continuity.
+- [x] `tests/api/story-3-8-recovery-rehearsal-api.test.mjs` — API contract checks for deterministic status mapping, rehearsal envelope shape, and dedicated route-test coverage.
+- [x] `tests/e2e/story-3-8-recovery-rehearsal.e2e.test.mjs` — E2E contract checks for safety-rail rehearsal visibility and selector wiring continuity.
+
+## Coverage
+
+- Story 3.8 backup-integrity rehearsal contracts covered end-to-end across deterministic domain rules, durable evidence persistence, governance severe-incident policy, authenticated API ingress, operator-console visibility, and runbook guidance:
+  - deterministic checksum/reconciliation/replay checks with explicit pass/fail reason codes,
+  - severe-incident resume fail-closed policy (`recovery_rehearsal_missing_or_failed`) unless latest relevant rehearsal evidence succeeds,
+  - rehearsal execute/query selector contracts by run-id, artifact, and correlation context,
+  - operator-console rehearsal evidence visibility with one clear recommended next action,
+  - runbook cross-links between recovery readiness, incident forensics, severity alerts, and rehearsal operations.
+- Automated Story 3.8 regression inventory in this QA pass: **40 tests passing** (`rust targeted: 28`, `story/api/e2e node tests: 12`).
+
+## Execution Result
+
+- `cargo test -p domain recovery_rehearsal::tests::` ✅
+- `cargo test -p persistence postgres::restore_rehearsals::tests::` ✅
+- `cargo test -p governance-service recovery::tests::` ✅
+- `cargo test -p control-api routes::tests::recovery_` ✅
+- `cargo test -p risk-engine tests::approved_recovery_run_requires_valid_resume_verification` ✅
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-8/*.test.mjs tests/api/story-3-8*.test.mjs tests/e2e/story-3-8*.test.mjs` ✅ (12 passing)
+- `npm run --silent qa:test:story-3-8` ✅
+
+---
+
 ## Story 3.6 QA Automation Refresh
 
 ### Generated Tests
@@ -398,3 +445,26 @@
 - `node --test tests/story-3-5/*.test.mjs tests/api/story-3-5*.test.mjs tests/e2e/story-3-5*.test.mjs` ✅
 - `npm run --silent qa:test:story-3-5` ✅
 - `npm test` ✅
+
+---
+
+## Story 3.8 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `tests/api/story-3-8-recovery-rehearsal-api.test.mjs` — expanded coverage for machine-readable error status mapping (`invalid_payload`, `unauthorized`, `dependency_unavailable`, `rehearsal_missing_or_failed`), malformed rehearsal JSON handling, and NFR16 query p95 latency guardrails.
+- [x] `tests/e2e/story-3-8-recovery-rehearsal.e2e.test.mjs` — expanded severe-incident resume flow coverage for selector-required gating, stale rehearsal evidence reset before lookup, and blocked-with-reasons rehearsal failure diagnostics.
+
+## Coverage
+
+- Story 3.8 API/E2E critical-flow refresh now verifies:
+  - explicit error-path status mapping for rehearsal payload, authorization, dependency, and severe resume-blocking reason codes;
+  - malformed rehearsal JSON payload mapping to canonical machine-readable errors;
+  - rehearsal query p95 latency objective enforcement (`<= 5_000ms`) in route-test coverage;
+  - severe incident resume guardrails in the safety rail (selector requirement, stale evidence clearing, blocked failure presentation).
+- Automated Story 3.8 regression inventory in this QA refresh: **44 tests passing** (`rust targeted: 28`, `story/api/e2e node tests: 16`).
+
+## Execution Result
+
+- `node --test tests/story-3-8/*.test.mjs tests/api/story-3-8*.test.mjs tests/e2e/story-3-8*.test.mjs` ✅
+- `npm run --silent qa:test:story-3-8` ✅

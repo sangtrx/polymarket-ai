@@ -93,6 +93,12 @@ pub enum RecoveryReasonCode {
     PersistenceUnavailable,
     NotFound,
     StaleEvidence,
+    RehearsalSuccess,
+    RehearsalChecksumMismatch,
+    RehearsalReconciliationSanityFailure,
+    RehearsalDeterministicReplayMismatch,
+    RehearsalSignatureContractError,
+    RehearsalMissingOrFailed,
 }
 
 impl RecoveryReasonCode {
@@ -114,6 +120,16 @@ impl RecoveryReasonCode {
             Self::PersistenceUnavailable => "recovery_persistence_unavailable",
             Self::NotFound => "recovery_not_found",
             Self::StaleEvidence => "recovery_stale_evidence",
+            Self::RehearsalSuccess => "recovery_rehearsal_success",
+            Self::RehearsalChecksumMismatch => "recovery_rehearsal_checksum_mismatch",
+            Self::RehearsalReconciliationSanityFailure => {
+                "recovery_rehearsal_reconciliation_sanity_failure"
+            }
+            Self::RehearsalDeterministicReplayMismatch => {
+                "recovery_rehearsal_deterministic_replay_mismatch"
+            }
+            Self::RehearsalSignatureContractError => "recovery_rehearsal_signature_contract_error",
+            Self::RehearsalMissingOrFailed => "recovery_rehearsal_missing_or_failed",
         }
     }
 
@@ -135,6 +151,18 @@ impl RecoveryReasonCode {
             "recovery_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
             "recovery_not_found" => Ok(Self::NotFound),
             "recovery_stale_evidence" => Ok(Self::StaleEvidence),
+            "recovery_rehearsal_success" => Ok(Self::RehearsalSuccess),
+            "recovery_rehearsal_checksum_mismatch" => Ok(Self::RehearsalChecksumMismatch),
+            "recovery_rehearsal_reconciliation_sanity_failure" => {
+                Ok(Self::RehearsalReconciliationSanityFailure)
+            }
+            "recovery_rehearsal_deterministic_replay_mismatch" => {
+                Ok(Self::RehearsalDeterministicReplayMismatch)
+            }
+            "recovery_rehearsal_signature_contract_error" => {
+                Ok(Self::RehearsalSignatureContractError)
+            }
+            "recovery_rehearsal_missing_or_failed" => Ok(Self::RehearsalMissingOrFailed),
             _ => Err(RecoveryContractError::invalid_payload(format!(
                 "unknown recovery reason code `{value}`"
             ))),

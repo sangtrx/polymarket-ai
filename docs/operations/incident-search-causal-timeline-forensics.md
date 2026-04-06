@@ -63,3 +63,4 @@ Out of scope:
 1. severity alert delivery and fallback policy: `docs/operations/severity-alert-delivery.md`
 2. emergency containment controls: `docs/operations/emergency-safe-state-controls.md`
 3. controlled recovery readiness gates and resume verification: `docs/operations/controlled-recovery-readiness-gates.md`
+4. backup integrity rehearsal and deterministic restore validation: `docs/operations/backup-integrity-restore-rehearsal.md`

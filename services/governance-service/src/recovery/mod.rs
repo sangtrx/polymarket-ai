@@ -7,6 +7,12 @@ use domain::recovery::{
     evaluate_checksum_gate, evaluate_freshness_readiness, evaluate_reconciliation_readiness,
     validate_checksum_digest, validate_recovery_gate_run_evidence,
 };
+use domain::recovery_rehearsal::{
+    BackupIntegrityCheckItem, RestoreRehearsalRequest, RestoreRehearsalRunEvidence,
+    RestoreRehearsalStatus, build_deterministic_replay_signature_evidence, is_severe_incident,
+    normalize_incident_severity, validate_restore_rehearsal_request,
+    validate_restore_rehearsal_run_evidence,
+};
 use domain::risk::{FreshnessGateEvent, normalize_risk_limit_identifier};
 use persistence::postgres::freshness_gate::{
     FreshnessGatePersistenceError,
@@ -20,11 +26,21 @@ use persistence::postgres::recovery_gate_runs::{
     load_latest_recovery_gate_run_by_correlation as pg_load_latest_run_by_correlation,
     load_recovery_gate_run_by_run_id as pg_load_run_by_run_id,
 };
+use persistence::postgres::restore_rehearsals::{
+    RestoreRehearsalPersistenceError,
+    load_latest_restore_rehearsals_by_artifact as pg_load_latest_rehearsals_by_artifact,
+    load_latest_restore_rehearsals_by_correlation as pg_load_latest_rehearsals_by_correlation,
+    load_latest_successful_restore_rehearsal_by_artifact as pg_load_latest_successful_rehearsal_by_artifact,
+    load_latest_successful_restore_rehearsal_by_correlation as pg_load_latest_successful_rehearsal_by_correlation,
+    load_restore_rehearsal_run_by_run_id as pg_load_rehearsal_by_run_id,
+    upsert_restore_rehearsal_run as pg_upsert_restore_rehearsal_run,
+};
 use persistence::postgres::risk_limits::{
     RiskLimitPersistenceError, RiskLimitProfileBundle,
     load_active_risk_limit_profile_bundle as pg_load_active_risk_limit_profile_bundle,
 };
 use serde::Serialize;
+use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -91,6 +107,22 @@ impl RecoveryServiceError {
             field_errors: Vec::new(),
         }
     }
+
+    fn rehearsal_missing_or_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: RecoveryReasonCode::RehearsalMissingOrFailed.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    fn rehearsal_signature_contract_error(message: impl Into<String>) -> Self {
+        Self {
+            code: RecoveryReasonCode::RehearsalSignatureContractError.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
 }
 
 impl Display for RecoveryServiceError {
@@ -121,6 +153,10 @@ pub struct ExecuteRecoveryResumeInput {
     pub correlation_id: String,
     pub resumed_at_utc: String,
     pub run_id: String,
+    pub incident_severity: Option<String>,
+    pub incident_correlation_id: Option<String>,
+    pub artifact_id: Option<String>,
+    pub rehearsal_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +167,43 @@ pub struct QueryRecoveryGateRunInput {
     pub queried_at_utc: String,
     pub run_id: Option<String>,
     pub query_correlation_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecuteRestoreRehearsalInput {
+    pub actor_id: String,
+    pub actor_role: String,
+    pub correlation_id: String,
+    pub requested_at_utc: String,
+    pub artifact_id: String,
+    pub artifact_checksum: String,
+    pub restore_target: String,
+    pub reconciliation_run_id: String,
+    pub restore_output: Value,
+    pub observed_checksum: Option<String>,
+    pub incident_correlation_id: Option<String>,
+    pub incident_severity: Option<String>,
+    pub audit_reference: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryRestoreRehearsalByRunIdInput {
+    pub actor_id: String,
+    pub actor_role: String,
+    pub correlation_id: String,
+    pub queried_at_utc: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryRestoreRehearsalsInput {
+    pub actor_id: String,
+    pub actor_role: String,
+    pub correlation_id: String,
+    pub queried_at_utc: String,
+    pub artifact_id: Option<String>,
+    pub query_correlation_id: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -149,6 +222,39 @@ pub trait RecoveryGateRunRepositoryPort: Send + Sync {
         &self,
         correlation_id: &str,
     ) -> Result<Option<RecoveryGateRunEvidence>, RecoveryServiceError>;
+}
+
+pub trait RestoreRehearsalRepositoryPort: Send + Sync {
+    fn insert_rehearsal_run(
+        &self,
+        run: RestoreRehearsalRunEvidence,
+    ) -> Result<(), RecoveryServiceError>;
+    fn load_rehearsal_by_run_id(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError>;
+    fn load_latest_rehearsal_by_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError>;
+    fn load_latest_rehearsals_by_artifact(
+        &self,
+        artifact_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError>;
+    fn load_latest_rehearsals_by_correlation(
+        &self,
+        correlation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError>;
+    fn load_latest_successful_rehearsal_by_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError>;
+    fn load_latest_successful_rehearsal_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError>;
 }
 
 pub trait RecoveryDependencyPort: Send + Sync {
@@ -178,11 +284,24 @@ pub trait RecoveryOrchestrator: Send + Sync {
         &self,
         input: QueryRecoveryGateRunInput,
     ) -> Result<RecoveryGateRunEvidence, RecoveryServiceError>;
+    fn execute_restore_rehearsal(
+        &self,
+        input: ExecuteRestoreRehearsalInput,
+    ) -> Result<RestoreRehearsalRunEvidence, RecoveryServiceError>;
+    fn query_restore_rehearsal_by_run_id(
+        &self,
+        input: QueryRestoreRehearsalByRunIdInput,
+    ) -> Result<RestoreRehearsalRunEvidence, RecoveryServiceError>;
+    fn query_restore_rehearsals(
+        &self,
+        input: QueryRestoreRehearsalsInput,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError>;
 }
 
 #[derive(Clone)]
 pub struct RecoveryService {
     repository: Arc<dyn RecoveryGateRunRepositoryPort>,
+    rehearsal_repository: Arc<dyn RestoreRehearsalRepositoryPort>,
     dependencies: Arc<dyn RecoveryDependencyPort>,
     operation_lock: Arc<Mutex<()>>,
 }
@@ -192,23 +311,38 @@ impl RecoveryService {
         repository: Arc<dyn RecoveryGateRunRepositoryPort>,
         dependencies: Arc<dyn RecoveryDependencyPort>,
     ) -> Self {
+        Self::new_with_rehearsal_repository(
+            repository,
+            Arc::new(InMemoryRestoreRehearsalRepository::default()),
+            dependencies,
+        )
+    }
+
+    pub fn new_with_rehearsal_repository(
+        repository: Arc<dyn RecoveryGateRunRepositoryPort>,
+        rehearsal_repository: Arc<dyn RestoreRehearsalRepositoryPort>,
+        dependencies: Arc<dyn RecoveryDependencyPort>,
+    ) -> Self {
         Self {
             repository,
+            rehearsal_repository,
             dependencies,
             operation_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn in_memory() -> Self {
-        Self::new(
+        Self::new_with_rehearsal_repository(
             Arc::new(InMemoryRecoveryGateRunRepository::default()),
+            Arc::new(InMemoryRestoreRehearsalRepository::default()),
             Arc::new(InMemoryRecoveryDependencyPort::default()),
         )
     }
 
     pub fn postgres(pool: PgPool) -> Self {
-        Self::new(
+        Self::new_with_rehearsal_repository(
             Arc::new(PostgresRecoveryGateRunRepository::new(pool.clone())),
+            Arc::new(PostgresRestoreRehearsalRepository::new(pool.clone())),
             Arc::new(PostgresRecoveryDependencyAdapter::new(pool)),
         )
     }
@@ -361,6 +495,118 @@ impl RecoveryOrchestrator for RecoveryService {
                 "recovery resume denied because verification evidence is already recorded",
             ));
         }
+        let normalized_incident_severity = input
+            .incident_severity
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|severity| {
+                normalize_incident_severity(severity).ok_or_else(|| {
+                    RecoveryServiceError::invalid_payload(
+                        "incident_severity must normalize to severity_1, severity_2, severity_3, or severity_4",
+                        vec![RecoveryValidationIssue {
+                            field: "incident_severity",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message: "incident_severity must be one of severity_1, severity_2, severity_3, or severity_4".to_string(),
+                        }],
+                    )
+                })
+            })
+            .transpose()?;
+        if is_severe_incident(normalized_incident_severity.as_deref()) {
+            let selector_override = input
+                .rehearsal_run_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(normalize_risk_limit_identifier);
+            let selector_correlation = input
+                .incident_correlation_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(normalize_risk_limit_identifier);
+            let selector_artifact = input
+                .artifact_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(normalize_risk_limit_identifier);
+            let rehearsal = if let Some(rehearsal_run_id) = selector_override.as_deref() {
+                self.rehearsal_repository
+                    .load_rehearsal_by_run_id(rehearsal_run_id)?
+            } else if let Some(correlation_id) = selector_correlation.as_deref() {
+                self.rehearsal_repository
+                    .load_latest_rehearsals_by_correlation(correlation_id, 1)?
+                    .into_iter()
+                    .next()
+            } else if let Some(artifact_id) = selector_artifact.as_deref() {
+                self.rehearsal_repository
+                    .load_latest_rehearsal_by_artifact(artifact_id)?
+            } else {
+                return Err(RecoveryServiceError::invalid_payload(
+                    "severity_1/severity_2 resume requires incident_correlation_id or artifact_id selector",
+                    vec![
+                        RecoveryValidationIssue {
+                            field: "incident_correlation_id",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message: "provide incident_correlation_id for incident-linked severe resume"
+                                .to_string(),
+                        },
+                        RecoveryValidationIssue {
+                            field: "artifact_id",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message:
+                                "provide artifact_id when incident-linked severe context is unavailable"
+                                    .to_string(),
+                        },
+                    ],
+                ));
+            };
+            let rehearsal = rehearsal.ok_or_else(|| {
+                RecoveryServiceError::rehearsal_missing_or_failed(
+                    "controlled resume blocked: latest relevant rehearsal is missing or failed; run restore rehearsal and ensure checksum + reconciliation checks pass",
+                )
+            })?;
+            if let Some(expected_correlation) = selector_correlation.as_deref() {
+                let correlation_matches = rehearsal.correlation_id == *expected_correlation
+                    || rehearsal
+                        .incident_correlation_id
+                        .as_deref()
+                        .is_some_and(|value| value == expected_correlation);
+                if !correlation_matches {
+                    return Err(RecoveryServiceError::invalid_payload(
+                        "selected rehearsal evidence does not match incident_correlation_id selector",
+                        vec![RecoveryValidationIssue {
+                            field: "incident_correlation_id",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message: "incident_correlation_id must match selected rehearsal evidence"
+                                .to_string(),
+                        }],
+                    ));
+                }
+            }
+            if let Some(expected_artifact) = selector_artifact.as_deref()
+                && rehearsal.artifact_id != *expected_artifact
+            {
+                return Err(RecoveryServiceError::invalid_payload(
+                    "selected rehearsal evidence does not match artifact_id selector",
+                    vec![RecoveryValidationIssue {
+                        field: "artifact_id",
+                        code: RecoveryReasonCode::InvalidPayload.code(),
+                        message: "artifact_id must match selected rehearsal evidence".to_string(),
+                    }],
+                ));
+            }
+            if rehearsal.status != RestoreRehearsalStatus::Passed
+                || rehearsal.reason_code != RecoveryReasonCode::RehearsalSuccess.code()
+            {
+                return Err(RecoveryServiceError::rehearsal_missing_or_failed(
+                    "controlled resume blocked: selected rehearsal evidence is not successful; rerun rehearsal and resolve failing integrity checks before resume",
+                ));
+            }
+            validate_restore_rehearsal_run_evidence(&rehearsal).map_err(map_contract_error)?;
+        }
         run.resumed_at_utc = Some(input.resumed_at_utc.clone());
         run.reason_code = RecoveryReasonCode::ResumeApproved.code().to_string();
         validate_recovery_gate_run_evidence(&run).map_err(map_contract_error)?;
@@ -406,6 +652,298 @@ impl RecoveryOrchestrator for RecoveryService {
         })?;
         emit_recovery_telemetry("governance_recovery_readiness_query_v1", &run);
         Ok(run)
+    }
+
+    fn execute_restore_rehearsal(
+        &self,
+        input: ExecuteRestoreRehearsalInput,
+    ) -> Result<RestoreRehearsalRunEvidence, RecoveryServiceError> {
+        validate_recovery_role(&input.actor_role)?;
+        validate_non_empty("actor_id", &input.actor_id)?;
+        validate_non_empty("correlation_id", &input.correlation_id)?;
+        validate_non_empty("requested_at_utc", &input.requested_at_utc)?;
+        validate_non_empty("artifact_id", &input.artifact_id)?;
+        validate_non_empty("artifact_checksum", &input.artifact_checksum)?;
+        validate_non_empty("restore_target", &input.restore_target)?;
+        validate_non_empty("reconciliation_run_id", &input.reconciliation_run_id)?;
+
+        let request = RestoreRehearsalRequest {
+            actor_id: input.actor_id.clone(),
+            actor_role: input.actor_role.clone(),
+            correlation_id: input.correlation_id.clone(),
+            requested_at_utc: input.requested_at_utc.clone(),
+            artifact_id: input.artifact_id.clone(),
+            artifact_checksum: input.artifact_checksum.clone(),
+            restore_target: input.restore_target.clone(),
+            reconciliation_run_id: input.reconciliation_run_id.clone(),
+            restore_output: input.restore_output.clone(),
+            observed_checksum: input.observed_checksum.clone(),
+            incident_correlation_id: input.incident_correlation_id.clone(),
+            incident_severity: input.incident_severity.clone(),
+            audit_reference: input.audit_reference.clone(),
+        };
+        validate_restore_rehearsal_request(&request).map_err(map_contract_error)?;
+
+        let _lock = self.lock_operations()?;
+        let reconciliation_summary = self
+            .dependencies
+            .load_reconciliation_run(&request.reconciliation_run_id)?
+            .ok_or_else(|| {
+                RecoveryServiceError::dependency_unavailable(format!(
+                    "reconciliation dependency unavailable for run `{}`",
+                    normalize_risk_limit_identifier(&request.reconciliation_run_id)
+                ))
+            })?;
+
+        let expected_checksum = validate_checksum_digest(&request.artifact_checksum)
+            .map_err(map_contract_error)?
+            .to_string();
+        let observed_checksum = validate_checksum_digest(
+            request
+                .observed_checksum
+                .as_deref()
+                .unwrap_or(expected_checksum.as_str()),
+        )
+        .map_err(map_contract_error)?
+        .to_string();
+        let checksum_passed = expected_checksum == observed_checksum;
+        let reconciliation_passed =
+            evaluate_reconciliation_readiness(reconciliation_summary.mismatch_rate)
+                .map_err(map_contract_error)?;
+
+        let prior_signature = self
+            .rehearsal_repository
+            .load_latest_successful_rehearsal_by_artifact(&request.artifact_id)?
+            .map(|run| run.deterministic_signature.deterministic_signature);
+        let deterministic_signature = build_deterministic_replay_signature_evidence(
+            &request.restore_output,
+            prior_signature.as_deref(),
+        )
+        .map_err(|error| RecoveryServiceError::rehearsal_signature_contract_error(error.message))?;
+        let deterministic_passed = deterministic_signature.deterministic_match.unwrap_or(true);
+
+        let checksum_reason_code = if checksum_passed {
+            RecoveryReasonCode::RehearsalSuccess.code().to_string()
+        } else {
+            RecoveryReasonCode::RehearsalChecksumMismatch
+                .code()
+                .to_string()
+        };
+        let reconciliation_reason_code = if reconciliation_passed {
+            RecoveryReasonCode::RehearsalSuccess.code().to_string()
+        } else {
+            RecoveryReasonCode::RehearsalReconciliationSanityFailure
+                .code()
+                .to_string()
+        };
+        let deterministic_reason_code = if deterministic_passed {
+            RecoveryReasonCode::RehearsalSuccess.code().to_string()
+        } else {
+            RecoveryReasonCode::RehearsalDeterministicReplayMismatch
+                .code()
+                .to_string()
+        };
+
+        let integrity_checks = vec![
+            BackupIntegrityCheckItem {
+                check_name: "checksum_match".to_string(),
+                passed: checksum_passed,
+                reason_code: checksum_reason_code,
+                expected_value: Some(expected_checksum.clone()),
+                observed_value: Some(observed_checksum.clone()),
+                details: if checksum_passed {
+                    "artifact checksum matched observed restore checksum".to_string()
+                } else {
+                    "artifact checksum mismatch detected during rehearsal restore verification"
+                        .to_string()
+                },
+            },
+            BackupIntegrityCheckItem {
+                check_name: "reconciliation_sanity".to_string(),
+                passed: reconciliation_passed,
+                reason_code: reconciliation_reason_code,
+                expected_value: Some("mismatch_rate < 0.001".to_string()),
+                observed_value: Some(format!("{:.6}", reconciliation_summary.mismatch_rate)),
+                details: if reconciliation_passed {
+                    "reconciliation sanity threshold satisfied".to_string()
+                } else {
+                    "reconciliation mismatch rate exceeded deterministic threshold".to_string()
+                },
+            },
+            BackupIntegrityCheckItem {
+                check_name: "deterministic_replay".to_string(),
+                passed: deterministic_passed,
+                reason_code: deterministic_reason_code,
+                expected_value: prior_signature,
+                observed_value: Some(deterministic_signature.deterministic_signature.clone()),
+                details: if deterministic_passed {
+                    "deterministic replay signature matched prior canonical output or established baseline"
+                        .to_string()
+                } else {
+                    deterministic_signature
+                        .mismatch_summary
+                        .clone()
+                        .unwrap_or_else(|| {
+                            "deterministic replay signature mismatched prior canonical output"
+                                .to_string()
+                        })
+                },
+            },
+        ];
+
+        let status = if checksum_passed && reconciliation_passed && deterministic_passed {
+            RestoreRehearsalStatus::Passed
+        } else {
+            RestoreRehearsalStatus::Failed
+        };
+        let reason_code = if !checksum_passed {
+            RecoveryReasonCode::RehearsalChecksumMismatch
+                .code()
+                .to_string()
+        } else if !reconciliation_passed {
+            RecoveryReasonCode::RehearsalReconciliationSanityFailure
+                .code()
+                .to_string()
+        } else if !deterministic_passed {
+            RecoveryReasonCode::RehearsalDeterministicReplayMismatch
+                .code()
+                .to_string()
+        } else {
+            RecoveryReasonCode::RehearsalSuccess.code().to_string()
+        };
+
+        let run = RestoreRehearsalRunEvidence {
+            run_id: build_restore_rehearsal_run_id(
+                &request.artifact_id,
+                &request.correlation_id,
+                &request.requested_at_utc,
+            ),
+            correlation_id: normalize_risk_limit_identifier(&request.correlation_id),
+            artifact_id: normalize_risk_limit_identifier(&request.artifact_id),
+            artifact_checksum: expected_checksum,
+            observed_checksum,
+            restore_target: normalize_risk_limit_identifier(&request.restore_target),
+            reconciliation_run_id: normalize_risk_limit_identifier(&request.reconciliation_run_id),
+            reconciliation_mismatch_rate: Some(reconciliation_summary.mismatch_rate),
+            reconciliation_passed,
+            status,
+            reason_code,
+            requested_at_utc: request.requested_at_utc.clone(),
+            started_at_utc: request.requested_at_utc.clone(),
+            completed_at_utc: request.requested_at_utc.clone(),
+            integrity_checks,
+            deterministic_signature,
+            incident_correlation_id: request
+                .incident_correlation_id
+                .as_deref()
+                .map(normalize_risk_limit_identifier),
+            incident_severity: request
+                .incident_severity
+                .as_deref()
+                .and_then(normalize_incident_severity),
+            audit_reference: normalize_optional_field(request.audit_reference.as_deref()),
+        };
+        validate_restore_rehearsal_run_evidence(&run).map_err(map_contract_error)?;
+        self.rehearsal_repository
+            .insert_rehearsal_run(run.clone())?;
+        emit_restore_rehearsal_telemetry("governance_restore_rehearsal_execute_v1", &run);
+        Ok(run)
+    }
+
+    fn query_restore_rehearsal_by_run_id(
+        &self,
+        input: QueryRestoreRehearsalByRunIdInput,
+    ) -> Result<RestoreRehearsalRunEvidence, RecoveryServiceError> {
+        validate_recovery_role(&input.actor_role)?;
+        validate_non_empty("actor_id", &input.actor_id)?;
+        validate_non_empty("correlation_id", &input.correlation_id)?;
+        validate_non_empty("queried_at_utc", &input.queried_at_utc)?;
+        validate_non_empty("run_id", &input.run_id)?;
+
+        let run = self
+            .rehearsal_repository
+            .load_rehearsal_by_run_id(&input.run_id)?
+            .ok_or_else(|| {
+                RecoveryServiceError::not_found(format!(
+                    "restore rehearsal run `{}` was not found",
+                    normalize_risk_limit_identifier(&input.run_id)
+                ))
+            })?;
+        validate_restore_rehearsal_run_evidence(&run).map_err(map_contract_error)?;
+        emit_restore_rehearsal_telemetry("governance_restore_rehearsal_query_by_run_v1", &run);
+        Ok(run)
+    }
+
+    fn query_restore_rehearsals(
+        &self,
+        input: QueryRestoreRehearsalsInput,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        validate_recovery_role(&input.actor_role)?;
+        validate_non_empty("actor_id", &input.actor_id)?;
+        validate_non_empty("correlation_id", &input.correlation_id)?;
+        validate_non_empty("queried_at_utc", &input.queried_at_utc)?;
+        let limit = input.limit.unwrap_or(20).clamp(1, 200) as usize;
+        let runs = match (
+            input
+                .artifact_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            input
+                .query_correlation_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(RecoveryServiceError::invalid_payload(
+                    "query_restore_rehearsals requires either artifact_id or query_correlation_id, not both",
+                    vec![
+                        RecoveryValidationIssue {
+                            field: "artifact_id",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message: "artifact_id and query_correlation_id are mutually exclusive"
+                                .to_string(),
+                        },
+                        RecoveryValidationIssue {
+                            field: "query_correlation_id",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message: "artifact_id and query_correlation_id are mutually exclusive"
+                                .to_string(),
+                        },
+                    ],
+                ));
+            }
+            (Some(artifact_id), None) => self
+                .rehearsal_repository
+                .load_latest_rehearsals_by_artifact(artifact_id, limit)?,
+            (None, Some(correlation_id)) => self
+                .rehearsal_repository
+                .load_latest_rehearsals_by_correlation(correlation_id, limit)?,
+            (None, None) => {
+                return Err(RecoveryServiceError::invalid_payload(
+                    "query_restore_rehearsals requires artifact_id or query_correlation_id selector",
+                    vec![
+                        RecoveryValidationIssue {
+                            field: "artifact_id",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message: "artifact_id or query_correlation_id must be provided"
+                                .to_string(),
+                        },
+                        RecoveryValidationIssue {
+                            field: "query_correlation_id",
+                            code: RecoveryReasonCode::InvalidPayload.code(),
+                            message: "artifact_id or query_correlation_id must be provided"
+                                .to_string(),
+                        },
+                    ],
+                ));
+            }
+        };
+        for run in &runs {
+            validate_restore_rehearsal_run_evidence(run).map_err(map_contract_error)?;
+        }
+        Ok(runs)
     }
 }
 
@@ -626,6 +1164,19 @@ fn build_recovery_run_id(
     )
 }
 
+fn build_restore_rehearsal_run_id(
+    artifact_id: &str,
+    correlation_id: &str,
+    requested_at_utc: &str,
+) -> String {
+    format!(
+        "recovery::rehearsal::{}::{}::{}",
+        normalize_risk_limit_identifier(artifact_id),
+        normalize_risk_limit_identifier(correlation_id),
+        compact_utc_timestamp_token(requested_at_utc)
+    )
+}
+
 fn compact_utc_timestamp_token(value: &str) -> String {
     value
         .chars()
@@ -676,6 +1227,23 @@ fn map_recovery_gate_persistence_error(
         "recovery_gate_query_failed"
         | "recovery_gate_row_decode_failed"
         | "recovery_gate_runtime_unavailable" => {
+            RecoveryServiceError::persistence_unavailable(error.message)
+        }
+        _ => RecoveryServiceError {
+            code: error.code,
+            message: error.message,
+            field_errors: error.field_errors,
+        },
+    }
+}
+
+fn map_restore_rehearsal_persistence_error(
+    error: RestoreRehearsalPersistenceError,
+) -> RecoveryServiceError {
+    match error.code {
+        "restore_rehearsal_query_failed"
+        | "restore_rehearsal_row_decode_failed"
+        | "restore_rehearsal_runtime_unavailable" => {
             RecoveryServiceError::persistence_unavailable(error.message)
         }
         _ => RecoveryServiceError {
@@ -750,6 +1318,29 @@ fn emit_recovery_resume_telemetry(
     );
 }
 
+fn emit_restore_rehearsal_telemetry(event_name: &'static str, run: &RestoreRehearsalRunEvidence) {
+    let event = RestoreRehearsalTelemetryEvent {
+        event_name,
+        run_id: &run.run_id,
+        correlation_id: &run.correlation_id,
+        artifact_id: &run.artifact_id,
+        status: run.status.as_str(),
+        reason_code: &run.reason_code,
+        requested_at_utc: &run.requested_at_utc,
+        completed_at_utc: &run.completed_at_utc,
+        failed_checks: run
+            .integrity_checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| check.check_name.clone())
+            .collect::<Vec<_>>(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&event).expect("restore rehearsal telemetry event should serialize")
+    );
+}
+
 #[derive(Debug, Serialize)]
 struct RecoveryTelemetryEvent<'a> {
     event_name: &'a str,
@@ -776,6 +1367,19 @@ struct RecoveryResumeTelemetryEvent<'a> {
     reason_code: &'a str,
     verification_reason_code: &'a str,
     verified_at_utc: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct RestoreRehearsalTelemetryEvent<'a> {
+    event_name: &'a str,
+    run_id: &'a str,
+    correlation_id: &'a str,
+    artifact_id: &'a str,
+    status: &'a str,
+    reason_code: &'a str,
+    requested_at_utc: &'a str,
+    completed_at_utc: &'a str,
+    failed_checks: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -826,6 +1430,105 @@ impl RecoveryGateRunRepositoryPort for PostgresRecoveryGateRunRepository {
         correlation_id: &str,
     ) -> Result<Option<RecoveryGateRunEvidence>, RecoveryServiceError> {
         self.run_with_runtime(pg_load_latest_run_by_correlation(
+            &self.pool,
+            correlation_id,
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PostgresRestoreRehearsalRepository {
+    pool: PgPool,
+}
+
+impl PostgresRestoreRehearsalRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    fn run_with_runtime<F, T>(&self, future: F) -> Result<T, RecoveryServiceError>
+    where
+        F: Future<Output = Result<T, RestoreRehearsalPersistenceError>>,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future))
+                .map_err(map_restore_rehearsal_persistence_error),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    RecoveryServiceError::persistence_unavailable(format!(
+                        "failed to initialize async runtime: {error}"
+                    ))
+                })?
+                .block_on(future)
+                .map_err(map_restore_rehearsal_persistence_error),
+        }
+    }
+}
+
+impl RestoreRehearsalRepositoryPort for PostgresRestoreRehearsalRepository {
+    fn insert_rehearsal_run(
+        &self,
+        run: RestoreRehearsalRunEvidence,
+    ) -> Result<(), RecoveryServiceError> {
+        self.run_with_runtime(pg_upsert_restore_rehearsal_run(&self.pool, &run))
+    }
+
+    fn load_rehearsal_by_run_id(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        self.run_with_runtime(pg_load_rehearsal_by_run_id(&self.pool, run_id))
+    }
+
+    fn load_latest_rehearsal_by_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        self.load_latest_rehearsals_by_artifact(artifact_id, 1)
+            .map(|runs| runs.into_iter().next())
+    }
+
+    fn load_latest_rehearsals_by_artifact(
+        &self,
+        artifact_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        self.run_with_runtime(pg_load_latest_rehearsals_by_artifact(
+            &self.pool,
+            artifact_id,
+            limit as i64,
+        ))
+    }
+
+    fn load_latest_rehearsals_by_correlation(
+        &self,
+        correlation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        self.run_with_runtime(pg_load_latest_rehearsals_by_correlation(
+            &self.pool,
+            correlation_id,
+            limit as i64,
+        ))
+    }
+
+    fn load_latest_successful_rehearsal_by_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        self.run_with_runtime(pg_load_latest_successful_rehearsal_by_artifact(
+            &self.pool,
+            artifact_id,
+        ))
+    }
+
+    fn load_latest_successful_rehearsal_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        self.run_with_runtime(pg_load_latest_successful_rehearsal_by_correlation(
             &self.pool,
             correlation_id,
         ))
@@ -948,6 +1651,140 @@ impl RecoveryGateRunRepositoryPort for InMemoryRecoveryGateRunRepository {
 }
 
 #[derive(Debug, Default)]
+pub struct InMemoryRestoreRehearsalRepository {
+    runs: Mutex<BTreeMap<String, RestoreRehearsalRunEvidence>>,
+}
+
+impl InMemoryRestoreRehearsalRepository {
+    fn select_latest<F>(
+        &self,
+        predicate: F,
+        limit: Option<usize>,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError>
+    where
+        F: Fn(&RestoreRehearsalRunEvidence) -> bool,
+    {
+        let runs = self
+            .runs
+            .lock()
+            .expect("in-memory rehearsal runs lock should not be poisoned");
+        let mut selected = runs
+            .values()
+            .filter(|run| predicate(run))
+            .cloned()
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            right
+                .completed_at_utc
+                .cmp(&left.completed_at_utc)
+                .then(right.run_id.cmp(&left.run_id))
+        });
+        if let Some(limit) = limit {
+            selected.truncate(limit);
+        }
+        Ok(selected)
+    }
+}
+
+impl RestoreRehearsalRepositoryPort for InMemoryRestoreRehearsalRepository {
+    fn insert_rehearsal_run(
+        &self,
+        run: RestoreRehearsalRunEvidence,
+    ) -> Result<(), RecoveryServiceError> {
+        let mut runs = self
+            .runs
+            .lock()
+            .expect("in-memory rehearsal runs lock should not be poisoned");
+        runs.insert(run.run_id.clone(), run);
+        Ok(())
+    }
+
+    fn load_rehearsal_by_run_id(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        let runs = self
+            .runs
+            .lock()
+            .expect("in-memory rehearsal runs lock should not be poisoned");
+        let normalized = normalize_risk_limit_identifier(run_id);
+        Ok(runs.get(&normalized).cloned())
+    }
+
+    fn load_latest_rehearsal_by_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        let normalized = normalize_risk_limit_identifier(artifact_id);
+        self.select_latest(|run| run.artifact_id == normalized, Some(1))
+            .map(|runs| runs.into_iter().next())
+    }
+
+    fn load_latest_rehearsals_by_artifact(
+        &self,
+        artifact_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        let normalized = normalize_risk_limit_identifier(artifact_id);
+        self.select_latest(|run| run.artifact_id == normalized, Some(limit.max(1)))
+    }
+
+    fn load_latest_rehearsals_by_correlation(
+        &self,
+        correlation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        let normalized = normalize_risk_limit_identifier(correlation_id);
+        self.select_latest(
+            |run| {
+                run.correlation_id == normalized
+                    || run
+                        .incident_correlation_id
+                        .as_deref()
+                        .is_some_and(|value| value == normalized)
+            },
+            Some(limit.max(1)),
+        )
+    }
+
+    fn load_latest_successful_rehearsal_by_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        let normalized = normalize_risk_limit_identifier(artifact_id);
+        self.select_latest(
+            |run| {
+                run.artifact_id == normalized
+                    && run.status == RestoreRehearsalStatus::Passed
+                    && run.reason_code == RecoveryReasonCode::RehearsalSuccess.code()
+            },
+            Some(1),
+        )
+        .map(|runs| runs.into_iter().next())
+    }
+
+    fn load_latest_successful_rehearsal_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+        let normalized = normalize_risk_limit_identifier(correlation_id);
+        self.select_latest(
+            |run| {
+                (run.correlation_id == normalized
+                    || run
+                        .incident_correlation_id
+                        .as_deref()
+                        .is_some_and(|value| value == normalized))
+                    && run.status == RestoreRehearsalStatus::Passed
+                    && run.reason_code == RecoveryReasonCode::RehearsalSuccess.code()
+            },
+            Some(1),
+        )
+        .map(|runs| runs.into_iter().next())
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct InMemoryRecoveryDependencyPort {
     latest_freshness_event: Mutex<Option<FreshnessGateEvent>>,
     reconciliation_runs: Mutex<BTreeMap<String, ReconciliationRunSummary>>,
@@ -1027,6 +1864,7 @@ mod tests {
         FreshnessGateTransition, InventoryLimitRule, RiskLimitProfileStatus, RiskLimitReasonCode,
         RiskLimitScope, RiskScopeLimit,
     };
+    use serde_json::json;
 
     #[derive(Debug)]
     struct TestRecoveryDependencies {
@@ -1183,6 +2021,10 @@ mod tests {
                 correlation_id: "corr-3-resume".to_string(),
                 resumed_at_utc: resumed_at_utc.clone(),
                 run_id: run.run_id.clone(),
+                incident_correlation_id: None,
+                artifact_id: None,
+                incident_severity: None,
+                rehearsal_run_id: None,
             })
             .expect("resume should record verification evidence");
         assert_eq!(resumed.run.resumed_at_utc, Some(resumed_at_utc.clone()));
@@ -1206,6 +2048,10 @@ mod tests {
                 correlation_id: "corr-3-resume".to_string(),
                 resumed_at_utc: "2026-04-06T12:00:07Z".to_string(),
                 run_id: run.run_id,
+                incident_correlation_id: None,
+                artifact_id: None,
+                incident_severity: None,
+                rehearsal_run_id: None,
             })
             .expect_err("resume replay must be rejected");
         assert_eq!(replay.code, RecoveryReasonCode::StaleEvidence.code());
@@ -1300,9 +2146,415 @@ mod tests {
                 correlation_id: "corr-4".to_string(),
                 resumed_at_utc: "2026-04-06T12:01:00Z".to_string(),
                 run_id: "run-blocked".to_string(),
+                incident_correlation_id: None,
+                artifact_id: None,
+                incident_severity: None,
+                rehearsal_run_id: None,
             })
             .expect_err("blocked run cannot resume");
         assert_eq!(error.code, RecoveryReasonCode::StaleEvidence.code());
+    }
+
+    #[test]
+    fn restore_rehearsal_records_passed_integrity_evidence() {
+        let dependencies = Arc::new(TestRecoveryDependencies::new_ready_state());
+        let service = service_with_dependencies(dependencies);
+        let artifact_checksum = "a".repeat(64);
+        let run = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-1".to_string(),
+                requested_at_utc: "2026-04-06T12:10:00Z".to_string(),
+                artifact_id: "artifact-1".to_string(),
+                artifact_checksum: artifact_checksum.clone(),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({
+                    "positions": 120,
+                    "balances": {
+                        "usd": "500000.00",
+                        "btc": "10.250000"
+                    }
+                }),
+                observed_checksum: Some(artifact_checksum),
+                incident_correlation_id: Some("incident-corr-1".to_string()),
+                incident_severity: Some("severity_1".to_string()),
+                audit_reference: Some("arb-2026-0010".to_string()),
+            })
+            .expect("rehearsal execution should succeed");
+        assert_eq!(run.status, RestoreRehearsalStatus::Passed);
+        assert_eq!(run.reason_code, RecoveryReasonCode::RehearsalSuccess.code());
+        assert!(run.integrity_checks.iter().all(|check| check.passed));
+        assert_eq!(run.incident_severity.as_deref(), Some("severity_1"));
+
+        let queried = service
+            .query_restore_rehearsal_by_run_id(QueryRestoreRehearsalByRunIdInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-query-1".to_string(),
+                queried_at_utc: "2026-04-06T12:10:01Z".to_string(),
+                run_id: run.run_id.clone(),
+            })
+            .expect("query by run id should return persisted rehearsal");
+        assert_eq!(queried.run_id, run.run_id);
+    }
+
+    #[test]
+    fn restore_rehearsal_fails_on_checksum_mismatch() {
+        let dependencies = Arc::new(TestRecoveryDependencies::new_ready_state());
+        let service = service_with_dependencies(dependencies);
+        let run = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-2".to_string(),
+                requested_at_utc: "2026-04-06T12:15:00Z".to_string(),
+                artifact_id: "artifact-2".to_string(),
+                artifact_checksum: "a".repeat(64),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({
+                    "positions": 121,
+                    "balances": {"usd": "500100.00"}
+                }),
+                observed_checksum: Some("b".repeat(64)),
+                incident_correlation_id: Some("incident-corr-2".to_string()),
+                incident_severity: Some("severity_2".to_string()),
+                audit_reference: None,
+            })
+            .expect("execution should return failed evidence, not transport error");
+        assert_eq!(run.status, RestoreRehearsalStatus::Failed);
+        assert_eq!(
+            run.reason_code,
+            RecoveryReasonCode::RehearsalChecksumMismatch.code()
+        );
+        assert!(
+            run.integrity_checks
+                .iter()
+                .any(|check| check.check_name == "checksum_match" && !check.passed)
+        );
+    }
+
+    #[test]
+    fn deterministic_replay_baseline_uses_latest_successful_run_only() {
+        let dependencies = Arc::new(TestRecoveryDependencies::new_ready_state());
+        let service = service_with_dependencies(dependencies);
+        let artifact_id = "artifact-deterministic-1";
+        let expected_checksum = "a".repeat(64);
+
+        let baseline = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-deterministic-base".to_string(),
+                requested_at_utc: "2026-04-06T12:16:00Z".to_string(),
+                artifact_id: artifact_id.to_string(),
+                artifact_checksum: expected_checksum.clone(),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({
+                    "snapshot": "baseline",
+                    "records": 100
+                }),
+                observed_checksum: Some(expected_checksum.clone()),
+                incident_correlation_id: None,
+                incident_severity: Some("severity_2".to_string()),
+                audit_reference: None,
+            })
+            .expect("baseline rehearsal should succeed");
+        assert_eq!(baseline.status, RestoreRehearsalStatus::Passed);
+
+        let failed_drift = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-deterministic-failed".to_string(),
+                requested_at_utc: "2026-04-06T12:16:10Z".to_string(),
+                artifact_id: artifact_id.to_string(),
+                artifact_checksum: expected_checksum.clone(),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({
+                    "snapshot": "drifted",
+                    "records": 100
+                }),
+                observed_checksum: Some("b".repeat(64)),
+                incident_correlation_id: None,
+                incident_severity: Some("severity_2".to_string()),
+                audit_reference: None,
+            })
+            .expect("failed rehearsal should still persist evidence");
+        assert_eq!(failed_drift.status, RestoreRehearsalStatus::Failed);
+        assert_eq!(
+            failed_drift.reason_code,
+            RecoveryReasonCode::RehearsalChecksumMismatch.code()
+        );
+
+        let replay_attempt = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-deterministic-retry".to_string(),
+                requested_at_utc: "2026-04-06T12:16:20Z".to_string(),
+                artifact_id: artifact_id.to_string(),
+                artifact_checksum: expected_checksum.clone(),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({
+                    "snapshot": "drifted",
+                    "records": 100
+                }),
+                observed_checksum: Some(expected_checksum),
+                incident_correlation_id: None,
+                incident_severity: Some("severity_2".to_string()),
+                audit_reference: None,
+            })
+            .expect("replay attempt should return deterministic evidence");
+        assert_eq!(replay_attempt.status, RestoreRehearsalStatus::Failed);
+        assert_eq!(
+            replay_attempt.reason_code,
+            RecoveryReasonCode::RehearsalDeterministicReplayMismatch.code()
+        );
+    }
+
+    #[test]
+    fn severe_resume_requires_successful_rehearsal_evidence() {
+        let dependencies = Arc::new(TestRecoveryDependencies::new_ready_state());
+        let service = service_with_dependencies(dependencies);
+        let bundle = sample_risk_limit_bundle();
+        let checksum = compute_risk_limit_bundle_checksum(&bundle.profile, &bundle.inventory_rules)
+            .expect("checksum should compute");
+        let readiness = service
+            .evaluate_recovery_readiness(EvaluateRecoveryReadinessInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-severe-1".to_string(),
+                requested_at_utc: "2026-04-06T12:20:00Z".to_string(),
+                profile_key: "default".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                approved_checksum: checksum,
+                signoff_intent: "approve controlled recovery".to_string(),
+                audit_reference: None,
+            })
+            .expect("readiness evaluation should approve baseline run");
+
+        let missing_error = service
+            .execute_recovery_resume(ExecuteRecoveryResumeInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-severe-1".to_string(),
+                resumed_at_utc: "2026-04-06T12:20:05Z".to_string(),
+                run_id: readiness.run_id.clone(),
+                incident_correlation_id: Some("incident-severe-1".to_string()),
+                artifact_id: None,
+                incident_severity: Some("severity_1".to_string()),
+                rehearsal_run_id: None,
+            })
+            .expect_err("severe resume without rehearsal evidence must fail closed");
+        assert_eq!(
+            missing_error.code,
+            RecoveryReasonCode::RehearsalMissingOrFailed.code()
+        );
+
+        let _failed_rehearsal = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-severe-failed".to_string(),
+                requested_at_utc: "2026-04-06T12:20:10Z".to_string(),
+                artifact_id: "artifact-severe-1".to_string(),
+                artifact_checksum: "a".repeat(64),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({"snapshot": "v1"}),
+                observed_checksum: Some("b".repeat(64)),
+                incident_correlation_id: Some("incident-severe-1".to_string()),
+                incident_severity: Some("severity_1".to_string()),
+                audit_reference: None,
+            })
+            .expect("failed rehearsal evidence should still persist");
+
+        let failed_error = service
+            .execute_recovery_resume(ExecuteRecoveryResumeInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-severe-1".to_string(),
+                resumed_at_utc: "2026-04-06T12:20:12Z".to_string(),
+                run_id: readiness.run_id,
+                incident_correlation_id: Some("incident-severe-1".to_string()),
+                artifact_id: None,
+                incident_severity: Some("severity_1".to_string()),
+                rehearsal_run_id: None,
+            })
+            .expect_err("failed rehearsal evidence must keep severe resume blocked");
+        assert_eq!(
+            failed_error.code,
+            RecoveryReasonCode::RehearsalMissingOrFailed.code()
+        );
+    }
+
+    #[test]
+    fn severe_resume_succeeds_with_latest_successful_rehearsal() {
+        let dependencies = Arc::new(TestRecoveryDependencies::new_ready_state());
+        let service = service_with_dependencies(dependencies);
+        let _run = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-rehearsal-success".to_string(),
+                requested_at_utc: "2026-04-06T12:25:00Z".to_string(),
+                artifact_id: "artifact-severe-2".to_string(),
+                artifact_checksum: "a".repeat(64),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({"snapshot": "v2", "records": 222}),
+                observed_checksum: Some("a".repeat(64)),
+                incident_correlation_id: Some("incident-severe-2".to_string()),
+                incident_severity: Some("severity_2".to_string()),
+                audit_reference: None,
+            })
+            .expect("successful rehearsal should persist");
+
+        let bundle = sample_risk_limit_bundle();
+        let checksum = compute_risk_limit_bundle_checksum(&bundle.profile, &bundle.inventory_rules)
+            .expect("checksum should compute");
+        let readiness = service
+            .evaluate_recovery_readiness(EvaluateRecoveryReadinessInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-severe-2".to_string(),
+                requested_at_utc: "2026-04-06T12:25:10Z".to_string(),
+                profile_key: "default".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                approved_checksum: checksum,
+                signoff_intent: "approve controlled recovery".to_string(),
+                audit_reference: None,
+            })
+            .expect("readiness should approve");
+
+        let resumed = service
+            .execute_recovery_resume(ExecuteRecoveryResumeInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-severe-2".to_string(),
+                resumed_at_utc: "2026-04-06T12:25:12Z".to_string(),
+                run_id: readiness.run_id,
+                incident_correlation_id: Some("incident-severe-2".to_string()),
+                artifact_id: None,
+                incident_severity: Some("severity_2".to_string()),
+                rehearsal_run_id: None,
+            })
+            .expect("severe resume should proceed with successful rehearsal evidence");
+        assert_eq!(
+            resumed.run.resumed_at_utc,
+            Some("2026-04-06T12:25:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn severe_resume_rejects_invalid_incident_severity() {
+        let dependencies = Arc::new(TestRecoveryDependencies::new_ready_state());
+        let service = service_with_dependencies(dependencies);
+        let bundle = sample_risk_limit_bundle();
+        let checksum = compute_risk_limit_bundle_checksum(&bundle.profile, &bundle.inventory_rules)
+            .expect("checksum should compute");
+        let readiness = service
+            .evaluate_recovery_readiness(EvaluateRecoveryReadinessInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-invalid-severity".to_string(),
+                requested_at_utc: "2026-04-06T12:30:00Z".to_string(),
+                profile_key: "default".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                approved_checksum: checksum,
+                signoff_intent: "approve controlled recovery".to_string(),
+                audit_reference: None,
+            })
+            .expect("readiness should approve");
+
+        let error = service
+            .execute_recovery_resume(ExecuteRecoveryResumeInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-invalid-severity".to_string(),
+                resumed_at_utc: "2026-04-06T12:30:05Z".to_string(),
+                run_id: readiness.run_id,
+                incident_correlation_id: Some("incident-invalid-severity".to_string()),
+                artifact_id: None,
+                incident_severity: Some("severity_9".to_string()),
+                rehearsal_run_id: None,
+            })
+            .expect_err("invalid incident severity must be rejected explicitly");
+        assert_eq!(error.code, RecoveryReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "incident_severity")
+        );
+    }
+
+    #[test]
+    fn severe_resume_rejects_rehearsal_selector_mismatch() {
+        let dependencies = Arc::new(TestRecoveryDependencies::new_ready_state());
+        let service = service_with_dependencies(dependencies);
+        let successful_rehearsal = service
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-selector-match".to_string(),
+                requested_at_utc: "2026-04-06T12:32:00Z".to_string(),
+                artifact_id: "artifact-selector-match".to_string(),
+                artifact_checksum: "a".repeat(64),
+                restore_target: "sandbox-recovery".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                restore_output: json!({"snapshot": "selector-baseline"}),
+                observed_checksum: Some("a".repeat(64)),
+                incident_correlation_id: Some("incident-selector-match".to_string()),
+                incident_severity: Some("severity_1".to_string()),
+                audit_reference: None,
+            })
+            .expect("successful rehearsal should persist");
+        assert_eq!(successful_rehearsal.status, RestoreRehearsalStatus::Passed);
+
+        let bundle = sample_risk_limit_bundle();
+        let checksum = compute_risk_limit_bundle_checksum(&bundle.profile, &bundle.inventory_rules)
+            .expect("checksum should compute");
+        let readiness = service
+            .evaluate_recovery_readiness(EvaluateRecoveryReadinessInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-selector-mismatch".to_string(),
+                requested_at_utc: "2026-04-06T12:32:10Z".to_string(),
+                profile_key: "default".to_string(),
+                reconciliation_run_id: "recon-1".to_string(),
+                approved_checksum: checksum,
+                signoff_intent: "approve controlled recovery".to_string(),
+                audit_reference: None,
+            })
+            .expect("readiness should approve");
+
+        let error = service
+            .execute_recovery_resume(ExecuteRecoveryResumeInput {
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-recovery-selector-mismatch".to_string(),
+                resumed_at_utc: "2026-04-06T12:32:12Z".to_string(),
+                run_id: readiness.run_id,
+                incident_correlation_id: Some("incident-selector-other".to_string()),
+                artifact_id: Some("artifact-selector-match".to_string()),
+                incident_severity: Some("severity_1".to_string()),
+                rehearsal_run_id: Some(successful_rehearsal.run_id),
+            })
+            .expect_err("selector mismatch must be rejected");
+        assert_eq!(error.code, RecoveryReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "incident_correlation_id")
+        );
     }
 
     fn sample_freshness_event(max_age_seconds: f64) -> FreshnessGateEvent {

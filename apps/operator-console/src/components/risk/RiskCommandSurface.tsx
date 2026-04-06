@@ -53,6 +53,10 @@ export function RiskCommandSurface({
         resumeReconciliationRunId={activePosture.resumeReconciliationRunId}
         resumeApprovedChecksum={activePosture.resumeApprovedChecksum}
         resumeSignoffIntent={activePosture.resumeSignoffIntent}
+        resumeArtifactId={activePosture.resumeArtifactId}
+        resumeIncidentCorrelationId={activePosture.resumeIncidentCorrelationId}
+        resumeIncidentSeverity={activePosture.resumeIncidentSeverity}
+        resumeRehearsalRunId={activePosture.resumeRehearsalRunId}
       />
     </section>
   );

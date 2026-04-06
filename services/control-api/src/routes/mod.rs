@@ -3,7 +3,7 @@ use crate::middleware::{
 };
 use axum::{
     Router,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
     middleware as axum_middleware,
     response::{IntoResponse, Response},
@@ -34,6 +34,9 @@ use domain::incidents::{
     IncidentValidationIssue, apply_incident_query, build_incident_query_filters,
 };
 use domain::recovery::RecoveryReasonCode;
+use domain::recovery_rehearsal::{
+    BackupIntegrityCheckItem, RestoreRehearsalRunEvidence, RestoreRehearsalStatus,
+};
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
     MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue,
@@ -53,7 +56,8 @@ use governance_service::credentials::{
 };
 use governance_service::market_policy::{ToggleMarketClusterInput, UpsertMarketPolicyProfileInput};
 use governance_service::recovery::{
-    EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput, QueryRecoveryGateRunInput,
+    EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput, ExecuteRestoreRehearsalInput,
+    QueryRecoveryGateRunInput, QueryRestoreRehearsalByRunIdInput, QueryRestoreRehearsalsInput,
     RecoveryResumeExecutionEvidence,
 };
 use governance_service::risk_limits::{
@@ -197,6 +201,14 @@ pub fn app_router(state: ControlApiState) -> Router {
             post(evaluate_recovery_readiness),
         )
         .route("/control/recovery/resume", post(execute_recovery_resume))
+        .route(
+            "/control/recovery/rehearsals",
+            post(execute_restore_rehearsal).get(query_restore_rehearsals),
+        )
+        .route(
+            "/control/recovery/rehearsals/{run_id}",
+            get(query_restore_rehearsal_by_run_id),
+        )
         .route(
             "/control/recovery/runs/{run_id}",
             get(query_recovery_gate_run_by_run_id),
@@ -2345,6 +2357,10 @@ pub async fn execute_recovery_resume(
                 correlation_id: actor.correlation_id.clone(),
                 resumed_at_utc: resumed_at_utc.clone(),
                 run_id: payload.run_id,
+                incident_correlation_id: payload.incident_correlation_id,
+                artifact_id: payload.artifact_id,
+                incident_severity: payload.incident_severity,
+                rehearsal_run_id: payload.rehearsal_run_id,
             }) {
             Ok(decision) => decision,
             Err(error) => {
@@ -2367,6 +2383,172 @@ pub async fn execute_recovery_resume(
         endpoint,
         "recovery_resume_execute",
         "POST",
+    )
+}
+
+pub async fn execute_restore_rehearsal(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<RecoveryRehearsalExecutePayload>, JsonRejection>,
+) -> Response {
+    let endpoint = "/control/recovery/rehearsals".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            let rejection_message = rejection.body_text();
+            return recovery_service_error_response(
+                RecoveryReasonCode::InvalidPayload.code(),
+                format!("invalid rehearsal payload: {rejection_message}"),
+                vec![domain::recovery::RecoveryValidationIssue {
+                    field: "payload",
+                    code: RecoveryReasonCode::InvalidPayload.code(),
+                    message: rejection_message,
+                }],
+                "recovery_rehearsal_execute",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    let run =
+        match state
+            .recovery_orchestrator
+            .execute_restore_rehearsal(ExecuteRestoreRehearsalInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                requested_at_utc: authorization.timestamp_utc.clone(),
+                artifact_id: payload.artifact_id,
+                artifact_checksum: payload.artifact_checksum,
+                restore_target: payload.restore_target,
+                reconciliation_run_id: payload.reconciliation_run_id,
+                restore_output: payload.restore_output,
+                observed_checksum: payload.observed_checksum,
+                incident_correlation_id: payload.incident_correlation_id,
+                incident_severity: payload.incident_severity,
+                audit_reference: payload.audit_reference,
+            }) {
+            Ok(run) => run,
+            Err(error) => {
+                return recovery_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "recovery_rehearsal_execute",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    recovery_rehearsal_response(
+        &state,
+        &actor,
+        run,
+        endpoint,
+        "recovery_rehearsal_execute",
+        "POST",
+        StatusCode::ACCEPTED,
+    )
+}
+
+pub async fn query_restore_rehearsal_by_run_id(
+    State(state): State<ControlApiState>,
+    Path(run_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/recovery/rehearsals/{run_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let run = match state
+        .recovery_orchestrator
+        .query_restore_rehearsal_by_run_id(QueryRestoreRehearsalByRunIdInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+            run_id,
+        }) {
+        Ok(run) => run,
+        Err(error) => {
+            return recovery_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "recovery_rehearsal_query",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    recovery_rehearsal_response(
+        &state,
+        &actor,
+        run,
+        endpoint,
+        "recovery_rehearsal_query",
+        "GET",
+        StatusCode::OK,
+    )
+}
+
+pub async fn query_restore_rehearsals(
+    State(state): State<ControlApiState>,
+    Query(query): Query<RecoveryRehearsalQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/recovery/rehearsals".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let runs =
+        match state
+            .recovery_orchestrator
+            .query_restore_rehearsals(QueryRestoreRehearsalsInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                queried_at_utc: authorization.timestamp_utc.clone(),
+                artifact_id: query.artifact_id,
+                query_correlation_id: query.correlation_id,
+                limit: query.limit,
+            }) {
+            Ok(runs) => runs,
+            Err(error) => {
+                return recovery_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "recovery_rehearsal_query",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    recovery_rehearsal_query_response(
+        &state,
+        &actor,
+        runs,
+        endpoint,
+        "recovery_rehearsal_query",
+        "GET",
+        authorization.timestamp_utc,
     )
 }
 
@@ -5078,6 +5260,194 @@ fn recovery_resume_response(
         .into_response()
 }
 
+fn recovery_rehearsal_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    run: RestoreRehearsalRunEvidence,
+    endpoint: String,
+    action_type: &'static str,
+    http_method: &'static str,
+    status: StatusCode,
+) -> Response {
+    let recommended_next_action = recovery_rehearsal_next_action(&run);
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action_type.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "run_id": run.run_id.clone(),
+            "artifact_id": run.artifact_id.clone(),
+            "rehearsal_status": run.status.as_str(),
+            "reason_code": run.reason_code.clone(),
+        }),
+        approval_reference: run.audit_reference.clone(),
+        timestamp: run.completed_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: run.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: run.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action_type.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            run.correlation_id.clone(),
+            run.completed_at_utc.clone(),
+        );
+    }
+
+    (
+        status,
+        axum::Json(RecoveryRehearsalDecisionResponse {
+            status: "accepted",
+            action: action_type.to_string(),
+            run_id: run.run_id,
+            rehearsal_status: run.status.as_str().to_string(),
+            reason_code: run.reason_code,
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: run.correlation_id,
+            artifact_id: run.artifact_id,
+            artifact_checksum: run.artifact_checksum,
+            observed_checksum: run.observed_checksum,
+            restore_target: run.restore_target,
+            reconciliation_run_id: run.reconciliation_run_id,
+            reconciliation_mismatch_rate: run.reconciliation_mismatch_rate,
+            reconciliation_passed: run.reconciliation_passed,
+            requested_at_utc: run.requested_at_utc,
+            started_at_utc: run.started_at_utc,
+            completed_at_utc: run.completed_at_utc.clone(),
+            integrity_checks: run
+                .integrity_checks
+                .into_iter()
+                .map(recovery_rehearsal_integrity_check_item)
+                .collect(),
+            deterministic_signature: recovery_deterministic_signature_response(
+                run.deterministic_signature,
+            ),
+            recommended_next_action,
+            incident_correlation_id: run.incident_correlation_id,
+            incident_severity: run.incident_severity,
+            audit_reference: run.audit_reference,
+            timestamp_utc: run.completed_at_utc,
+        }),
+    )
+        .into_response()
+}
+
+fn recovery_rehearsal_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    runs: Vec<RestoreRehearsalRunEvidence>,
+    endpoint: String,
+    action_type: &'static str,
+    http_method: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let reason_code = runs
+        .first()
+        .map(|run| run.reason_code.clone())
+        .unwrap_or_else(|| RecoveryReasonCode::RehearsalSuccess.code().to_string());
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action_type.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "result_count": runs.len(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action_type.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc.clone(),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(RecoveryRehearsalQueryResponse {
+            status: "accepted",
+            action: action_type.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            rehearsals: runs.into_iter().map(recovery_rehearsal_run_item).collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn recovery_rehearsal_run_item(run: RestoreRehearsalRunEvidence) -> RecoveryRehearsalRunItem {
+    let recommended_next_action = recovery_rehearsal_next_action(&run);
+    let failing_checks = run
+        .integrity_checks
+        .iter()
+        .filter(|check| !check.passed)
+        .map(|check| check.check_name.clone())
+        .collect::<Vec<_>>();
+    RecoveryRehearsalRunItem {
+        run_id: run.run_id,
+        rehearsal_status: run.status.as_str().to_string(),
+        reason_code: run.reason_code,
+        artifact_id: run.artifact_id,
+        correlation_id: run.correlation_id,
+        completed_at_utc: run.completed_at_utc,
+        failing_checks,
+        recommended_next_action,
+    }
+}
+
+fn recovery_rehearsal_integrity_check_item(
+    check: BackupIntegrityCheckItem,
+) -> RecoveryRehearsalIntegrityCheckResponseItem {
+    RecoveryRehearsalIntegrityCheckResponseItem {
+        check_name: check.check_name,
+        passed: check.passed,
+        reason_code: check.reason_code,
+        expected_value: check.expected_value,
+        observed_value: check.observed_value,
+        details: check.details,
+    }
+}
+
+fn recovery_deterministic_signature_response(
+    signature: domain::recovery_rehearsal::DeterministicReplaySignatureEvidence,
+) -> RecoveryDeterministicSignatureResponse {
+    RecoveryDeterministicSignatureResponse {
+        deterministic_signature: signature.deterministic_signature,
+        prior_signature: signature.prior_deterministic_signature,
+        deterministic_match: signature.deterministic_match,
+        mismatch_summary: signature.mismatch_summary,
+    }
+}
+
+fn recovery_rehearsal_next_action(run: &RestoreRehearsalRunEvidence) -> String {
+    if run.status == RestoreRehearsalStatus::Passed {
+        "Restore rehearsal passed with deterministic integrity checks; severe-incident resume may proceed when readiness gates are approved.".to_string()
+    } else {
+        "Restore rehearsal failed; keep production resume blocked and rerun rehearsal after resolving checksum/reconciliation/deterministic mismatches.".to_string()
+    }
+}
+
 fn recovery_service_error_response(
     error_code: &'static str,
     message: String,
@@ -5115,18 +5485,30 @@ fn recovery_service_error_response(
 fn recovery_service_error_status(code: &str) -> StatusCode {
     match code {
         code if code == RecoveryReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == RecoveryReasonCode::RehearsalSignatureContractError.code() => {
+            StatusCode::BAD_REQUEST
+        }
         code if code == RecoveryReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
         code if code == RecoveryReasonCode::NotFound.code() => StatusCode::NOT_FOUND,
-        code if code == RecoveryReasonCode::StaleEvidence.code() => StatusCode::CONFLICT,
+        code if code == RecoveryReasonCode::StaleEvidence.code()
+            || code == RecoveryReasonCode::RehearsalMissingOrFailed.code() =>
+        {
+            StatusCode::CONFLICT
+        }
         code if code == RecoveryReasonCode::DependencyUnavailable.code()
             || code == RecoveryReasonCode::PersistenceUnavailable.code()
             || code == "recovery_gate_query_failed"
             || code == "recovery_gate_row_decode_failed"
-            || code == "recovery_gate_runtime_unavailable" =>
+            || code == "recovery_gate_runtime_unavailable"
+            || code == "restore_rehearsal_query_failed"
+            || code == "restore_rehearsal_row_decode_failed"
+            || code == "restore_rehearsal_runtime_unavailable" =>
         {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        "recovery_gate_constraint_violation" => StatusCode::CONFLICT,
+        "recovery_gate_constraint_violation" | "restore_rehearsal_constraint_violation" => {
+            StatusCode::CONFLICT
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -5653,6 +6035,41 @@ pub struct RecoveryResumePayload {
     pub run_id: String,
     #[serde(default)]
     pub resumed_at_utc: Option<String>,
+    #[serde(default)]
+    pub incident_correlation_id: Option<String>,
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub incident_severity: Option<String>,
+    #[serde(default)]
+    pub rehearsal_run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoveryRehearsalExecutePayload {
+    pub artifact_id: String,
+    pub artifact_checksum: String,
+    pub restore_target: String,
+    pub reconciliation_run_id: String,
+    pub restore_output: serde_json::Value,
+    #[serde(default)]
+    pub observed_checksum: Option<String>,
+    #[serde(default)]
+    pub incident_correlation_id: Option<String>,
+    #[serde(default)]
+    pub incident_severity: Option<String>,
+    #[serde(default)]
+    pub audit_reference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoveryRehearsalQuery {
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6296,6 +6713,87 @@ pub struct RecoveryResumeDecisionResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RecoveryRehearsalDecisionResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub run_id: String,
+    pub rehearsal_status: String,
+    pub reason_code: String,
+    pub actor_id: String,
+    pub actor_role: String,
+    pub correlation_id: String,
+    pub artifact_id: String,
+    pub artifact_checksum: String,
+    pub observed_checksum: String,
+    pub restore_target: String,
+    pub reconciliation_run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation_mismatch_rate: Option<f64>,
+    pub reconciliation_passed: bool,
+    pub requested_at_utc: String,
+    pub started_at_utc: String,
+    pub completed_at_utc: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrity_checks: Vec<RecoveryRehearsalIntegrityCheckResponseItem>,
+    pub deterministic_signature: RecoveryDeterministicSignatureResponse,
+    pub recommended_next_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_reference: Option<String>,
+    pub timestamp_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryRehearsalQueryResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub rehearsals: Vec<RecoveryRehearsalRunItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryRehearsalRunItem {
+    pub run_id: String,
+    pub rehearsal_status: String,
+    pub reason_code: String,
+    pub artifact_id: String,
+    pub correlation_id: String,
+    pub completed_at_utc: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failing_checks: Vec<String>,
+    pub recommended_next_action: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryRehearsalIntegrityCheckResponseItem {
+    pub check_name: String,
+    pub passed: bool,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_value: Option<String>,
+    pub details: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveryDeterministicSignatureResponse {
+    pub deterministic_signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deterministic_match: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mismatch_summary: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RecoveryServiceErrorResponse {
     pub error_code: &'static str,
     pub reason_code: String,
@@ -6348,6 +6846,10 @@ mod tests {
         RecoveryGateName, RecoveryGateOutcome, RecoveryGateRunEvidence, RecoveryOperatorSignoff,
         RecoveryReadinessStatus, RecoveryReasonCode, RecoveryResumeVerificationEnvelope,
     };
+    use domain::recovery_rehearsal::{
+        BackupIntegrityCheckItem, DeterministicReplaySignatureEvidence,
+        RestoreRehearsalRunEvidence, RestoreRehearsalStatus,
+    };
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
         EmergencyControlTriggerSource,
@@ -6367,9 +6869,10 @@ mod tests {
             MarketPolicyServiceError, ToggleMarketClusterInput, UpsertMarketPolicyProfileInput,
         },
         recovery::{
-            EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput, QueryRecoveryGateRunInput,
-            RecoveryOrchestrator, RecoveryResumeExecutionEvidence, RecoveryService,
-            RecoveryServiceError,
+            EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput,
+            ExecuteRestoreRehearsalInput, QueryRecoveryGateRunInput,
+            QueryRestoreRehearsalByRunIdInput, QueryRestoreRehearsalsInput, RecoveryOrchestrator,
+            RecoveryResumeExecutionEvidence, RecoveryService, RecoveryServiceError,
         },
         risk_limits::{
             PendingRiskLimitProfilesInput, RiskLimitOrchestrator, RiskLimitProfileMutationEvidence,
@@ -6949,6 +7452,8 @@ mod tests {
         evaluate_error: Option<(&'static str, &'static str)>,
         resume_error: Option<(&'static str, &'static str)>,
         query_error: Option<(&'static str, &'static str)>,
+        rehearsal_execute_error: Option<(&'static str, &'static str)>,
+        rehearsal_query_error: Option<(&'static str, &'static str)>,
     }
 
     impl RecoveryOrchestrator for StubRecoveryOrchestrator {
@@ -6999,6 +7504,78 @@ mod tests {
                 },
                 run,
             })
+        }
+
+        fn execute_restore_rehearsal(
+            &self,
+            input: ExecuteRestoreRehearsalInput,
+        ) -> Result<RestoreRehearsalRunEvidence, RecoveryServiceError> {
+            if let Some((code, message)) = self.rehearsal_execute_error {
+                return Err(RecoveryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(sample_restore_rehearsal_run(
+                format!("rehearsal::{}", input.correlation_id),
+                input.correlation_id,
+                input.artifact_id,
+                RestoreRehearsalStatus::Passed,
+            ))
+        }
+
+        fn query_restore_rehearsal_by_run_id(
+            &self,
+            input: QueryRestoreRehearsalByRunIdInput,
+        ) -> Result<RestoreRehearsalRunEvidence, RecoveryServiceError> {
+            if let Some((code, message)) = self.rehearsal_query_error {
+                return Err(RecoveryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(sample_restore_rehearsal_run(
+                input.run_id,
+                input.correlation_id,
+                "artifact::query".to_string(),
+                RestoreRehearsalStatus::Passed,
+            ))
+        }
+
+        fn query_restore_rehearsals(
+            &self,
+            input: QueryRestoreRehearsalsInput,
+        ) -> Result<Vec<RestoreRehearsalRunEvidence>, RecoveryServiceError> {
+            if let Some((code, message)) = self.rehearsal_query_error {
+                return Err(RecoveryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            let selector_artifact = input
+                .artifact_id
+                .unwrap_or_else(|| "artifact::query".to_string());
+            let selector_correlation = input
+                .query_correlation_id
+                .unwrap_or_else(|| input.correlation_id.clone());
+            let limit = input.limit.unwrap_or(2).clamp(1, 3) as usize;
+            Ok((0..limit)
+                .map(|index| {
+                    sample_restore_rehearsal_run(
+                        format!("rehearsal::{}::{index}", selector_correlation),
+                        selector_correlation.clone(),
+                        selector_artifact.clone(),
+                        if index == 0 {
+                            RestoreRehearsalStatus::Passed
+                        } else {
+                            RestoreRehearsalStatus::Failed
+                        },
+                    )
+                })
+                .collect())
         }
 
         fn query_recovery_gate_run(
@@ -7144,6 +7721,104 @@ mod tests {
                     RecoveryReasonCode::ChecksumMismatch.code().to_string(),
                 ]
             },
+            audit_reference: Some("arb-2026-0007".to_string()),
+        }
+    }
+
+    fn sample_restore_rehearsal_run(
+        run_id: String,
+        correlation_id: String,
+        artifact_id: String,
+        status: RestoreRehearsalStatus,
+    ) -> RestoreRehearsalRunEvidence {
+        let passed = status == RestoreRehearsalStatus::Passed;
+        RestoreRehearsalRunEvidence {
+            run_id,
+            correlation_id,
+            artifact_id,
+            artifact_checksum: "a".repeat(64),
+            observed_checksum: if passed {
+                "a".repeat(64)
+            } else {
+                "b".repeat(64)
+            },
+            restore_target: "sandbox-restore-target".to_string(),
+            reconciliation_run_id: "recon-1".to_string(),
+            reconciliation_mismatch_rate: Some(if passed { 0.0002 } else { 0.01 }),
+            reconciliation_passed: passed,
+            status,
+            reason_code: if passed {
+                RecoveryReasonCode::RehearsalSuccess.code().to_string()
+            } else {
+                RecoveryReasonCode::RehearsalChecksumMismatch
+                    .code()
+                    .to_string()
+            },
+            requested_at_utc: "2026-04-06T12:00:00Z".to_string(),
+            started_at_utc: "2026-04-06T12:00:01Z".to_string(),
+            completed_at_utc: "2026-04-06T12:00:02Z".to_string(),
+            integrity_checks: vec![
+                BackupIntegrityCheckItem {
+                    check_name: "checksum_match".to_string(),
+                    passed,
+                    reason_code: if passed {
+                        RecoveryReasonCode::RehearsalSuccess.code().to_string()
+                    } else {
+                        RecoveryReasonCode::RehearsalChecksumMismatch
+                            .code()
+                            .to_string()
+                    },
+                    expected_value: Some("a".repeat(64)),
+                    observed_value: Some(if passed {
+                        "a".repeat(64)
+                    } else {
+                        "b".repeat(64)
+                    }),
+                    details: if passed {
+                        "checksum verification passed".to_string()
+                    } else {
+                        "checksum mismatch detected".to_string()
+                    },
+                },
+                BackupIntegrityCheckItem {
+                    check_name: "reconciliation_sanity".to_string(),
+                    passed,
+                    reason_code: if passed {
+                        RecoveryReasonCode::RehearsalSuccess.code().to_string()
+                    } else {
+                        RecoveryReasonCode::RehearsalReconciliationSanityFailure
+                            .code()
+                            .to_string()
+                    },
+                    expected_value: Some("mismatch_rate < 0.001".to_string()),
+                    observed_value: Some(if passed {
+                        "0.000200".to_string()
+                    } else {
+                        "0.010000".to_string()
+                    }),
+                    details: if passed {
+                        "reconciliation sanity passed".to_string()
+                    } else {
+                        "reconciliation mismatch exceeded threshold".to_string()
+                    },
+                },
+            ],
+            deterministic_signature: DeterministicReplaySignatureEvidence {
+                deterministic_signature: if passed {
+                    "sig::deterministic::ok".to_string()
+                } else {
+                    "sig::deterministic::mismatch".to_string()
+                },
+                prior_deterministic_signature: Some("sig::deterministic::ok".to_string()),
+                deterministic_match: Some(passed),
+                mismatch_summary: if passed {
+                    None
+                } else {
+                    Some("field mismatch in canonical restore output".to_string())
+                },
+            },
+            incident_correlation_id: Some("incident-corr-1".to_string()),
+            incident_severity: Some("severity_1".to_string()),
             audit_reference: Some("arb-2026-0007".to_string()),
         }
     }
@@ -7425,6 +8100,210 @@ mod tests {
         assert!(
             p95_latency_ms <= 5_000,
             "recovery query p95 latency should remain <= 5000ms, got {p95_latency_ms}",
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rehearsal_execute_endpoint_returns_integrity_evidence() {
+        let response = test_app_with_recovery_orchestrator(Arc::new(
+            StubRecoveryOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/recovery/rehearsals")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-rehearsal-execute-001")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "artifact_id": "artifact-001",
+                        "artifact_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "restore_target": "sandbox-restore-target",
+                        "reconciliation_run_id": "recon-1",
+                        "restore_output": {
+                            "positions": 100,
+                            "matched_records": 100
+                        },
+                        "incident_severity": "severity_1",
+                        "audit_reference": "arb-2026-0008"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["rehearsal_status"], "passed");
+        assert_eq!(payload["reason_code"], "recovery_rehearsal_success");
+        assert!(
+            payload["integrity_checks"]
+                .as_array()
+                .is_some_and(|checks| checks.len() >= 2)
+        );
+        assert!(
+            payload["deterministic_signature"]["deterministic_signature"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rehearsal_execute_endpoint_maps_json_rejection_to_machine_error() {
+        let response = test_app_with_recovery_orchestrator(Arc::new(
+            StubRecoveryOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/recovery/rehearsals")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-rehearsal-json-rejection-001")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"artifact_id\":"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            RecoveryReasonCode::InvalidPayload.code()
+        );
+        assert_eq!(payload["action"], "recovery_rehearsal_execute");
+        assert_eq!(payload["endpoint"], "/control/recovery/rehearsals");
+    }
+
+    #[tokio::test]
+    async fn recovery_rehearsal_query_by_run_endpoint_returns_rehearsal_details() {
+        let response =
+            test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator::default()))
+                .oneshot(
+                    Request::builder()
+                        .uri("/control/recovery/rehearsals/rehearsal::corr-001::0")
+                        .method("GET")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", "corr-rehearsal-query-run-001")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["action"], "recovery_rehearsal_query");
+        assert_eq!(payload["rehearsal_status"], "passed");
+        assert_eq!(payload["artifact_id"], "artifact::query");
+    }
+
+    #[tokio::test]
+    async fn recovery_rehearsal_query_endpoint_supports_selector_and_limit() {
+        let response =
+            test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator::default()))
+                .oneshot(
+                    Request::builder()
+                        .uri("/control/recovery/rehearsals?artifact_id=artifact-001&limit=2")
+                        .method("GET")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", "corr-rehearsal-query-selector-001")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["action"], "recovery_rehearsal_query");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["rehearsals"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn recovery_rehearsal_query_endpoint_measures_p95_latency_within_target_for_repeated_queries(
+    ) {
+        let app =
+            test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator::default()));
+        let mut latencies = Vec::with_capacity(40);
+
+        for index in 0..40 {
+            let correlation = format!("corr-rehearsal-query-p95-{index:03}");
+            let uri = format!("/control/recovery/rehearsals?correlation_id={correlation}&limit=1");
+            let started = std::time::Instant::now();
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri.as_str())
+                        .method("GET")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", correlation)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body should be readable"),
+            )
+            .expect("payload should be valid json");
+            assert_eq!(payload["status"], "accepted");
+
+            latencies.push(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+        }
+
+        latencies.sort_unstable();
+        let p95_index = (latencies.len() * 95).div_ceil(100) - 1;
+        let p95_latency_ms = latencies[p95_index];
+        assert!(
+            p95_latency_ms <= 5_000,
+            "restore rehearsal query p95 latency should remain <= 5000ms, got {p95_latency_ms}",
         );
     }
 

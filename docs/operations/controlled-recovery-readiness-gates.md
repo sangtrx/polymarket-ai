@@ -41,7 +41,11 @@ Every run persists full gate evidence (`run_id`, `correlation_id`, per-gate outc
 ```json
 {
   "run_id": "recovery::gate::default::corr-123::20260406120000",
-  "resumed_at_utc": "2026-04-06T12:00:05Z"
+  "resumed_at_utc": "2026-04-06T12:00:05Z",
+  "incident_correlation_id": "incident-corr-001",
+  "artifact_id": "backup-artifact-2026-04-06",
+  "incident_severity": "severity_1",
+  "rehearsal_run_id": "recovery::rehearsal::backup-artifact-2026-04-06::corr-123::20260406115955"
 }
 ```
 
@@ -70,7 +74,9 @@ Successful resume responses include:
    remediation: query by `correlation_id` to locate latest readiness run and retry with canonical `run_id`.
 4. **Stale/blocked evidence** (`recovery_stale_evidence`, HTTP 409)  
    remediation: resolve failing gates and rerun readiness evaluation before resume.
-5. **Dependency/persistence unavailable** (`recovery_dependency_unavailable` / `recovery_persistence_unavailable`, HTTP 503)  
+5. **Missing/failed rehearsal evidence for severe incident** (`recovery_rehearsal_missing_or_failed`, HTTP 409)  
+   remediation: execute restore rehearsal and confirm successful integrity + deterministic replay evidence before retrying resume.
+6. **Dependency/persistence unavailable** (`recovery_dependency_unavailable` / `recovery_persistence_unavailable`, HTTP 503)  
    remediation: restore freshness/reconciliation/risk-limit dependencies and rerun readiness.
 
 ## Operator workflow
@@ -86,3 +92,4 @@ Successful resume responses include:
 1. Emergency containment controls: `docs/operations/emergency-safe-state-controls.md`
 2. Incident forensics timeline: `docs/operations/incident-search-causal-timeline-forensics.md`
 3. Severity alert delivery and fallback policy: `docs/operations/severity-alert-delivery.md`
+4. Backup integrity and deterministic restore rehearsal: `docs/operations/backup-integrity-restore-rehearsal.md`
