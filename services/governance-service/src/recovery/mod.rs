@@ -580,8 +580,9 @@ impl RecoveryOrchestrator for RecoveryService {
                         vec![RecoveryValidationIssue {
                             field: "incident_correlation_id",
                             code: RecoveryReasonCode::InvalidPayload.code(),
-                            message: "incident_correlation_id must match selected rehearsal evidence"
-                                .to_string(),
+                            message:
+                                "incident_correlation_id must match selected rehearsal evidence"
+                                    .to_string(),
                         }],
                     ));
                 }

@@ -19,6 +19,7 @@ use governance_service::market_policy::{MarketPolicyOrchestrator, MarketPolicySe
 use governance_service::recovery::{RecoveryOrchestrator, RecoveryService};
 use governance_service::risk_limits::{RiskLimitOrchestrator, RiskLimitService};
 use governance_service::safety_controls::{SafetyControlOrchestrator, SafetyControlService};
+use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportSchedulingService};
 use serde::Serialize;
 use serde_json::json;
 use sqlx::PgPool;
@@ -220,6 +221,7 @@ pub struct ControlApiState {
     pub market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
     pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
+    pub report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
@@ -288,6 +290,35 @@ impl ControlApiState {
         safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
         recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     ) -> Self {
+        Self::with_all_orchestrators_and_reporting(
+            authorization_guard,
+            authenticator,
+            audit_appender,
+            approval_orchestrator,
+            credential_rotation_orchestrator,
+            allocation_policy_orchestrator,
+            market_policy_orchestrator,
+            risk_limit_orchestrator,
+            safety_control_orchestrator,
+            Arc::new(ReportSchedulingService::default()),
+            recovery_orchestrator,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_all_orchestrators_and_reporting(
+        authorization_guard: Arc<dyn AuthorizationGuard>,
+        authenticator: Arc<dyn Authenticator>,
+        audit_appender: Arc<dyn PrivilegedAuditAppender>,
+        approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
+        credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
+        allocation_policy_orchestrator: Arc<dyn AllocationPolicyOrchestrator>,
+        market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
+        risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
+        safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
+        report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
+        recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
+    ) -> Self {
         Self {
             authorization_guard,
             authenticator,
@@ -298,9 +329,19 @@ impl ControlApiState {
             market_policy_orchestrator,
             risk_limit_orchestrator,
             safety_control_orchestrator,
+            report_schedule_orchestrator,
             recovery_orchestrator,
             attribution_pool: None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_report_schedule_orchestrator(
+        mut self,
+        report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
+    ) -> Self {
+        self.report_schedule_orchestrator = report_schedule_orchestrator;
+        self
     }
 
     pub fn with_attribution_pool(mut self, attribution_pool: PgPool) -> Self {

@@ -14,6 +14,7 @@ use governance_service::recovery::RecoveryService;
 use governance_service::risk_limits::RiskLimitService;
 use governance_service::safety_controls::SafetyControlService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
+use reporting_service::exports::scheduling::ReportSchedulingService;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ async fn main() {
         .await
         .expect("failed to connect to Postgres for approval persistence");
 
-    let state = ControlApiState::with_all_orchestrators(
+    let state = ControlApiState::with_all_orchestrators_and_reporting(
         Arc::new(GovernanceAuthorizationGuard::new(
             AuthorizationEvaluator::default(),
         )),
@@ -41,6 +42,7 @@ async fn main() {
         Arc::new(MarketPolicyService::postgres(pool.clone())),
         Arc::new(RiskLimitService::postgres(pool.clone())),
         Arc::new(SafetyControlService::postgres(pool.clone())),
+        Arc::new(ReportSchedulingService::postgres(pool.clone())),
         Arc::new(RecoveryService::postgres(pool.clone())),
     )
     .with_attribution_pool(pool);

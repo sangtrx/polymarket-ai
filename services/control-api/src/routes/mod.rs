@@ -37,6 +37,10 @@ use domain::recovery::RecoveryReasonCode;
 use domain::recovery_rehearsal::{
     BackupIntegrityCheckItem, RestoreRehearsalRunEvidence, RestoreRehearsalStatus,
 };
+use domain::reporting_schedule::{
+    ReportRunRecord, ReportingScheduleReasonCode, ReportingScheduleValidationIssue,
+    parse_utc_timestamp,
+};
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
     MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue,
@@ -71,6 +75,10 @@ use persistence::postgres::incident_alerts::{
     load_recent_incident_alerts, update_incident_alert_status,
 };
 use persistence::postgres::incident_query_views::load_incident_forensics_timeline;
+use reporting_service::exports::scheduling::{
+    PauseReportScheduleInput, QueryReportRunHistoryInput, ReportScheduleMutationEvidence,
+    ResumeReportScheduleInput, UpsertReportScheduleInput,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Instant;
@@ -218,6 +226,27 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let report_schedule_routes = Router::new()
+        .route(
+            "/control/report-schedules/{schedule_id}",
+            post(upsert_report_schedule),
+        )
+        .route(
+            "/control/report-schedules/{schedule_id}/pause",
+            post(pause_report_schedule),
+        )
+        .route(
+            "/control/report-schedules/{schedule_id}/resume",
+            post(resume_report_schedule),
+        )
+        .route(
+            "/control/report-schedules/{schedule_id}/runs",
+            get(query_report_schedule_runs),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -231,6 +260,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(incident_forensics_routes)
         .merge(emergency_control_routes)
         .merge(recovery_routes)
+        .merge(report_schedule_routes)
         .with_state(state)
 }
 
@@ -2642,6 +2672,639 @@ pub async fn query_recovery_gate_run(
         "GET",
         StatusCode::OK,
     )
+}
+
+pub async fn upsert_report_schedule(
+    State(state): State<ControlApiState>,
+    Path(schedule_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    maybe_payload: Option<axum::Json<ReportScheduleMutationPayload>>,
+) -> Response {
+    let endpoint = format!("/control/report-schedules/{schedule_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let Some(axum::Json(payload)) = maybe_payload else {
+        return report_schedule_service_error_response(
+            ReportingScheduleReasonCode::InvalidPayload.code(),
+            "request body is required".to_string(),
+            vec![ReportingScheduleValidationIssue {
+                field: "body",
+                code: ReportingScheduleReasonCode::InvalidPayload.code(),
+                message: "request body is required".to_string(),
+            }],
+            "report_schedule_upsert",
+            &actor,
+            authorization.timestamp_utc,
+            endpoint,
+        );
+    };
+
+    let cadence = payload
+        .cadence
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default();
+    if cadence.is_empty() {
+        return report_schedule_service_error_response(
+            ReportingScheduleReasonCode::InvalidPayload.code(),
+            "cadence is required".to_string(),
+            vec![ReportingScheduleValidationIssue {
+                field: "cadence",
+                code: ReportingScheduleReasonCode::InvalidPayload.code(),
+                message: "cadence is required".to_string(),
+            }],
+            "report_schedule_upsert",
+            &actor,
+            authorization.timestamp_utc,
+            endpoint,
+        );
+    }
+    if let Some(scheduled_at_utc) = payload
+        .scheduled_at_utc
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Err(error) = parse_utc_timestamp("scheduled_at_utc", scheduled_at_utc) {
+            return report_schedule_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "report_schedule_upsert",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    }
+
+    let evidence =
+        match state
+            .report_schedule_orchestrator
+            .upsert_schedule(UpsertReportScheduleInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                schedule_id,
+                cadence,
+                reason_code: payload.reason_code,
+                correlation_id: payload
+                    .correlation_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| actor.correlation_id.clone()),
+                timestamp_utc: authorization.timestamp_utc.clone(),
+                runbook_url: payload.runbook_url,
+            }) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return report_schedule_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "report_schedule_upsert",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    report_schedule_mutation_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "report_schedule_upsert",
+        "POST",
+        StatusCode::ACCEPTED,
+    )
+}
+
+pub async fn pause_report_schedule(
+    State(state): State<ControlApiState>,
+    Path(schedule_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    maybe_payload: Option<axum::Json<ReportScheduleActionPayload>>,
+) -> Response {
+    let endpoint = format!("/control/report-schedules/{schedule_id}/pause");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = maybe_payload
+        .map(|axum::Json(payload)| payload)
+        .unwrap_or_default();
+    if let Some(observed_at_utc) = payload
+        .observed_at_utc
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Err(error) = parse_utc_timestamp("observed_at_utc", observed_at_utc) {
+            return report_schedule_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "report_schedule_pause",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    }
+
+    let evidence =
+        match state
+            .report_schedule_orchestrator
+            .pause_schedule(PauseReportScheduleInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                schedule_id,
+                reason_code: payload.reason_code,
+                correlation_id: payload
+                    .correlation_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| actor.correlation_id.clone()),
+                timestamp_utc: authorization.timestamp_utc.clone(),
+            }) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return report_schedule_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "report_schedule_pause",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    report_schedule_mutation_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "report_schedule_pause",
+        "POST",
+        StatusCode::ACCEPTED,
+    )
+}
+
+pub async fn resume_report_schedule(
+    State(state): State<ControlApiState>,
+    Path(schedule_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    maybe_payload: Option<axum::Json<ReportScheduleActionPayload>>,
+) -> Response {
+    let endpoint = format!("/control/report-schedules/{schedule_id}/resume");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = maybe_payload
+        .map(|axum::Json(payload)| payload)
+        .unwrap_or_default();
+    if let Some(observed_at_utc) = payload
+        .observed_at_utc
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Err(error) = parse_utc_timestamp("observed_at_utc", observed_at_utc) {
+            return report_schedule_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "report_schedule_resume",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    }
+
+    let evidence =
+        match state
+            .report_schedule_orchestrator
+            .resume_schedule(ResumeReportScheduleInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                schedule_id,
+                reason_code: payload.reason_code,
+                correlation_id: payload
+                    .correlation_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| actor.correlation_id.clone()),
+                timestamp_utc: authorization.timestamp_utc.clone(),
+            }) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return report_schedule_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "report_schedule_resume",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    report_schedule_mutation_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "report_schedule_resume",
+        "POST",
+        StatusCode::ACCEPTED,
+    )
+}
+
+pub async fn query_report_schedule_runs(
+    State(state): State<ControlApiState>,
+    Path(schedule_id): Path<String>,
+    Query(query): Query<ReportScheduleRunsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/report-schedules/{schedule_id}/runs");
+    let authorization = match authorize_report_schedule_read(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let queried_schedule_id = schedule_id.clone();
+
+    let runs =
+        match state
+            .report_schedule_orchestrator
+            .query_run_history(QueryReportRunHistoryInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                schedule_id: queried_schedule_id.clone(),
+                correlation_id: query
+                    .correlation_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| actor.correlation_id.clone()),
+                queried_at_utc: authorization.timestamp_utc.clone(),
+                limit: query.limit,
+            }) {
+            Ok(runs) => runs,
+            Err(error) => {
+                return report_schedule_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "report_schedule_run_history_query",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    report_schedule_run_history_response(
+        &state,
+        &actor,
+        queried_schedule_id,
+        runs,
+        endpoint,
+        authorization.timestamp_utc,
+    )
+}
+
+fn report_schedule_mutation_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: ReportScheduleMutationEvidence,
+    endpoint: String,
+    action: &'static str,
+    http_method: &'static str,
+    status: StatusCode,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "schedule_id": evidence.schedule_id.clone(),
+            "cadence": evidence.cadence.clone(),
+            "status": evidence.status.clone(),
+            "next_run_at_utc": evidence.next_run_at_utc.clone(),
+        }),
+        approval_reference: None,
+        timestamp: evidence.timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: evidence.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: evidence.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            evidence.correlation_id.clone(),
+            evidence.timestamp_utc.clone(),
+        );
+    }
+
+    emit_report_schedule_route_telemetry(ReportScheduleRouteTelemetryEvent {
+        event_name: "control_api_report_schedule_transition_v1",
+        signal_name: "report_schedule_transition_applied_v1",
+        alert_compatible: false,
+        alert_target_seconds: 30,
+        action,
+        actor_id: &actor.actor_id,
+        role: &actor.role,
+        correlation_id: &evidence.correlation_id,
+        schedule_id: &evidence.schedule_id,
+        cadence: &evidence.cadence,
+        status: &evidence.status,
+        reason_code: &evidence.reason_code,
+        timestamp_utc: &evidence.timestamp_utc,
+    });
+
+    (
+        status,
+        axum::Json(ReportScheduleMutationResponse {
+            status: "accepted",
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: evidence.correlation_id.clone(),
+            timestamp_utc: evidence.timestamp_utc.clone(),
+            schedule: ReportScheduleMutationItem {
+                schedule_id: evidence.schedule_id,
+                cadence: evidence.cadence,
+                status: evidence.status,
+                next_run_at_utc: evidence.next_run_at_utc,
+                reason_code: evidence.reason_code,
+                runbook_url: evidence.runbook_url,
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn report_schedule_run_history_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    schedule_id: String,
+    runs: Vec<ReportRunRecord>,
+    endpoint: String,
+    timestamp_utc: String,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "report_schedule_run_history_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "run_count": runs.len(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: ReportingScheduleReasonCode::Ready.code().to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "report_schedule_run_history_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let cadence = runs
+        .first()
+        .map(|first| {
+            let first_cadence = first.cadence.as_str();
+            if runs.iter().all(|run| run.cadence == first.cadence) {
+                first_cadence
+            } else {
+                "mixed"
+            }
+        })
+        .unwrap_or("none");
+
+    emit_report_schedule_route_telemetry(ReportScheduleRouteTelemetryEvent {
+        event_name: "control_api_report_schedule_transition_v1",
+        signal_name: "report_schedule_run_history_query_v1",
+        alert_compatible: false,
+        alert_target_seconds: 30,
+        action: "report_schedule_run_history_query",
+        actor_id: &actor.actor_id,
+        role: &actor.role,
+        correlation_id: &actor.correlation_id,
+        schedule_id: &schedule_id,
+        cadence,
+        status: "query",
+        reason_code: ReportingScheduleReasonCode::Ready.code(),
+        timestamp_utc: &timestamp_utc,
+    });
+
+    (
+        StatusCode::OK,
+        axum::Json(ReportScheduleRunHistoryResponse {
+            status: "ok",
+            action: "report_schedule_run_history_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            runs: runs
+                .into_iter()
+                .map(|run| ReportScheduleRunItem {
+                    run_id: run.run_id,
+                    schedule_id: run.schedule_id,
+                    cadence: run.cadence.as_str().to_string(),
+                    window_key: run.window_key,
+                    window_started_at_utc: run.window_started_at_utc,
+                    window_ended_at_utc: run.window_ended_at_utc,
+                    status: run.status.as_str().to_string(),
+                    reason_code: run.reason_code,
+                    correlation_id: run.correlation_id,
+                    run_started_at_utc: run.run_started_at_utc,
+                    actor_id: run.actor_id,
+                    source_context: run.source_context,
+                    run_finished_at_utc: run.run_finished_at_utc,
+                    alert_emitted_at_utc: run.alert_emitted_at_utc,
+                    runbook_url: run.runbook_url,
+                    impacted_system: run.impacted_system,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn authorize_report_schedule_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(report_schedule_service_error_response(
+        ReportingScheduleReasonCode::Unauthorized.code(),
+        machine_error.message,
+        Vec::new(),
+        "report_schedule_run_history_query",
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
+}
+
+fn report_schedule_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<ReportingScheduleValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let security_signal = if error_code == ReportingScheduleReasonCode::Unauthorized.code() {
+        Some(ReportScheduleSecuritySignal {
+            name: "unauthorized_report_schedule_mutation_attempt_v1",
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    emit_report_schedule_route_telemetry(ReportScheduleRouteTelemetryEvent {
+        event_name: "control_api_report_schedule_transition_v1",
+        signal_name: "report_schedule_transition_rejected_v1",
+        alert_compatible: security_signal.is_some(),
+        alert_target_seconds: 30,
+        action,
+        actor_id: &actor.actor_id,
+        role: &actor.role,
+        correlation_id: &actor.correlation_id,
+        schedule_id: "unknown",
+        cadence: "unknown",
+        status: "rejected",
+        reason_code: error_code,
+        timestamp_utc: &timestamp_utc,
+    });
+
+    (
+        report_schedule_service_error_status(error_code),
+        axum::Json(ReportScheduleServiceErrorResponse {
+            error_code,
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| ReportScheduleFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+            security_signal,
+        }),
+    )
+        .into_response()
+}
+
+fn report_schedule_service_error_status(code: &str) -> StatusCode {
+    match code {
+        value if value == ReportingScheduleReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
+        value if value == ReportingScheduleReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
+        value if value == ReportingScheduleReasonCode::NotFound.code() => StatusCode::NOT_FOUND,
+        value if value == ReportingScheduleReasonCode::StaleEvidence.code() => StatusCode::CONFLICT,
+        "report_schedule_constraint_violation" => StatusCode::CONFLICT,
+        value
+            if value == ReportingScheduleReasonCode::DependencyUnavailable.code()
+                || value == ReportingScheduleReasonCode::PersistenceUnavailable.code()
+                || value == ReportingScheduleReasonCode::AlertUnavailable.code()
+                || value == "report_schedule_query_failed"
+                || value == "report_schedule_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn emit_report_schedule_route_telemetry(event: ReportScheduleRouteTelemetryEvent<'_>) {
+    println!(
+        "{}",
+        serde_json::to_string(&event)
+            .expect("report schedule route telemetry event should always serialize")
+    );
 }
 
 fn trigger_manual_emergency_control(
@@ -6826,6 +7489,133 @@ pub struct RecoveryGateOutcomeItem {
     pub verification: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReportScheduleMutationPayload {
+    pub cadence: Option<String>,
+    pub reason_code: Option<String>,
+    pub correlation_id: Option<String>,
+    pub scheduled_at_utc: Option<String>,
+    pub runbook_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReportScheduleActionPayload {
+    pub reason_code: Option<String>,
+    pub correlation_id: Option<String>,
+    pub observed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReportScheduleRunsQuery {
+    pub correlation_id: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportScheduleMutationResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub schedule: ReportScheduleMutationItem,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportScheduleMutationItem {
+    pub schedule_id: String,
+    pub cadence: String,
+    pub status: String,
+    pub next_run_at_utc: String,
+    pub reason_code: String,
+    pub runbook_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportScheduleRunHistoryResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub runs: Vec<ReportScheduleRunItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportScheduleRunItem {
+    pub run_id: String,
+    pub schedule_id: String,
+    pub cadence: String,
+    pub window_key: String,
+    pub window_started_at_utc: String,
+    pub window_ended_at_utc: String,
+    pub status: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub run_started_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    pub source_context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_finished_at_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_emitted_at_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runbook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impacted_system: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportScheduleServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<ReportScheduleFieldError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<ReportScheduleSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportScheduleFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportScheduleSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportScheduleRouteTelemetryEvent<'a> {
+    event_name: &'a str,
+    signal_name: &'a str,
+    alert_compatible: bool,
+    alert_target_seconds: u32,
+    action: &'a str,
+    actor_id: &'a str,
+    role: &'a str,
+    correlation_id: &'a str,
+    schedule_id: &'a str,
+    cadence: &'a str,
+    status: &'a str,
+    reason_code: &'a str,
+    timestamp_utc: &'a str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6850,6 +7640,7 @@ mod tests {
         BackupIntegrityCheckItem, DeterministicReplaySignatureEvidence,
         RestoreRehearsalRunEvidence, RestoreRehearsalStatus,
     };
+    use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
         EmergencyControlTriggerSource,
@@ -6883,6 +7674,11 @@ mod tests {
             HandleAutomaticSafetyTriggerInput, SafetyControlOrchestrator, SafetyControlService,
             SafetyControlServiceError,
         },
+    };
+    use reporting_service::exports::scheduling::{
+        PauseReportScheduleInput, QueryReportRunHistoryInput, ReportScheduleMutationEvidence,
+        ReportScheduleOrchestrator, ReportSchedulingServiceError, ResumeReportScheduleInput,
+        UpsertReportScheduleInput,
     };
     use std::sync::{Arc, Mutex};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -6963,6 +7759,166 @@ mod tests {
 
     fn test_app_with_state(state: ControlApiState) -> Router {
         app_router(state)
+    }
+
+    #[derive(Debug, Default)]
+    struct StubReportScheduleOrchestrator {
+        upsert_error: Option<(&'static str, &'static str)>,
+        pause_error: Option<(&'static str, &'static str)>,
+        resume_error: Option<(&'static str, &'static str)>,
+        query_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl ReportScheduleOrchestrator for StubReportScheduleOrchestrator {
+        fn warmup_status(&self) -> &'static str {
+            "report-schedule-stub-ready"
+        }
+
+        fn upsert_schedule(
+            &self,
+            input: UpsertReportScheduleInput,
+        ) -> Result<ReportScheduleMutationEvidence, ReportSchedulingServiceError> {
+            if let Some((code, message)) = self.upsert_error {
+                return Err(ReportSchedulingServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(ReportScheduleMutationEvidence {
+                schedule_id: input.schedule_id.trim().to_lowercase(),
+                cadence: input.cadence.trim().to_lowercase(),
+                status: "active".to_string(),
+                next_run_at_utc: "2026-04-08T00:00:00Z".to_string(),
+                actor_id: input.actor_id,
+                actor_role: input.actor_role,
+                reason_code: input
+                    .reason_code
+                    .unwrap_or_else(|| ReportingScheduleReasonCode::Ready.code().to_string()),
+                correlation_id: input.correlation_id,
+                runbook_url: input.runbook_url.unwrap_or_else(|| {
+                    "https://docs.example.com/operations/recurring-report-scheduling".to_string()
+                }),
+                timestamp_utc: input.timestamp_utc,
+            })
+        }
+
+        fn pause_schedule(
+            &self,
+            input: PauseReportScheduleInput,
+        ) -> Result<ReportScheduleMutationEvidence, ReportSchedulingServiceError> {
+            if let Some((code, message)) = self.pause_error {
+                return Err(ReportSchedulingServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(ReportScheduleMutationEvidence {
+                schedule_id: input.schedule_id.trim().to_lowercase(),
+                cadence: "daily".to_string(),
+                status: "paused".to_string(),
+                next_run_at_utc: "2026-04-08T00:00:00Z".to_string(),
+                actor_id: input.actor_id,
+                actor_role: input.actor_role,
+                reason_code: input.reason_code.unwrap_or_else(|| {
+                    ReportingScheduleReasonCode::SchedulePaused
+                        .code()
+                        .to_string()
+                }),
+                correlation_id: input.correlation_id,
+                runbook_url: "https://docs.example.com/operations/recurring-report-scheduling"
+                    .to_string(),
+                timestamp_utc: input.timestamp_utc,
+            })
+        }
+
+        fn resume_schedule(
+            &self,
+            input: ResumeReportScheduleInput,
+        ) -> Result<ReportScheduleMutationEvidence, ReportSchedulingServiceError> {
+            if let Some((code, message)) = self.resume_error {
+                return Err(ReportSchedulingServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(ReportScheduleMutationEvidence {
+                schedule_id: input.schedule_id.trim().to_lowercase(),
+                cadence: "daily".to_string(),
+                status: "active".to_string(),
+                next_run_at_utc: "2026-04-09T00:00:00Z".to_string(),
+                actor_id: input.actor_id,
+                actor_role: input.actor_role,
+                reason_code: input.reason_code.unwrap_or_else(|| {
+                    ReportingScheduleReasonCode::ScheduleResumed
+                        .code()
+                        .to_string()
+                }),
+                correlation_id: input.correlation_id,
+                runbook_url: "https://docs.example.com/operations/recurring-report-scheduling"
+                    .to_string(),
+                timestamp_utc: input.timestamp_utc,
+            })
+        }
+
+        fn query_run_history(
+            &self,
+            input: QueryReportRunHistoryInput,
+        ) -> Result<Vec<ReportRunRecord>, ReportSchedulingServiceError> {
+            if let Some((code, message)) = self.query_error {
+                return Err(ReportSchedulingServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(vec![ReportRunRecord {
+                run_id: "report-run::daily::2026-04-07t00-00-00z-2026-04-08t00-00-00z".to_string(),
+                schedule_id: input.schedule_id.trim().to_lowercase(),
+                cadence: ReportingCadence::Daily,
+                window_key: "2026-04-07t00-00-00z-2026-04-08t00-00-00z".to_string(),
+                window_started_at_utc: "2026-04-07T00:00:00Z".to_string(),
+                window_ended_at_utc: "2026-04-08T00:00:00Z".to_string(),
+                status: ReportingRunState::Succeeded,
+                reason_code: ReportingScheduleReasonCode::RunSucceeded.code().to_string(),
+                correlation_id: input.correlation_id,
+                source_context: "reporting-service.scheduler".to_string(),
+                actor_id: Some(input.actor_id),
+                run_started_at_utc: "2026-04-08T00:00:00Z".to_string(),
+                run_finished_at_utc: Some("2026-04-08T00:00:02Z".to_string()),
+                alert_emitted_at_utc: None,
+                runbook_url: Some(
+                    "https://docs.example.com/operations/recurring-report-scheduling".to_string(),
+                ),
+                impacted_system: Some("reporting-service scheduler".to_string()),
+                created_at_utc: input.queried_at_utc.clone(),
+                updated_at_utc: input.queried_at_utc,
+            }])
+        }
+
+        fn process_due_schedules(
+            &self,
+            _as_of_utc: &str,
+        ) -> Result<Vec<ReportRunRecord>, ReportSchedulingServiceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn test_app_with_report_schedule_orchestrator(
+        report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::new(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+            )
+            .with_report_schedule_orchestrator(report_schedule_orchestrator),
+        )
     }
 
     #[derive(Debug, Default)]
@@ -7919,6 +8875,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_schedule_upsert_endpoint_returns_schedule_evidence() {
+        let response = test_app_with_report_schedule_orchestrator(Arc::new(
+            StubReportScheduleOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-schedules/report-schedule-daily")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-report-schedule-upsert-001")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "cadence": "daily",
+                        "scheduled_at_utc": "2026-04-07T00:00:00Z",
+                        "reason_code": "ready",
+                        "runbook_url": "https://docs.example.com/operations/recurring-report-scheduling"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["action"], "report_schedule_upsert");
+        assert_eq!(payload["schedule"]["schedule_id"], "report-schedule-daily");
+        assert_eq!(payload["schedule"]["cadence"], "daily");
+        assert_eq!(payload["schedule"]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn report_schedule_run_history_endpoint_returns_run_rows() {
+        let response = test_app_with_report_schedule_orchestrator(Arc::new(
+            StubReportScheduleOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-schedules/report-schedule-daily/runs?limit=1")
+                .method("GET")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-report-schedule-runs-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["action"], "report_schedule_run_history_query");
+        assert_eq!(payload["runs"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["runs"][0]["status"], "succeeded");
+        assert_eq!(
+            payload["runs"][0]["reason_code"],
+            ReportingScheduleReasonCode::RunSucceeded.code()
+        );
+        assert_eq!(payload["runs"][0]["actor_id"], "ops-1");
+        assert_eq!(
+            payload["runs"][0]["source_context"],
+            "reporting-service.scheduler"
+        );
+        assert_eq!(
+            payload["runs"][0]["impacted_system"],
+            "reporting-service scheduler"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_schedule_run_history_endpoint_allows_read_only_analytics_roles() {
+        let response = test_app_with_report_schedule_orchestrator(Arc::new(
+            StubReportScheduleOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-schedules/report-schedule-daily/runs?limit=1")
+                .method("GET")
+                .header(
+                    "authorization",
+                    bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                )
+                .header(
+                    "x-correlation-id",
+                    "corr-report-schedule-runs-read-only-001",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn report_schedule_pause_endpoint_maps_unauthorized_errors() {
+        let response =
+            test_app_with_report_schedule_orchestrator(Arc::new(StubReportScheduleOrchestrator {
+                pause_error: Some((
+                    ReportingScheduleReasonCode::Unauthorized.code(),
+                    "forbidden",
+                )),
+                ..StubReportScheduleOrchestrator::default()
+            }))
+            .oneshot(
+                Request::builder()
+                    .uri("/control/report-schedules/report-schedule-daily/pause")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-report-schedule-pause-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "reason_code": "schedule_paused",
+                            "observed_at_utc": "2026-04-07T00:05:00Z"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            ReportingScheduleReasonCode::Unauthorized.code()
+        );
+        assert_eq!(
+            payload["security_signal"]["name"],
+            "unauthorized_report_schedule_mutation_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_schedule_pause_endpoint_rejects_malformed_observed_timestamp() {
+        let response = test_app_with_report_schedule_orchestrator(Arc::new(
+            StubReportScheduleOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-schedules/report-schedule-daily/pause")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-report-schedule-pause-002")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "reason_code": "schedule_paused",
+                        "observed_at_utc": "2026-04-07T00:05:00+01:00"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            ReportingScheduleReasonCode::InvalidPayload.code()
+        );
+        assert_eq!(payload["field_errors"][0]["field"], "observed_at_utc");
+    }
+
+    #[tokio::test]
     async fn health_endpoint_remains_non_privileged() {
         let response = test_app()
             .oneshot(
@@ -8161,24 +9321,23 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_rehearsal_execute_endpoint_maps_json_rejection_to_machine_error() {
-        let response = test_app_with_recovery_orchestrator(Arc::new(
-            StubRecoveryOrchestrator::default(),
-        ))
-        .oneshot(
-            Request::builder()
-                .uri("/control/recovery/rehearsals")
-                .method("POST")
-                .header(
-                    "authorization",
-                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+        let response =
+            test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator::default()))
+                .oneshot(
+                    Request::builder()
+                        .uri("/control/recovery/rehearsals")
+                        .method("POST")
+                        .header(
+                            "authorization",
+                            bearer_token("ops-1", "operational_control", 4_102_444_800),
+                        )
+                        .header("x-correlation-id", "corr-rehearsal-json-rejection-001")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{\"artifact_id\":"))
+                        .expect("request should build"),
                 )
-                .header("x-correlation-id", "corr-rehearsal-json-rejection-001")
-                .header("content-type", "application/json")
-                .body(Body::from("{\"artifact_id\":"))
-                .expect("request should build"),
-        )
-        .await
-        .expect("request should complete");
+                .await
+                .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let payload: serde_json::Value = serde_json::from_slice(
@@ -8258,8 +9417,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_rehearsal_query_endpoint_measures_p95_latency_within_target_for_repeated_queries(
-    ) {
+    async fn recovery_rehearsal_query_endpoint_measures_p95_latency_within_target_for_repeated_queries()
+     {
         let app =
             test_app_with_recovery_orchestrator(Arc::new(StubRecoveryOrchestrator::default()));
         let mut latencies = Vec::with_capacity(40);

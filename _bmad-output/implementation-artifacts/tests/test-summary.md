@@ -553,3 +553,32 @@
 
 - `npm run --silent qa:test:story-4-2` ✅
 - `npm test` ✅
+
+---
+
+## Story 4.3 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/reporting_schedule.rs` (`reporting_schedule::tests::`) — validates UTC cadence boundaries, schedule/run contract validation, authorization gates, run-state transitions, and deterministic schedule-window composition.
+- [x] `crates/persistence/src/postgres/report_schedules.rs` (`postgres::report_schedules::tests::`) — validates Story 4.3 migration scope (`report_schedules`, `report_runs` only), deterministic due/history retrieval ordering, idempotent run-window uniqueness, and persistence failure taxonomy.
+- [x] `services/reporting-service/src/exports/scheduling.rs` (`exports::scheduling::tests::`) — validates scheduler orchestration transitions (`pending -> running -> succeeded|failed|missed`), UTC boundary advancement, fail-closed dependency handling, and alert-link evidence propagation.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::report_schedule_`) — validates authenticated schedule mutation/run-history endpoints, machine-readable denial contracts, and control-plane telemetry/audit envelope behavior.
+- [x] `tests/contract/story-4-3-recurring-report-scheduling.test.mjs` — validates route discoverability, NFR15 critical-failure escalation invariants, runbook coverage, and root QA script publication.
+- [x] `tests/api/story-4-3-recurring-report-scheduling-api.test.mjs` — validates control-api scheduling route/auth wiring, deterministic machine-readable status mapping, and accepted/rejected telemetry+security signal evidence.
+- [x] `tests/e2e/story-4-3-recurring-report-scheduling.e2e.test.mjs` — validates scheduler lifecycle/evidence orchestration and runbook-driven pause/resume/recovery operator workflow contracts.
+
+### Coverage
+
+- Story 4.3 now has deterministic automated coverage for:
+  - FR38 UTC cadence boundaries (daily/weekly/monthly) and schedule pause/resume lifecycle behavior,
+  - auditable run-history evidence persistence with bounded deterministic query behavior,
+  - control-plane schedule mutation authorization and machine-readable rejection envelopes,
+  - NFR15 critical scheduling failure escalation with runbook-linked alert evidence and fail-closed behavior,
+  - API/E2E story-level regression checks that keep scheduling endpoint contracts and end-to-end scheduler flow expectations stable.
+- Automated Story 4.3 regression inventory in this QA refresh: **41 Story-4.3 tests passing** (`rust: 31`, `contract/api/e2e: 10`).
+
+### Execution Result
+
+- `npm run --silent qa:test:story-4-3` ✅
+- `node --test tests/contract/story-4-3*.test.mjs tests/api/story-4-3*.test.mjs tests/e2e/story-4-3*.test.mjs` ✅

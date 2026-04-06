@@ -374,8 +374,7 @@ pub fn validate_restore_rehearsal_run_evidence(
         field_errors.push(RecoveryValidationIssue {
             field: "deterministic_signature.deterministic_match",
             code: RecoveryReasonCode::InvalidPayload.code(),
-            message: "deterministic_match=false cannot be marked as a passed rehearsal"
-                .to_string(),
+            message: "deterministic_match=false cannot be marked as a passed rehearsal".to_string(),
         });
     }
     let failed_checks = run.integrity_checks.iter().any(|item| !item.passed);

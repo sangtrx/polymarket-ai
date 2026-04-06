@@ -1709,7 +1709,10 @@ mod tests {
     async fn contract_discovery_routes_reject_unauthorized_roles() {
         let app = reporting_router(success_state(1));
         let response = app
-            .oneshot(request("/api/v1/reporting/contracts/trades/versions", "guest"))
+            .oneshot(request(
+                "/api/v1/reporting/contracts/trades/versions",
+                "guest",
+            ))
             .await
             .expect("route should respond");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
