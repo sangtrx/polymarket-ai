@@ -273,12 +273,28 @@ pub fn validate_reconciliation_run_summary(
 ) -> Result<(), ReconciliationContractError> {
     let mut issues = Vec::new();
     validate_non_empty("run_id", &summary.run_id, &mut issues);
-    validate_non_empty("window_started_at_utc", &summary.window_started_at_utc, &mut issues);
-    validate_non_empty("window_ended_at_utc", &summary.window_ended_at_utc, &mut issues);
+    validate_non_empty(
+        "window_started_at_utc",
+        &summary.window_started_at_utc,
+        &mut issues,
+    );
+    validate_non_empty(
+        "window_ended_at_utc",
+        &summary.window_ended_at_utc,
+        &mut issues,
+    );
     validate_non_empty("evaluated_at_utc", &summary.evaluated_at_utc, &mut issues);
     validate_non_empty("correlation_id", &summary.correlation_id, &mut issues);
-    validate_timestamp_utc("window_started_at_utc", &summary.window_started_at_utc, &mut issues);
-    validate_timestamp_utc("window_ended_at_utc", &summary.window_ended_at_utc, &mut issues);
+    validate_timestamp_utc(
+        "window_started_at_utc",
+        &summary.window_started_at_utc,
+        &mut issues,
+    );
+    validate_timestamp_utc(
+        "window_ended_at_utc",
+        &summary.window_ended_at_utc,
+        &mut issues,
+    );
     validate_timestamp_utc("evaluated_at_utc", &summary.evaluated_at_utc, &mut issues);
 
     if summary.compared_records <= 0 {
@@ -351,7 +367,8 @@ pub fn validate_reconciliation_run_summary(
         issues.push(ReconciliationValidationIssue {
             field: "status",
             code: ReconciliationReasonCode::InvalidPayload.code(),
-            message: "non-critical reconciliation runs cannot use `critical_halt` status".to_string(),
+            message: "non-critical reconciliation runs cannot use `critical_halt` status"
+                .to_string(),
         });
     }
 
@@ -365,7 +382,9 @@ pub fn validate_reconciliation_run_summary(
     })
 }
 
-pub fn validate_exposure_snapshot(snapshot: &ExposureSnapshot) -> Result<(), ReconciliationContractError> {
+pub fn validate_exposure_snapshot(
+    snapshot: &ExposureSnapshot,
+) -> Result<(), ReconciliationContractError> {
     let mut issues = Vec::new();
     validate_non_empty("snapshot_id", &snapshot.snapshot_id, &mut issues);
     validate_non_empty("run_id", &snapshot.run_id, &mut issues);
@@ -424,7 +443,9 @@ pub fn calculate_mismatch_rate(
     Ok(mismatch_count as f64 / compared_records as f64)
 }
 
-pub fn mismatch_rate_triggers_halt(mismatch_rate: f64) -> Result<bool, ReconciliationContractError> {
+pub fn mismatch_rate_triggers_halt(
+    mismatch_rate: f64,
+) -> Result<bool, ReconciliationContractError> {
     if !mismatch_rate.is_finite() || !(0.0..=1.0).contains(&mismatch_rate) {
         return Err(ReconciliationContractError::invalid_payload(
             "mismatch_rate must be a finite ratio between 0 and 1",
@@ -507,9 +528,13 @@ pub fn reconcile_window(
     let reason_code = if mismatch_count == 0 {
         ReconciliationReasonCode::Matched.code().to_string()
     } else if critical_halt {
-        ReconciliationReasonCode::CriticalMismatch.code().to_string()
+        ReconciliationReasonCode::CriticalMismatch
+            .code()
+            .to_string()
     } else {
-        ReconciliationReasonCode::NonCriticalMismatch.code().to_string()
+        ReconciliationReasonCode::NonCriticalMismatch
+            .code()
+            .to_string()
     };
 
     let summary = ReconciliationRunSummary {
@@ -625,8 +650,7 @@ fn build_diff(
     internal: Option<&ReconciliationOrderRecord>,
     venue: Option<&ReconciliationOrderRecord>,
 ) -> Result<Option<ReconciliationDiffRecord>, ReconciliationContractError> {
-    let Some(diff_details) = classify_diff(order_id, internal, venue)
-    else {
+    let Some(diff_details) = classify_diff(order_id, internal, venue) else {
         return Ok(None);
     };
 
@@ -640,7 +664,9 @@ fn build_diff(
         order_id: order_id.to_string(),
         market_id: diff_details.market_id,
         diff_class: diff_details.diff_class,
-        reason_code: ReconciliationReasonCode::NonCriticalMismatch.code().to_string(),
+        reason_code: ReconciliationReasonCode::NonCriticalMismatch
+            .code()
+            .to_string(),
         internal_value: diff_details.internal_value,
         venue_value: diff_details.venue_value,
         observed_at_utc: diff_details.observed_at_utc,
@@ -1000,7 +1026,10 @@ mod tests {
             &[],
         )
         .expect_err("empty windows should fail closed");
-        assert_eq!(error.code, ReconciliationReasonCode::WindowUnavailable.code());
+        assert_eq!(
+            error.code,
+            ReconciliationReasonCode::WindowUnavailable.code()
+        );
     }
 
     #[test]
@@ -1021,7 +1050,10 @@ mod tests {
         .expect("snapshot should build");
 
         assert_eq!(snapshot.open_order_count, 1);
-        assert_eq!(snapshot.reason_code, ReconciliationReasonCode::CriticalMismatch.code());
+        assert_eq!(
+            snapshot.reason_code,
+            ReconciliationReasonCode::CriticalMismatch.code()
+        );
         assert_eq!(snapshot.captured_at_utc, "2026-04-06T00:01:01Z");
     }
 
@@ -1044,7 +1076,9 @@ mod tests {
             mismatch_rate: 0.2,
             critical_halt: false,
             status: ReconciliationRunStatus::Succeeded,
-            reason_code: ReconciliationReasonCode::NonCriticalMismatch.code().to_string(),
+            reason_code: ReconciliationReasonCode::NonCriticalMismatch
+                .code()
+                .to_string(),
             evaluated_at_utc: "2026-04-06T00:01:01Z".to_string(),
             correlation_id: "corr-1".to_string(),
         };

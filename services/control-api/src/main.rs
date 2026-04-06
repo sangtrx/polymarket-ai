@@ -5,6 +5,7 @@ mod routes;
 use axum::Router;
 use common::time::timestamp_utc;
 use domain::governance::AuthorizationEvaluator;
+use governance_service::allocation_policy::AllocationPolicyService;
 use governance_service::approvals::GovernanceApprovalService;
 use governance_service::audit::{GovernanceAuditService, InMemoryAuditAppendPort};
 use governance_service::credentials::CredentialRotationService;
@@ -35,6 +36,7 @@ async fn main() {
         ))),
         Arc::new(GovernanceApprovalService::postgres(pool.clone())),
         Arc::new(CredentialRotationService::postgres(pool.clone())),
+        Arc::new(AllocationPolicyService::postgres(pool.clone())),
         Arc::new(MarketPolicyService::postgres(pool.clone())),
         Arc::new(RiskLimitService::postgres(pool.clone())),
         Arc::new(SafetyControlService::postgres(pool)),

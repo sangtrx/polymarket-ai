@@ -3,11 +3,15 @@ use crate::middleware::{
 };
 use axum::{
     Router,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     middleware as axum_middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
+};
+use domain::allocation::{
+    DEFAULT_EXPOSURE_DRIFT_THRESHOLD_PCT, DEFAULT_POLICY_STALE_AFTER_SECONDS,
+    DEFAULT_RELATIVE_ALPHA_DRIFT_THRESHOLD_PCT, RebalanceReasonCode,
 };
 use domain::governance::{
     ApprovalDecisionEvidence, ApprovalDecisionOutcome, ApprovalReasonCode, AuthorizationDecision,
@@ -19,6 +23,11 @@ use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
     MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue,
     SafetyControlActionRecord,
+};
+use governance_service::allocation_policy::{
+    AllocationPolicyMutationEvidence, EvaluateRebalanceDriftInput,
+    ExecuteRebalanceRecommendationInput, PendingRebalanceRecommendationsInput,
+    RebalanceRecommendationEvidence, UpsertAllocationPolicyInput,
 };
 use governance_service::approvals::{
     EvaluateApprovalExecutionInput, RecordApprovalVoteInput, SubmitApprovalRequestInput,
@@ -100,6 +109,23 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let allocation_policy_routes = Router::new()
+        .route(
+            "/control/allocation-policies/{policy_key}",
+            post(upsert_allocation_policy),
+        )
+        .route(
+            "/control/rebalance/recommendations/pending",
+            get(list_pending_rebalance_recommendations),
+        )
+        .route(
+            "/control/rebalance/recommendations/{recommendation_id}/execute",
+            post(execute_rebalance_recommendation),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
     let emergency_control_routes = Router::new()
         .route("/control/emergency/pause", post(trigger_emergency_pause))
         .route(
@@ -126,6 +152,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(credential_rotation_routes)
         .merge(market_policy_routes)
         .merge(risk_limit_routes)
+        .merge(allocation_policy_routes)
         .merge(emergency_control_routes)
         .with_state(state)
 }
@@ -137,76 +164,138 @@ pub async fn health() -> &'static str {
 pub async fn rebalance_portfolio(
     State(state): State<ControlApiState>,
     Extension(actor): Extension<AuthenticatedActor>,
+    maybe_payload: Option<axum::Json<RebalanceDriftPayload>>,
 ) -> Response {
-    let decision = state
-        .authorization_guard
-        .evaluate(&actor, ControlAction::ExecuteControlPlaneAction);
+    let endpoint = "/control/rebalance".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
 
-    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
-
-    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
-        &decision,
-        actor.authentication_outcome.as_str(),
-        json!({
-            "endpoint": "/control/rebalance",
-            "http_method": "POST",
-        }),
-    );
-
-    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
-        return audit_append_failure_response(
-            audit_error,
-            decision.action.clone(),
-            decision.actor_id.clone(),
-            decision.role.clone(),
-            actor.authentication_outcome.as_str(),
-            decision.correlation_id.clone(),
-            decision.timestamp_utc.clone(),
-        );
-    }
-
-    if decision.outcome == AuthorizationOutcome::Allow {
+    let Some(axum::Json(payload)) = maybe_payload else {
         return (
             StatusCode::ACCEPTED,
             axum::Json(ControlActionAccepted {
                 status: "accepted",
-                action: decision.action,
-                actor_id: decision.actor_id,
-                role: decision.role,
+                action: authorization.action,
+                actor_id: authorization.actor_id,
+                role: authorization.role,
                 outcome: "allow",
                 authentication_outcome: actor.authentication_outcome.as_str(),
-                correlation_id: decision.correlation_id,
-                timestamp_utc: decision.timestamp_utc,
+                correlation_id: authorization.correlation_id,
+                timestamp_utc: authorization.timestamp_utc,
             }),
         )
             .into_response();
-    }
-
-    let machine_error = decision
-        .machine_error()
-        .expect("denied authorization decisions always produce machine errors");
-    let status = match decision.reason {
-        AuthorizationReason::UnknownRole
-        | AuthorizationReason::UnknownAction
-        | AuthorizationReason::InvalidActorContext => StatusCode::BAD_REQUEST,
-        _ => StatusCode::FORBIDDEN,
     };
 
-    (
-        status,
-        axum::Json(ControlActionDenied {
-            error_code: machine_error.code,
-            reason: reason_key(decision.reason),
-            message: machine_error.message,
-            action: decision.action,
-            actor_id: decision.actor_id,
-            role: decision.role,
-            authentication_outcome: actor.authentication_outcome.as_str(),
-            correlation_id: decision.correlation_id,
-            timestamp_utc: decision.timestamp_utc,
-        }),
+    let observed_at_utc = payload
+        .observed_at_utc
+        .clone()
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let approval_request_id = payload
+        .approval_request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let provided_approval_reference = payload
+        .approval_reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if provided_approval_reference.is_some() && approval_request_id.is_none() {
+        return approval_reference_requires_request_id_response(
+            "rebalance_recommendation_evaluate",
+            &actor,
+            observed_at_utc.clone(),
+            endpoint,
+        );
+    }
+
+    let mut approval_reference = None;
+    if payload.require_execution && let Some(request_id) = approval_request_id {
+        let approval_decision =
+            match state
+                .approval_orchestrator
+                .evaluate_execution(EvaluateApprovalExecutionInput {
+                    request_id,
+                    action_id: "rebalance_recommendation_execute".to_string(),
+                    actor_id: actor.actor_id.clone(),
+                    actor_role: actor.role.clone(),
+                    correlation_id: actor.correlation_id.clone(),
+                    now_utc: observed_at_utc.clone(),
+                }) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return approval_service_error_response(
+                        error.code,
+                        error.message,
+                        &actor,
+                        observed_at_utc,
+                        endpoint,
+                    );
+                }
+            };
+        match approval_decision.outcome {
+            ApprovalDecisionOutcome::Allow => {
+                approval_reference = approval_decision
+                    .approval_reference
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            ApprovalDecisionOutcome::Pending => {}
+            ApprovalDecisionOutcome::Deny => {
+                return critical_approval_response(
+                    &state,
+                    &actor,
+                    approval_decision,
+                    endpoint,
+                    "rebalance_recommendation_evaluate",
+                );
+            }
+        }
+    }
+
+    let recommendation = match state
+        .allocation_policy_orchestrator
+        .evaluate_rebalance_drift(EvaluateRebalanceDriftInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            policy_key: payload.policy_key,
+            exposure_drift_pct: payload.exposure_drift_pct,
+            relative_alpha_drift_pct: payload.relative_alpha_drift_pct,
+            observed_at_utc: observed_at_utc.clone(),
+            stale_after_seconds: payload.stale_after_seconds,
+            correlation_id: actor.correlation_id.clone(),
+            require_execution: payload.require_execution,
+            approval_reference,
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return allocation_policy_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "rebalance_recommendation_evaluate",
+                &actor,
+                observed_at_utc,
+                endpoint,
+            );
+        }
+    };
+
+    rebalance_recommendation_response(
+        &state,
+        &actor,
+        recommendation,
+        endpoint,
+        "POST",
+        "rebalance_recommendation_evaluate",
     )
-        .into_response()
 }
 
 pub async fn submit_critical_action_request(
@@ -658,6 +747,280 @@ pub async fn list_pending_risk_limit_profiles(
         pending,
         authorization.timestamp_utc,
         endpoint,
+    )
+}
+
+pub async fn upsert_allocation_policy(
+    State(state): State<ControlApiState>,
+    Path(policy_key): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<AllocationPolicyPayload>,
+) -> Response {
+    let endpoint = format!("/control/allocation-policies/{policy_key}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let approval_request_id = payload
+        .approval_request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let provided_approval_reference = payload
+        .approval_reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if provided_approval_reference.is_some() && approval_request_id.is_none() {
+        return approval_reference_requires_request_id_response(
+            "allocation_policy_update",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    }
+
+    let mut approval_reference = None;
+    if let Some(request_id) = approval_request_id {
+        let approval_decision =
+            match state
+                .approval_orchestrator
+                .evaluate_execution(EvaluateApprovalExecutionInput {
+                    request_id,
+                    action_id: "allocation_policy_increase".to_string(),
+                    actor_id: actor.actor_id.clone(),
+                    actor_role: actor.role.clone(),
+                    correlation_id: actor.correlation_id.clone(),
+                    now_utc: authorization.timestamp_utc.clone(),
+                }) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return approval_service_error_response(
+                        error.code,
+                        error.message,
+                        &actor,
+                        authorization.timestamp_utc.clone(),
+                        endpoint,
+                    );
+                }
+            };
+
+        match approval_decision.outcome {
+            ApprovalDecisionOutcome::Allow => {
+                approval_reference = approval_decision
+                    .approval_reference
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            ApprovalDecisionOutcome::Pending => {}
+            ApprovalDecisionOutcome::Deny => {
+                return critical_approval_response(
+                    &state,
+                    &actor,
+                    approval_decision,
+                    endpoint,
+                    "allocation_policy_update",
+                );
+            }
+        }
+    }
+
+    let decision = match state
+        .allocation_policy_orchestrator
+        .upsert_allocation_policy(UpsertAllocationPolicyInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            policy_key,
+            version: payload.version,
+            portfolio_scope_id: payload.portfolio_scope_id,
+            target_exposure_pct_nav: payload.target_exposure_pct_nav,
+            target_relative_alpha_weight: payload.target_relative_alpha_weight,
+            exposure_drift_threshold_pct: payload.exposure_drift_threshold_pct,
+            relative_alpha_drift_threshold_pct: payload.relative_alpha_drift_threshold_pct,
+            advanced_parameters: payload.advanced_parameters,
+            correlation_id: actor.correlation_id.clone(),
+            updated_at_utc: authorization.timestamp_utc.clone(),
+            approval_reference,
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return allocation_policy_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "allocation_policy_update",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    allocation_policy_mutation_response(&state, &actor, decision, endpoint)
+}
+
+pub async fn list_pending_rebalance_recommendations(
+    State(state): State<ControlApiState>,
+    Query(query): Query<PendingRebalanceRecommendationsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/rebalance/recommendations/pending".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let pending = match state
+        .allocation_policy_orchestrator
+        .list_pending_rebalance_recommendations(PendingRebalanceRecommendationsInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+            policy_key: query.policy_key,
+        }) {
+        Ok(recommendations) => recommendations,
+        Err(error) => {
+            return allocation_policy_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "rebalance_pending_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    rebalance_pending_query_response(
+        &state,
+        &actor,
+        pending,
+        authorization.timestamp_utc,
+        endpoint,
+    )
+}
+
+pub async fn execute_rebalance_recommendation(
+    State(state): State<ControlApiState>,
+    Path(recommendation_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<RebalanceExecutionPayload>,
+) -> Response {
+    let endpoint = format!("/control/rebalance/recommendations/{recommendation_id}/execute");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let executed_at_utc = payload
+        .executed_at_utc
+        .clone()
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let approval_request_id = payload
+        .approval_request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let provided_approval_reference = payload
+        .approval_reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if provided_approval_reference.is_some() && approval_request_id.is_none() {
+        return approval_reference_requires_request_id_response(
+            "rebalance_recommendation_execute",
+            &actor,
+            executed_at_utc,
+            endpoint,
+        );
+    }
+
+    let mut approval_reference = None;
+    if let Some(request_id) = approval_request_id {
+        let approval_decision =
+            match state
+                .approval_orchestrator
+                .evaluate_execution(EvaluateApprovalExecutionInput {
+                    request_id,
+                    action_id: "rebalance_recommendation_execute".to_string(),
+                    actor_id: actor.actor_id.clone(),
+                    actor_role: actor.role.clone(),
+                    correlation_id: actor.correlation_id.clone(),
+                    now_utc: executed_at_utc.clone(),
+                }) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return approval_service_error_response(
+                        error.code,
+                        error.message,
+                        &actor,
+                        executed_at_utc,
+                        endpoint,
+                    );
+                }
+            };
+
+        match approval_decision.outcome {
+            ApprovalDecisionOutcome::Allow => {
+                approval_reference = approval_decision
+                    .approval_reference
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            ApprovalDecisionOutcome::Pending | ApprovalDecisionOutcome::Deny => {
+                return critical_approval_response(
+                    &state,
+                    &actor,
+                    approval_decision,
+                    endpoint,
+                    "rebalance_recommendation_execute",
+                );
+            }
+        }
+    }
+
+    let decision = match state
+        .allocation_policy_orchestrator
+        .execute_rebalance_recommendation(ExecuteRebalanceRecommendationInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            recommendation_id,
+            correlation_id: actor.correlation_id.clone(),
+            executed_at_utc: executed_at_utc.clone(),
+            approval_reference,
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return allocation_policy_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "rebalance_recommendation_execute",
+                &actor,
+                executed_at_utc,
+                endpoint,
+            );
+        }
+    };
+
+    rebalance_recommendation_response(
+        &state,
+        &actor,
+        decision,
+        endpoint,
+        "POST",
+        "rebalance_recommendation_execute",
     )
 }
 
@@ -1643,6 +2006,374 @@ fn risk_limit_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn allocation_policy_mutation_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: AllocationPolicyMutationEvidence,
+    endpoint: String,
+) -> Response {
+    let audit_outcome = if decision.approval_status == "approved" {
+        PrivilegedAuditOutcome::Allow
+    } else {
+        PrivilegedAuditOutcome::AuthorizationDenied
+    };
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "allocation_policy_update".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+            "policy_key": decision.policy_key,
+            "version": decision.version,
+            "approval_status": decision.approval_status,
+        }),
+        approval_reference: if decision.approval_status == "approved" {
+            decision.approval_reference.clone()
+        } else {
+            None
+        },
+        timestamp: decision.updated_at_utc.clone(),
+        outcome: audit_outcome,
+        reason_code: decision.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: decision.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "allocation_policy_update".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.updated_at_utc,
+        );
+    }
+
+    match decision.approval_status.as_str() {
+        "approved" => (
+            StatusCode::ACCEPTED,
+            axum::Json(AllocationPolicyDecisionResponse {
+                status: "accepted",
+                error_code: None,
+                message: None,
+                policy_key: decision.policy_key,
+                version: decision.version,
+                approval_status: decision.approval_status,
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                reason_code: decision.reason_code,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.updated_at_utc,
+                approval_reference: decision.approval_reference,
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        "pending" => (
+            StatusCode::ACCEPTED,
+            axum::Json(AllocationPolicyDecisionResponse {
+                status: "pending",
+                error_code: None,
+                message: None,
+                policy_key: decision.policy_key,
+                version: decision.version,
+                approval_status: decision.approval_status,
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                reason_code: decision.reason_code,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.updated_at_utc,
+                approval_reference: None,
+                security_signal: None,
+            }),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::FORBIDDEN,
+            axum::Json(AllocationPolicyDecisionResponse {
+                status: "denied",
+                error_code: Some(decision.reason_code.clone()),
+                message: Some("allocation policy mutation was denied".to_string()),
+                policy_key: decision.policy_key,
+                version: decision.version,
+                approval_status: decision.approval_status,
+                actor_id: decision.actor_id,
+                role: actor.role.clone(),
+                reason_code: decision.reason_code,
+                correlation_id: decision.correlation_id,
+                timestamp_utc: decision.updated_at_utc,
+                approval_reference: None,
+                security_signal: Some(AllocationPolicySecuritySignal {
+                    name: "unauthorized_allocation_policy_mutation_attempt_v1",
+                    severity: "high",
+                    alert_compatible: true,
+                    alert_target_seconds: 30,
+                }),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn rebalance_recommendation_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: RebalanceRecommendationEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+) -> Response {
+    let audit_outcome = match decision.status.as_str() {
+        "executed" | "approved" | "proposed" => PrivilegedAuditOutcome::Allow,
+        "pending_approval" | "denied" => PrivilegedAuditOutcome::AuthorizationDenied,
+        _ => PrivilegedAuditOutcome::AuthorizationDenied,
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "recommendation_id": decision.recommendation_id,
+            "policy_key": decision.policy_key,
+            "policy_version": decision.policy_version,
+            "status": decision.status,
+            "approval_status": decision.approval_status,
+            "reason_code": decision.reason_code,
+        }),
+        approval_reference: if decision.approval_status == "approved" {
+            decision.approval_reference.clone()
+        } else {
+            None
+        },
+        timestamp: decision.updated_at_utc.clone(),
+        outcome: audit_outcome,
+        reason_code: decision.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: decision.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.updated_at_utc,
+        );
+    }
+
+    let (status_code, status, error_code, message, security_signal) = match decision.status.as_str()
+    {
+        "pending_approval" => (StatusCode::ACCEPTED, "pending", None, None, None),
+        "denied" if decision.reason_code == RebalanceReasonCode::InBounds.code() => {
+            (StatusCode::ACCEPTED, "accepted", None, None, None)
+        }
+        "denied" => (
+            StatusCode::FORBIDDEN,
+            "denied",
+            Some(decision.reason_code.clone()),
+            Some("rebalance recommendation was denied".to_string()),
+            Some(AllocationPolicySecuritySignal {
+                name: "rebalance_recommendation_denied_v1",
+                severity: "high",
+                alert_compatible: true,
+                alert_target_seconds: 30,
+            }),
+        ),
+        _ => (StatusCode::ACCEPTED, "accepted", None, None, None),
+    };
+
+    (
+        status_code,
+        axum::Json(RebalanceRecommendationDecisionResponse {
+            status,
+            error_code,
+            message,
+            recommendation_id: decision.recommendation_id,
+            policy_key: decision.policy_key,
+            policy_version: decision.policy_version,
+            recommendation_status: decision.status,
+            approval_status: decision.approval_status,
+            action_type: decision.action_type,
+            rationale: decision.rationale,
+            recommended_next_action: decision.recommended_next_action,
+            actor_id: decision.actor_id,
+            role: actor.role.clone(),
+            reason_code: decision.reason_code,
+            correlation_id: decision.correlation_id,
+            created_at_utc: decision.created_at_utc,
+            timestamp_utc: decision.updated_at_utc,
+            approval_reference: decision.approval_reference,
+            security_signal,
+        }),
+    )
+        .into_response()
+}
+
+fn rebalance_pending_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    pending: Vec<RebalanceRecommendationEvidence>,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "rebalance_pending_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "pending_count": pending.len(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: RebalanceReasonCode::ApprovalRequired.code().to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "rebalance_pending_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(PendingRebalanceRecommendationsResponse {
+            status: "accepted",
+            action: "rebalance_pending_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            pending_recommendations: pending
+                .into_iter()
+                .map(|item| PendingRebalanceRecommendationItem {
+                    recommendation_id: item.recommendation_id,
+                    policy_key: item.policy_key,
+                    policy_version: item.policy_version,
+                    recommendation_status: item.status,
+                    approval_status: item.approval_status,
+                    action_type: item.action_type,
+                    rationale: item.rationale,
+                    recommended_next_action: item.recommended_next_action,
+                    actor_id: item.actor_id,
+                    reason_code: item.reason_code,
+                    correlation_id: item.correlation_id,
+                    created_at_utc: item.created_at_utc,
+                    updated_at_utc: item.updated_at_utc,
+                    approval_reference: item.approval_reference,
+                })
+                .collect(),
+        }),
+    )
+        .into_response()
+}
+
+fn allocation_policy_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<domain::allocation::AllocationValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let security_signal = if error_code == "allocation_policy_unauthorized_role" {
+        Some(AllocationPolicySecuritySignal {
+            name: "unauthorized_allocation_policy_mutation_attempt_v1",
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+    (
+        allocation_policy_service_error_status(error_code),
+        axum::Json(AllocationPolicyServiceErrorResponse {
+            error_code,
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| AllocationPolicyFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+            security_signal,
+        }),
+    )
+        .into_response()
+}
+
+fn allocation_policy_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == RebalanceReasonCode::InvalidPayload.code()
+            || code == RebalanceReasonCode::InvalidThreshold.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        "allocation_policy_unauthorized_role" => StatusCode::FORBIDDEN,
+        "allocation_constraint_violation" => StatusCode::CONFLICT,
+        code if code == RebalanceReasonCode::RecommendationNotFound.code() => StatusCode::NOT_FOUND,
+        code if code == RebalanceReasonCode::RecommendationDenied.code() => StatusCode::CONFLICT,
+        code if code == RebalanceReasonCode::ApprovalRequired.code() => StatusCode::CONFLICT,
+        code if code == RebalanceReasonCode::PolicyStateUnavailable.code()
+            || code == RebalanceReasonCode::PolicyStateStale.code()
+            || code == RebalanceReasonCode::PersistenceUnavailable.code()
+            || code == "allocation_query_failed"
+            || code == "allocation_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn approval_reference_requires_request_id_response(
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    allocation_policy_service_error_response(
+        RebalanceReasonCode::InvalidPayload.code(),
+        "approval_reference cannot be supplied directly; provide approval_request_id and rely on approval workflow evidence."
+            .to_string(),
+        vec![domain::allocation::AllocationValidationIssue {
+            field: "approval_reference",
+            code: RebalanceReasonCode::InvalidPayload.code(),
+            message: "approval_reference requires approval_request_id and must originate from an approved request.".to_string(),
+        }],
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+    )
+}
+
 fn emergency_control_action_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -2072,6 +2803,73 @@ pub struct MarketClusterTogglePayload {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AllocationPolicyPayload {
+    pub version: i64,
+    pub portfolio_scope_id: String,
+    pub target_exposure_pct_nav: f64,
+    pub target_relative_alpha_weight: f64,
+    #[serde(default = "default_exposure_drift_threshold_pct")]
+    pub exposure_drift_threshold_pct: f64,
+    #[serde(default = "default_relative_alpha_drift_threshold_pct")]
+    pub relative_alpha_drift_threshold_pct: f64,
+    #[serde(default = "default_allocation_advanced_parameters")]
+    pub advanced_parameters: serde_json::Value,
+    #[serde(default)]
+    pub approval_request_id: Option<String>,
+    #[serde(default)]
+    pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RebalanceDriftPayload {
+    pub policy_key: String,
+    pub exposure_drift_pct: f64,
+    pub relative_alpha_drift_pct: f64,
+    #[serde(default)]
+    pub observed_at_utc: Option<String>,
+    #[serde(default = "default_policy_stale_after_seconds")]
+    pub stale_after_seconds: f64,
+    #[serde(default)]
+    pub require_execution: bool,
+    #[serde(default)]
+    pub approval_request_id: Option<String>,
+    #[serde(default)]
+    pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PendingRebalanceRecommendationsQuery {
+    #[serde(default)]
+    pub policy_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RebalanceExecutionPayload {
+    #[serde(default)]
+    pub executed_at_utc: Option<String>,
+    #[serde(default)]
+    pub approval_request_id: Option<String>,
+    #[serde(default)]
+    pub approval_reference: Option<String>,
+}
+
+fn default_exposure_drift_threshold_pct() -> f64 {
+    DEFAULT_EXPOSURE_DRIFT_THRESHOLD_PCT
+}
+
+fn default_relative_alpha_drift_threshold_pct() -> f64 {
+    DEFAULT_RELATIVE_ALPHA_DRIFT_THRESHOLD_PCT
+}
+
+fn default_policy_stale_after_seconds() -> f64 {
+    DEFAULT_POLICY_STALE_AFTER_SECONDS
+}
+
+fn default_allocation_advanced_parameters() -> serde_json::Value {
+    json!({})
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RiskLimitRulePayload {
     pub scope: String,
     pub scope_id: String,
@@ -2223,6 +3021,115 @@ pub struct MarketPolicySecuritySignal {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AllocationPolicyDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub policy_key: String,
+    pub version: i64,
+    pub approval_status: String,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<AllocationPolicySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RebalanceRecommendationDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub recommendation_id: String,
+    pub policy_key: String,
+    pub policy_version: i64,
+    pub recommendation_status: String,
+    pub approval_status: String,
+    pub action_type: String,
+    pub rationale: String,
+    pub recommended_next_action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub created_at_utc: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<AllocationPolicySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PendingRebalanceRecommendationsResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub pending_recommendations: Vec<PendingRebalanceRecommendationItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PendingRebalanceRecommendationItem {
+    pub recommendation_id: String,
+    pub policy_key: String,
+    pub policy_version: i64,
+    pub recommendation_status: String,
+    pub approval_status: String,
+    pub action_type: String,
+    pub rationale: String,
+    pub recommended_next_action: String,
+    pub actor_id: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub created_at_utc: String,
+    pub updated_at_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AllocationPolicyServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<AllocationPolicyFieldError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<AllocationPolicySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AllocationPolicyFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AllocationPolicySecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RiskLimitProfileDecisionResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2356,6 +3263,12 @@ mod tests {
         EmergencyControlTriggerSource,
     };
     use governance_service::{
+        allocation_policy::{
+            AllocationPolicyMutationEvidence, AllocationPolicyOrchestrator,
+            AllocationPolicyService, AllocationPolicyServiceError, EvaluateRebalanceDriftInput,
+            ExecuteRebalanceRecommendationInput, PendingRebalanceRecommendationsInput,
+            RebalanceRecommendationEvidence, UpsertAllocationPolicyInput,
+        },
         approvals::GovernanceApprovalService,
         audit::{AuditAppendError, PrivilegedAuditAppender},
         credentials::CredentialRotationService,
@@ -2588,6 +3501,209 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct StubAllocationPolicyOrchestrator {
+        upsert_error: Option<(&'static str, &'static str)>,
+        evaluate_error: Option<(&'static str, &'static str)>,
+        execute_error: Option<(&'static str, &'static str)>,
+        pending_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl AllocationPolicyOrchestrator for StubAllocationPolicyOrchestrator {
+        fn upsert_allocation_policy(
+            &self,
+            input: UpsertAllocationPolicyInput,
+        ) -> Result<AllocationPolicyMutationEvidence, AllocationPolicyServiceError> {
+            if let Some((code, message)) = self.upsert_error {
+                return Err(AllocationPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            let approval_status = if input.approval_reference.is_some() {
+                "approved"
+            } else {
+                "pending"
+            };
+            Ok(AllocationPolicyMutationEvidence {
+                policy_key: input.policy_key.trim().to_lowercase(),
+                version: input.version,
+                approval_status: approval_status.to_string(),
+                actor_id: input.actor_id,
+                reason_code: if approval_status == "approved" {
+                    RebalanceReasonCode::AllocationPolicyUpdated
+                        .code()
+                        .to_string()
+                } else {
+                    RebalanceReasonCode::AllocationPolicyPendingApproval
+                        .code()
+                        .to_string()
+                },
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.updated_at_utc,
+                approval_reference: input.approval_reference,
+            })
+        }
+
+        fn evaluate_rebalance_drift(
+            &self,
+            input: EvaluateRebalanceDriftInput,
+        ) -> Result<RebalanceRecommendationEvidence, AllocationPolicyServiceError> {
+            if let Some((code, message)) = self.evaluate_error {
+                return Err(AllocationPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            let threshold_exceeded =
+                input.exposure_drift_pct > 10.0 || input.relative_alpha_drift_pct > 15.0;
+            let (status, approval_status, reason_code, recommended_next_action) =
+                if !threshold_exceeded {
+                    (
+                        "denied",
+                        "not_required",
+                        RebalanceReasonCode::InBounds.code().to_string(),
+                        "Continue monitoring drift telemetry; no rebalance action is required."
+                            .to_string(),
+                    )
+                } else if input.require_execution && input.approval_reference.is_none() {
+                    (
+                        "pending_approval",
+                        "pending",
+                        RebalanceReasonCode::ApprovalRequired.code().to_string(),
+                        "Complete dual approval for rebalance execution.".to_string(),
+                    )
+                } else if input.require_execution {
+                    (
+                        "approved",
+                        "approved",
+                        RebalanceReasonCode::RecommendationApproved
+                            .code()
+                            .to_string(),
+                        "Execute approved recommendation.".to_string(),
+                    )
+                } else {
+                    (
+                        "proposed",
+                        "not_required",
+                        RebalanceReasonCode::RecommendationProposed
+                            .code()
+                            .to_string(),
+                        "Review rationale and execute if portfolio intent remains valid."
+                            .to_string(),
+                    )
+                };
+
+            Ok(RebalanceRecommendationEvidence {
+                recommendation_id: format!(
+                    "reco::{}::{}",
+                    input.policy_key.trim().to_lowercase(),
+                    input.correlation_id.trim().to_lowercase()
+                ),
+                policy_key: input.policy_key.trim().to_lowercase(),
+                policy_version: 1,
+                status: status.to_string(),
+                approval_status: approval_status.to_string(),
+                action_type: if input.require_execution {
+                    "execute".to_string()
+                } else {
+                    "recommend".to_string()
+                },
+                rationale: "Drift exceeded threshold and requires operator review.".to_string(),
+                recommended_next_action,
+                actor_id: input.actor_id,
+                reason_code,
+                correlation_id: input.correlation_id,
+                created_at_utc: input.observed_at_utc.clone(),
+                updated_at_utc: input.observed_at_utc,
+                approval_reference: input.approval_reference,
+            })
+        }
+
+        fn execute_rebalance_recommendation(
+            &self,
+            input: ExecuteRebalanceRecommendationInput,
+        ) -> Result<RebalanceRecommendationEvidence, AllocationPolicyServiceError> {
+            if let Some((code, message)) = self.execute_error {
+                return Err(AllocationPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            Ok(RebalanceRecommendationEvidence {
+                recommendation_id: input.recommendation_id,
+                policy_key: "portfolio-default".to_string(),
+                policy_version: 1,
+                status: "executed".to_string(),
+                approval_status: if input.approval_reference.is_some() {
+                    "approved".to_string()
+                } else {
+                    "not_required".to_string()
+                },
+                action_type: "execute".to_string(),
+                rationale:
+                    "Drift exceeded threshold and recommendation executed by privileged actor."
+                        .to_string(),
+                recommended_next_action:
+                    "Monitor post-execution drift and verify audit references.".to_string(),
+                actor_id: input.actor_id,
+                reason_code: RebalanceReasonCode::RecommendationExecuted
+                    .code()
+                    .to_string(),
+                correlation_id: input.correlation_id,
+                created_at_utc: input.executed_at_utc.clone(),
+                updated_at_utc: input.executed_at_utc,
+                approval_reference: input.approval_reference,
+            })
+        }
+
+        fn list_pending_rebalance_recommendations(
+            &self,
+            input: PendingRebalanceRecommendationsInput,
+        ) -> Result<Vec<RebalanceRecommendationEvidence>, AllocationPolicyServiceError> {
+            if let Some((code, message)) = self.pending_error {
+                return Err(AllocationPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            Ok(vec![RebalanceRecommendationEvidence {
+                recommendation_id: format!(
+                    "reco::{}::pending",
+                    input
+                        .policy_key
+                        .clone()
+                        .unwrap_or_else(|| "portfolio-default".to_string())
+                ),
+                policy_key: input
+                    .policy_key
+                    .unwrap_or_else(|| "portfolio-default".to_string()),
+                policy_version: 2,
+                status: "pending_approval".to_string(),
+                approval_status: "pending".to_string(),
+                action_type: "execute".to_string(),
+                rationale: "Critical drift exceeds threshold and requires dual approval."
+                    .to_string(),
+                recommended_next_action: "Complete dual approval and execute recommendation."
+                    .to_string(),
+                actor_id: input.actor_id,
+                reason_code: RebalanceReasonCode::ApprovalRequired.code().to_string(),
+                correlation_id: input.correlation_id,
+                created_at_utc: input.queried_at_utc.clone(),
+                updated_at_utc: input.queried_at_utc,
+                approval_reference: None,
+            }])
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct StubSafetyControlOrchestrator {
         manual_error: Option<(&'static str, &'static str)>,
         query_error: Option<(&'static str, &'static str)>,
@@ -2737,7 +3853,26 @@ mod tests {
             Arc::new(CapturingAuditAppender::default()),
             Arc::new(GovernanceApprovalService::default()),
             Arc::new(CredentialRotationService::default()),
+            Arc::new(AllocationPolicyService::default()),
             market_policy_orchestrator,
+            Arc::new(RiskLimitService::default()),
+            Arc::new(SafetyControlService::default()),
+        ))
+    }
+
+    fn test_app_with_allocation_policy_orchestrator(
+        allocation_policy_orchestrator: Arc<dyn AllocationPolicyOrchestrator>,
+    ) -> Router {
+        test_app_with_state(ControlApiState::with_all_orchestrators(
+            Arc::new(GovernanceAuthorizationGuard::new(
+                AuthorizationEvaluator::default(),
+            )),
+            Arc::new(HeaderTokenAuthenticator),
+            Arc::new(CapturingAuditAppender::default()),
+            Arc::new(GovernanceApprovalService::default()),
+            Arc::new(CredentialRotationService::default()),
+            allocation_policy_orchestrator,
+            Arc::new(StubMarketPolicyOrchestrator::default()),
             Arc::new(RiskLimitService::default()),
             Arc::new(SafetyControlService::default()),
         ))
@@ -2754,6 +3889,7 @@ mod tests {
             Arc::new(CapturingAuditAppender::default()),
             Arc::new(GovernanceApprovalService::default()),
             Arc::new(CredentialRotationService::default()),
+            Arc::new(AllocationPolicyService::default()),
             Arc::new(StubMarketPolicyOrchestrator::default()),
             risk_limit_orchestrator,
             Arc::new(SafetyControlService::default()),
@@ -2771,6 +3907,7 @@ mod tests {
             Arc::new(CapturingAuditAppender::default()),
             Arc::new(GovernanceApprovalService::default()),
             Arc::new(CredentialRotationService::default()),
+            Arc::new(AllocationPolicyService::default()),
             Arc::new(StubMarketPolicyOrchestrator::default()),
             Arc::new(RiskLimitService::default()),
             safety_control_orchestrator,
@@ -5235,6 +6372,337 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allocation_policy_route_returns_pending_machine_readable_evidence() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/allocation-policies/portfolio-default")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-allocation-policy-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "version": 1,
+                            "portfolio_scope_id": "portfolio::default",
+                            "target_exposure_pct_nav": 32.5,
+                            "target_relative_alpha_weight": 1.15
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "pending");
+        assert_eq!(payload["approval_status"], "pending");
+        assert_eq!(payload["reason_code"], "allocation_policy_pending_approval");
+        assert_eq!(payload["policy_key"], "portfolio-default");
+    }
+
+    #[tokio::test]
+    async fn allocation_policy_route_rejects_client_supplied_approval_reference_without_request() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/allocation-policies/portfolio-default")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-allocation-policy-invalid-approval-ref-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "version": 2,
+                            "portfolio_scope_id": "portfolio::default",
+                            "target_exposure_pct_nav": 35.0,
+                            "target_relative_alpha_weight": 1.20,
+                            "approval_reference": "apr-unsafe-client-value"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "rebalance_invalid_payload");
+        assert_eq!(payload["action"], "allocation_policy_update");
+        assert_eq!(payload["field_errors"][0]["field"], "approval_reference");
+    }
+
+    #[tokio::test]
+    async fn rebalance_route_returns_recommendation_context_for_drift_exceedance() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rebalance-route-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "policy_key": "portfolio-default",
+                            "exposure_drift_pct": 12.0,
+                            "relative_alpha_drift_pct": 11.0,
+                            "require_execution": false
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["recommendation_status"], "proposed");
+        assert_eq!(payload["approval_status"], "not_required");
+        assert_eq!(payload["reason_code"], "rebalance_recommendation_proposed");
+        assert_eq!(payload["action_type"], "recommend");
+        assert!(
+            payload["rationale"]
+                .as_str()
+                .expect("rationale should be a string")
+                .contains("Drift exceeded threshold")
+        );
+    }
+
+    #[tokio::test]
+    async fn rebalance_route_rejects_client_supplied_approval_reference_without_request() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rebalance-invalid-approval-ref-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "policy_key": "portfolio-default",
+                            "exposure_drift_pct": 18.0,
+                            "relative_alpha_drift_pct": 22.0,
+                            "require_execution": true,
+                            "approval_reference": "apr-unsafe-client-value"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "rebalance_invalid_payload");
+        assert_eq!(payload["action"], "rebalance_recommendation_evaluate");
+        assert_eq!(payload["field_errors"][0]["field"], "approval_reference");
+    }
+
+    #[tokio::test]
+    async fn rebalance_pending_route_returns_queryable_pending_recommendation_evidence() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance/recommendations/pending?policy_key=portfolio-default")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rebalance-pending-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["action"], "rebalance_pending_query");
+        assert_eq!(
+            payload["pending_recommendations"][0]["recommendation_status"],
+            "pending_approval"
+        );
+        assert_eq!(
+            payload["pending_recommendations"][0]["reason_code"],
+            "rebalance_approval_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebalance_execute_route_returns_executed_machine_readable_evidence() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance/recommendations/reco-001/execute")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("admin-1", "administrative_actions", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rebalance-execute-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["recommendation_status"], "executed");
+        assert_eq!(payload["approval_status"], "not_required");
+        assert_eq!(payload["reason_code"], "rebalance_recommendation_executed");
+        assert_eq!(payload["approval_reference"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn rebalance_execute_route_rejects_client_supplied_approval_reference_without_request() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance/recommendations/reco-001/execute")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("admin-1", "administrative_actions", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rebalance-execute-invalid-approval-ref-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approval_reference":"apr-unsafe-client-value"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "rebalance_invalid_payload");
+        assert_eq!(payload["action"], "rebalance_recommendation_execute");
+        assert_eq!(payload["field_errors"][0]["field"], "approval_reference");
+    }
+
+    #[tokio::test]
+    async fn rebalance_route_surfaces_service_unavailable_machine_error() {
+        let app = test_app_with_allocation_policy_orchestrator(Arc::new(
+            StubAllocationPolicyOrchestrator {
+                evaluate_error: Some((
+                    "rebalance_persistence_unavailable",
+                    "allocation persistence dependency unavailable",
+                )),
+                ..Default::default()
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/rebalance")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-rebalance-error-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "policy_key": "portfolio-default",
+                            "exposure_drift_pct": 18.0,
+                            "relative_alpha_drift_pct": 22.0,
+                            "require_execution": true
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "rebalance_persistence_unavailable");
+        assert_eq!(payload["action"], "rebalance_recommendation_evaluate");
+    }
+
+    #[tokio::test]
     async fn emergency_pause_route_returns_machine_readable_accepted_evidence() {
         let app = test_app_with_safety_control_orchestrator(Arc::new(
             StubSafetyControlOrchestrator::default(),
@@ -5502,9 +6970,15 @@ mod tests {
                 .expect("body should be readable"),
         )
         .expect("payload should be valid json");
-        assert_eq!(payload["error_code"], EmergencyControlReasonCode::NotFound.code());
+        assert_eq!(
+            payload["error_code"],
+            EmergencyControlReasonCode::NotFound.code()
+        );
         assert_eq!(payload["action"], "emergency_control_action_query");
-        assert_eq!(payload["endpoint"], "/control/emergency/actions/action::missing");
+        assert_eq!(
+            payload["endpoint"],
+            "/control/emergency/actions/action::missing"
+        );
     }
 
     #[derive(Debug)]

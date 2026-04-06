@@ -9,6 +9,9 @@ use domain::governance::{
     AuthorizationDecision, AuthorizationEvaluator, AuthorizationRequest, ControlAction,
     GovernanceRole, PrivilegedAuditRecord,
 };
+use governance_service::allocation_policy::{
+    AllocationPolicyOrchestrator, AllocationPolicyService,
+};
 use governance_service::approvals::{ApprovalOrchestrator, GovernanceApprovalService};
 use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
 use governance_service::credentials::{CredentialRotationOrchestrator, CredentialRotationService};
@@ -211,6 +214,7 @@ pub struct ControlApiState {
     pub audit_appender: Arc<dyn PrivilegedAuditAppender>,
     pub approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
     pub credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
+    pub allocation_policy_orchestrator: Arc<dyn AllocationPolicyOrchestrator>,
     pub market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
     pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
@@ -259,6 +263,7 @@ impl ControlApiState {
             audit_appender,
             approval_orchestrator,
             credential_rotation_orchestrator,
+            Arc::new(AllocationPolicyService::default()),
             Arc::new(MarketPolicyService::default()),
             Arc::new(RiskLimitService::default()),
             Arc::new(SafetyControlService::default()),
@@ -272,6 +277,7 @@ impl ControlApiState {
         audit_appender: Arc<dyn PrivilegedAuditAppender>,
         approval_orchestrator: Arc<dyn ApprovalOrchestrator>,
         credential_rotation_orchestrator: Arc<dyn CredentialRotationOrchestrator>,
+        allocation_policy_orchestrator: Arc<dyn AllocationPolicyOrchestrator>,
         market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
         risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
         safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
@@ -282,6 +288,7 @@ impl ControlApiState {
             audit_appender,
             approval_orchestrator,
             credential_rotation_orchestrator,
+            allocation_policy_orchestrator,
             market_policy_orchestrator,
             risk_limit_orchestrator,
             safety_control_orchestrator,

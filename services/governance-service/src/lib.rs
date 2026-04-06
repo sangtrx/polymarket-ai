@@ -1,3 +1,4 @@
+pub mod allocation_policy;
 pub mod approvals;
 pub mod audit;
 pub mod credentials;

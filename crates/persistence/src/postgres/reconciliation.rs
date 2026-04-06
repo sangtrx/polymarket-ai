@@ -1,8 +1,8 @@
 use domain::reconciliation::{
-    ExposureSnapshot, ReconciliationContractError, ReconciliationDiffClass, ReconciliationDiffRecord,
-    ReconciliationReasonCode, ReconciliationRunStatus, ReconciliationRunSummary,
-    ReconciliationValidationIssue, validate_exposure_snapshot, validate_reconciliation_diff_record,
-    validate_reconciliation_run_summary,
+    ExposureSnapshot, ReconciliationContractError, ReconciliationDiffClass,
+    ReconciliationDiffRecord, ReconciliationReasonCode, ReconciliationRunStatus,
+    ReconciliationRunSummary, ReconciliationValidationIssue, validate_exposure_snapshot,
+    validate_reconciliation_diff_record, validate_reconciliation_run_summary,
 };
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -359,7 +359,9 @@ pub async fn load_reconciliation_diffs(
         .fetch_all(pool)
         .await
         .map_err(|error| classify_query_error("load_reconciliation_diffs", error))?;
-    rows.into_iter().map(decode_reconciliation_diff_row).collect()
+    rows.into_iter()
+        .map(decode_reconciliation_diff_row)
+        .collect()
 }
 
 pub async fn load_latest_exposure_snapshot(
@@ -373,7 +375,9 @@ pub async fn load_latest_exposure_snapshot(
                 .bind(value.trim())
                 .fetch_optional(pool)
                 .await
-                .map_err(|error| classify_query_error("load_latest_exposure_snapshot_market", error))?
+                .map_err(|error| {
+                    classify_query_error("load_latest_exposure_snapshot_market", error)
+                })?
         }
         None => sqlx::query(LOAD_LATEST_EXPOSURE_SNAPSHOT_GLOBAL_SQL)
             .fetch_optional(pool)
@@ -419,9 +423,9 @@ fn decode_reconciliation_run_row(
         .try_get("status")
         .map_err(|error| ReconciliationPersistenceError::row_decode_failure("status", error))?;
     let status = ReconciliationRunStatus::parse(&status).map_err(map_contract_error)?;
-    let reason_code: String = row
-        .try_get("reason_code")
-        .map_err(|error| ReconciliationPersistenceError::row_decode_failure("reason_code", error))?;
+    let reason_code: String = row.try_get("reason_code").map_err(|error| {
+        ReconciliationPersistenceError::row_decode_failure("reason_code", error)
+    })?;
     ReconciliationReasonCode::parse(&reason_code).map_err(map_contract_error)?;
 
     let run = ReconciliationRunSummary {
@@ -466,21 +470,21 @@ fn decode_reconciliation_diff_row(
         .try_get("diff_class")
         .map_err(|error| ReconciliationPersistenceError::row_decode_failure("diff_class", error))?;
     let diff_class = ReconciliationDiffClass::parse(&diff_class).map_err(map_contract_error)?;
-    let reason_code: String = row
-        .try_get("reason_code")
-        .map_err(|error| ReconciliationPersistenceError::row_decode_failure("reason_code", error))?;
+    let reason_code: String = row.try_get("reason_code").map_err(|error| {
+        ReconciliationPersistenceError::row_decode_failure("reason_code", error)
+    })?;
     ReconciliationReasonCode::parse(&reason_code).map_err(map_contract_error)?;
 
     let diff = ReconciliationDiffRecord {
-        diff_id: row
-            .try_get("diff_id")
-            .map_err(|error| ReconciliationPersistenceError::row_decode_failure("diff_id", error))?,
+        diff_id: row.try_get("diff_id").map_err(|error| {
+            ReconciliationPersistenceError::row_decode_failure("diff_id", error)
+        })?,
         run_id: row
             .try_get("run_id")
             .map_err(|error| ReconciliationPersistenceError::row_decode_failure("run_id", error))?,
-        order_id: row
-            .try_get("order_id")
-            .map_err(|error| ReconciliationPersistenceError::row_decode_failure("order_id", error))?,
+        order_id: row.try_get("order_id").map_err(|error| {
+            ReconciliationPersistenceError::row_decode_failure("order_id", error)
+        })?,
         market_id: row.try_get("market_id").map_err(|error| {
             ReconciliationPersistenceError::row_decode_failure("market_id", error)
         })?,
@@ -506,9 +510,9 @@ fn decode_reconciliation_diff_row(
 fn decode_exposure_snapshot_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<ExposureSnapshot, ReconciliationPersistenceError> {
-    let reason_code: String = row
-        .try_get("reason_code")
-        .map_err(|error| ReconciliationPersistenceError::row_decode_failure("reason_code", error))?;
+    let reason_code: String = row.try_get("reason_code").map_err(|error| {
+        ReconciliationPersistenceError::row_decode_failure("reason_code", error)
+    })?;
     ReconciliationReasonCode::parse(&reason_code).map_err(map_contract_error)?;
     let snapshot = ExposureSnapshot {
         snapshot_id: row.try_get("snapshot_id").map_err(|error| {
@@ -599,7 +603,9 @@ mod tests {
             mismatch_rate: 0.01,
             critical_halt: true,
             status: ReconciliationRunStatus::CriticalHalt,
-            reason_code: ReconciliationReasonCode::CriticalMismatch.code().to_string(),
+            reason_code: ReconciliationReasonCode::CriticalMismatch
+                .code()
+                .to_string(),
             evaluated_at_utc: "2026-04-06T00:01:01Z".to_string(),
             correlation_id: "corr-1".to_string(),
         }
@@ -612,7 +618,9 @@ mod tests {
             order_id: "order-1".to_string(),
             market_id: "market-1".to_string(),
             diff_class: ReconciliationDiffClass::LifecycleStateMismatch,
-            reason_code: ReconciliationReasonCode::NonCriticalMismatch.code().to_string(),
+            reason_code: ReconciliationReasonCode::NonCriticalMismatch
+                .code()
+                .to_string(),
             internal_value: Some("live".to_string()),
             venue_value: Some("filled".to_string()),
             observed_at_utc: "2026-04-06T00:00:30Z".to_string(),
@@ -628,7 +636,9 @@ mod tests {
             net_exposure: 1.0,
             gross_exposure: 1.0,
             open_order_count: 1,
-            reason_code: ReconciliationReasonCode::CriticalMismatch.code().to_string(),
+            reason_code: ReconciliationReasonCode::CriticalMismatch
+                .code()
+                .to_string(),
             captured_at_utc: "2026-04-06T00:01:01Z".to_string(),
             correlation_id: "corr-1".to_string(),
         }
@@ -640,7 +650,8 @@ mod tests {
             RECONCILIATION_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS reconciliation_runs")
         );
         assert!(
-            RECONCILIATION_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS reconciliation_diffs")
+            RECONCILIATION_MIGRATION_SQL
+                .contains("CREATE TABLE IF NOT EXISTS reconciliation_diffs")
         );
         assert!(
             RECONCILIATION_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS exposure_snapshots")
@@ -653,9 +664,15 @@ mod tests {
 
     #[test]
     fn migration_enforces_constraints_and_incident_query_indexes() {
-        assert!(RECONCILIATION_MIGRATION_SQL.contains("status IN ('succeeded', 'critical_halt', 'failed')"));
+        assert!(
+            RECONCILIATION_MIGRATION_SQL
+                .contains("status IN ('succeeded', 'critical_halt', 'failed')")
+        );
         assert!(RECONCILIATION_MIGRATION_SQL.contains("ABS(mismatch_rate - (mismatch_count::DOUBLE PRECISION / compared_records::DOUBLE PRECISION))"));
-        assert!(RECONCILIATION_MIGRATION_SQL.contains("UNIQUE (correlation_id, window_started_at_utc, window_ended_at_utc)"));
+        assert!(
+            RECONCILIATION_MIGRATION_SQL
+                .contains("UNIQUE (correlation_id, window_started_at_utc, window_ended_at_utc)")
+        );
         assert!(RECONCILIATION_MIGRATION_SQL.contains("idx_reconciliation_runs_window_lookup"));
         assert!(RECONCILIATION_MIGRATION_SQL.contains("idx_reconciliation_diffs_run_lookup"));
         assert!(RECONCILIATION_MIGRATION_SQL.contains("idx_reconciliation_diffs_correlation_time"));
@@ -687,9 +704,7 @@ mod tests {
 
     #[test]
     fn diff_lookup_query_orders_by_order_and_class() {
-        assert!(
-            LOAD_RECONCILIATION_DIFFS_SQL.contains("ORDER BY order_id ASC, diff_class ASC")
-        );
+        assert!(LOAD_RECONCILIATION_DIFFS_SQL.contains("ORDER BY order_id ASC, diff_class ASC"));
     }
 
     #[test]

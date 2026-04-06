@@ -7,8 +7,9 @@ use domain::reconciliation::{
     authorize_reconciliation_read, build_exposure_snapshot, reconcile_window,
 };
 use persistence::postgres::reconciliation::{
-    ReconciliationPersistenceError, load_latest_exposure_snapshot, load_reconciliation_diffs,
-    load_latest_exposure_snapshot_for_run, load_reconciliation_run, persist_reconciliation_evidence,
+    ReconciliationPersistenceError, load_latest_exposure_snapshot,
+    load_latest_exposure_snapshot_for_run, load_reconciliation_diffs, load_reconciliation_run,
+    persist_reconciliation_evidence,
 };
 use serde::Serialize;
 use sqlx::{PgPool, Row};
@@ -142,8 +143,9 @@ pub trait ReconciliationEvidenceStore: Send + Sync {
         run_id: &'a str,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Option<ReconciliationRunSummary>, ReconciliationRuntimeError>>
-                + Send
+            dyn Future<
+                    Output = Result<Option<ReconciliationRunSummary>, ReconciliationRuntimeError>,
+                > + Send
                 + 'a,
         >,
     >;
@@ -219,18 +221,20 @@ impl InternalTruthProvider for PostgresInternalTruthProvider {
 
             rows.into_iter()
                 .map(|row| {
-                    let lifecycle_state: String = row.try_get("lifecycle_state").map_err(|error| {
-                        ReconciliationRuntimeError::new(
-                            ReconciliationReasonCode::StateHydrationFailed.code(),
-                            format!("unable to decode `lifecycle_state`: {error}"),
-                        )
-                    })?;
-                    let parsed_state = OrderLifecycleState::parse(&lifecycle_state).map_err(|error| {
-                        ReconciliationRuntimeError::new(
-                            ReconciliationReasonCode::StateHydrationFailed.code(),
-                            error.message,
-                        )
-                    })?;
+                    let lifecycle_state: String =
+                        row.try_get("lifecycle_state").map_err(|error| {
+                            ReconciliationRuntimeError::new(
+                                ReconciliationReasonCode::StateHydrationFailed.code(),
+                                format!("unable to decode `lifecycle_state`: {error}"),
+                            )
+                        })?;
+                    let parsed_state =
+                        OrderLifecycleState::parse(&lifecycle_state).map_err(|error| {
+                            ReconciliationRuntimeError::new(
+                                ReconciliationReasonCode::StateHydrationFailed.code(),
+                                error.message,
+                            )
+                        })?;
                     Ok(ReconciliationOrderRecord {
                         order_id: row.try_get("order_id").map_err(|error| {
                             ReconciliationRuntimeError::new(
@@ -339,8 +343,9 @@ impl ReconciliationEvidenceStore for PostgresReconciliationEvidenceStore {
         run_id: &'a str,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Option<ReconciliationRunSummary>, ReconciliationRuntimeError>>
-                + Send
+            dyn Future<
+                    Output = Result<Option<ReconciliationRunSummary>, ReconciliationRuntimeError>,
+                > + Send
                 + 'a,
         >,
     > {
@@ -470,7 +475,9 @@ where
 
         if run_result.summary.critical_halt {
             for diff in &mut run_result.diffs {
-                diff.reason_code = ReconciliationReasonCode::CriticalMismatch.code().to_string();
+                diff.reason_code = ReconciliationReasonCode::CriticalMismatch
+                    .code()
+                    .to_string();
             }
         }
 
@@ -677,7 +684,10 @@ mod tests {
         ) -> Pin<
             Box<
                 dyn Future<
-                        Output = Result<Option<ReconciliationRunSummary>, ReconciliationRuntimeError>,
+                        Output = Result<
+                            Option<ReconciliationRunSummary>,
+                            ReconciliationRuntimeError,
+                        >,
                     > + Send
                     + 'a,
             >,
@@ -698,8 +708,9 @@ mod tests {
             run_id: &'a str,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<Vec<ReconciliationDiffRecord>, ReconciliationRuntimeError>>
-                    + Send
+                dyn Future<
+                        Output = Result<Vec<ReconciliationDiffRecord>, ReconciliationRuntimeError>,
+                    > + Send
                     + 'a,
             >,
         > {
@@ -807,17 +818,24 @@ mod tests {
     #[tokio::test]
     async fn execution_run_is_deterministic_for_identical_inputs() {
         let internal = StaticInternalTruthProvider {
-            records: vec![sample_record("order-1", "live"), sample_record("order-2", "live")],
+            records: vec![
+                sample_record("order-1", "live"),
+                sample_record("order-2", "live"),
+            ],
         };
         let venue = StaticVenueTruthProvider::default();
-        venue.set_records(vec![sample_record("order-1", "live"), sample_record("order-2", "filled")]);
+        venue.set_records(vec![
+            sample_record("order-1", "live"),
+            sample_record("order-2", "filled"),
+        ]);
 
         let runtime_a = ReconciliationRuntime::new(
             internal.clone(),
             venue.clone(),
             InMemoryEvidenceStore::default(),
         );
-        let runtime_b = ReconciliationRuntime::new(internal, venue, InMemoryEvidenceStore::default());
+        let runtime_b =
+            ReconciliationRuntime::new(internal, venue, InMemoryEvidenceStore::default());
         let first = runtime_a
             .execute_reconciliation(sample_request("run-a", "corr-a"))
             .await
@@ -844,7 +862,10 @@ mod tests {
             ],
         };
         let venue = StaticVenueTruthProvider::default();
-        venue.set_records(vec![sample_record("order-1", "live"), sample_record("order-2", "filled")]);
+        venue.set_records(vec![
+            sample_record("order-1", "live"),
+            sample_record("order-2", "filled"),
+        ]);
         let store = InMemoryEvidenceStore::default();
         let runtime = ReconciliationRuntime::new(internal, venue, store);
 
@@ -880,8 +901,7 @@ mod tests {
         };
         let venue = StaticVenueTruthProvider::default();
         venue.set_records(vec![sample_record("order-1", "live")]);
-        let runtime =
-            ReconciliationRuntime::new(internal, venue, InMemoryEvidenceStore::default());
+        let runtime = ReconciliationRuntime::new(internal, venue, InMemoryEvidenceStore::default());
         runtime
             .execute_reconciliation(sample_request("run-authz", "corr-authz"))
             .await

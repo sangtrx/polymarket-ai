@@ -106,3 +106,49 @@
 - `npm run qa:test:story-3-2` ✅
 - `npm test` ✅
 - `npm run qa:test:story-3-2` ✅ (expanded API/E2E critical-flow coverage)
+
+---
+
+## Story
+
+- 3-3-deliver-allocation-policy-and-drift-rebalance-workflows
+
+## Generated Tests
+
+### Domain, Persistence, Governance, and Control API
+
+- [x] `crates/domain/src/allocation.rs` — drift boundary semantics, default threshold behavior, fail-closed stale/unavailable policy state handling, and recommendation status/reason-code contract coverage.
+- [x] `crates/persistence/src/postgres/allocation_policies.rs` — migration/query contract validation for `allocation_policies` and `rebalance_recommendations` with canonical identifiers, status constraints, and deterministic retrieval ordering.
+- [x] `services/governance-service/src/allocation_policy/mod.rs` — role boundary checks, critical increase approval-context handling, recommendation lifecycle transitions (`proposed/pending_approval/approved/executed/denied`), and machine-readable error propagation.
+- [x] `services/control-api/src/routes/mod.rs` — allocation-policy upsert + pending query + recommendation execute/evaluate routes with canonical authorization/audit reuse, enriched `/control/rebalance` rationale payloads, and explicit machine-error envelope mapping.
+
+### Portfolio Engine and Operator Console
+
+- [x] `services/portfolio-engine/src/allocation/mod.rs` — deterministic drift evaluation seam with read-model recommendation outputs and fail-closed stale/unavailable policy behavior (no execution-state mutation ownership leak).
+- [x] `apps/operator-console/src/components/portfolio/{AllocationPolicyForm.tsx,RebalanceRecommendationCard.tsx,PortfolioSummaryCard.tsx}` and `apps/operator-console/src/lib/portfolio/allocation-policy.ts` — progressive-disclosure allocation form, blur validation, risk-impact guidance, recommendation rationale/approval-context evidence rendering, and canonical control-api client contracts.
+- [x] `tests/story-3-3/*.test.mjs` — story-surface contracts validate dashboard composition, progressive disclosure copy, and rationale/evidence visibility.
+- [x] `tests/api/story-3-3*.test.mjs` — API contract checks validate canonical endpoint wiring plus machine-readable status/error handling across `200/202` happy paths and `400/404/500` critical failures (including field-level diagnostics).
+- [x] `tests/e2e/story-3-3*.test.mjs` — E2E contract checks validate route wiring, progressive-disclosure evidence surfaces, and rebalance evaluate → pending-query → execute control-loop affordances.
+
+## Coverage
+
+- Story 3.3 allocation and drift-rebalance contracts covered across backend orchestration, control ingress, runtime seam, and operator-console workflows:
+  - allocation policy mutation with pending/approved approval context,
+  - deterministic drift boundary behavior (`==` in-bounds, `>` recommendation flow),
+  - recommendation lifecycle query + execution surfaces with rationale and next-action guidance,
+  - fail-closed machine-readable errors for validation (`400`), not-found (`404`), and dependency/transport (`500+`) paths,
+  - progressive-disclosure UX with inline blur validation and explicit recommendation guidance text.
+- Automated Story 3.3 regression inventory in this QA refresh: **14 tests passing** (`story: 3`, `api: 7`, `e2e: 4`).
+
+## Execution Result
+
+- `cargo test -p domain allocation::tests::` ✅
+- `cargo test -p persistence postgres::allocation_policies::tests::` ✅
+- `cargo test -p governance-service allocation_policy::tests::` ✅
+- `cargo test -p control-api routes::tests::` ✅
+- `cargo test -p portfolio-engine allocation::tests::` ✅
+- `npm run web:lint` ✅
+- `npm run web:typecheck` ✅
+- `npm run web:build` ✅
+- `node --test tests/story-3-3/*.test.mjs tests/api/story-3-3*.test.mjs tests/e2e/story-3-3*.test.mjs` ✅
+- `npm run --silent qa:test:story-3-3` ✅

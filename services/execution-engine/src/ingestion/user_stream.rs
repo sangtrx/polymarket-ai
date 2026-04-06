@@ -1713,7 +1713,11 @@ mod tests {
         assert_eq!(error.code, UserStreamReasonCode::InvalidPayload.code());
         assert!(error.message.contains("unsupported order status"));
         assert!(store.events().is_empty());
-        assert!(store.cursor_for_partition("order-unsupported-state").is_none());
+        assert!(
+            store
+                .cursor_for_partition("order-unsupported-state")
+                .is_none()
+        );
         assert!(order_lifecycle_port.events().is_empty());
     }
 
@@ -1729,13 +1733,20 @@ mod tests {
         unsupported_type.msg_type = Some(OrderMessageType::Unknown("AUCTION".to_string()));
 
         let error = runtime
-            .process_order_message(&unsupported_type, &rfc3339_from_millis(event_offset + 1_100))
+            .process_order_message(
+                &unsupported_type,
+                &rfc3339_from_millis(event_offset + 1_100),
+            )
             .await
             .expect_err("unsupported venue message type should fail closed");
         assert_eq!(error.code, UserStreamReasonCode::InvalidPayload.code());
         assert!(error.message.contains("unsupported order message type"));
         assert!(store.events().is_empty());
-        assert!(store.cursor_for_partition("order-unsupported-type").is_none());
+        assert!(
+            store
+                .cursor_for_partition("order-unsupported-type")
+                .is_none()
+        );
         assert!(order_lifecycle_port.events().is_empty());
     }
 

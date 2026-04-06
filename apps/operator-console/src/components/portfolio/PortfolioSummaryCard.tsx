@@ -1,3 +1,6 @@
+import { AllocationPolicyForm } from "@/components/portfolio/AllocationPolicyForm";
+import { RebalanceRecommendationCard } from "@/components/portfolio/RebalanceRecommendationCard";
+import { getOperatorConsoleEnv } from "@/lib/env";
 import type { ShellFreshnessSnapshot } from "@/lib/shell/read-models";
 
 export function PortfolioSummaryCard({
@@ -5,6 +8,8 @@ export function PortfolioSummaryCard({
 }: {
   freshness: ShellFreshnessSnapshot;
 }) {
+  const { apiBaseUrl } = getOperatorConsoleEnv();
+
   return (
     <article className="shell-panel shell-panel-grid-item">
       <div className="shell-panel-header">
@@ -34,6 +39,11 @@ export function PortfolioSummaryCard({
         Last update:{" "}
         <time dateTime={freshness.lastUpdatedIso}>{freshness.lastUpdatedIso}</time>
       </p>
+
+      <section className="portfolio-allocation-grid">
+        <AllocationPolicyForm baseUrl={apiBaseUrl} />
+        <RebalanceRecommendationCard baseUrl={apiBaseUrl} />
+      </section>
     </article>
   );
 }

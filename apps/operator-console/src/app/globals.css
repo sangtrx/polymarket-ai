@@ -324,6 +324,172 @@ a {
   padding: var(--foundation-space-1);
 }
 
+.portfolio-allocation-grid {
+  display: grid;
+  gap: var(--foundation-space-2);
+  margin-top: var(--foundation-space-2);
+}
+
+.allocation-policy-form,
+.rebalance-recommendation-card {
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--foundation-radius-16);
+  display: flex;
+  flex-direction: column;
+  gap: var(--foundation-space-1);
+  padding: var(--foundation-space-2);
+}
+
+.allocation-form-grid {
+  display: grid;
+  gap: var(--foundation-space-1);
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+}
+
+.allocation-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.allocation-form-field--wide {
+  grid-column: 1 / -1;
+}
+
+.allocation-form-field--inline {
+  flex: 1;
+}
+
+.allocation-form-input,
+.allocation-form-textarea {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--foundation-radius-8);
+  color: var(--text-primary);
+  font-family: var(--font-family-body), sans-serif;
+  font-size: 0.95rem;
+  min-height: 2.2rem;
+  padding: 0.45rem 0.6rem;
+}
+
+.allocation-form-textarea {
+  resize: vertical;
+}
+
+.allocation-form-checkbox {
+  align-self: flex-start;
+  height: 1.05rem;
+  width: 1.05rem;
+}
+
+.allocation-form-error {
+  color: var(--risk-critical);
+  margin: 0;
+}
+
+.allocation-advanced-toggle {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--foundation-radius-8);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: var(--font-family-body), sans-serif;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.45rem 0.7rem;
+}
+
+.allocation-guidance {
+  border-radius: var(--foundation-radius-12);
+  padding: var(--foundation-space-1);
+}
+
+.allocation-guidance[data-tone="normal"] {
+  background: var(--status-normal-bg);
+  border: 1px solid var(--risk-normal);
+}
+
+.allocation-guidance[data-tone="warning"] {
+  background: var(--status-warning-bg);
+  border: 1px solid var(--risk-warning);
+}
+
+.allocation-guidance[data-tone="critical"] {
+  background: var(--status-critical-bg);
+  border: 1px solid var(--risk-critical);
+}
+
+.allocation-form-submit {
+  background: var(--interactive-primary-bg);
+  border: 1px solid var(--interactive-primary-bg);
+  border-radius: var(--foundation-radius-12);
+  color: var(--interactive-primary-text);
+  cursor: pointer;
+  font-family: var(--font-family-body), sans-serif;
+  font-size: 0.95rem;
+  font-weight: 600;
+  min-height: 2.4rem;
+  padding: 0.5rem 0.9rem;
+}
+
+.allocation-form-submit--secondary {
+  background: var(--interactive-subtle-bg);
+  border-color: var(--interactive-subtle-bg);
+  color: var(--interactive-subtle-text);
+}
+
+.allocation-form-submit:disabled {
+  background: var(--safety-action-gated-bg);
+  border-color: var(--safety-action-gated-border);
+  color: var(--safety-action-gated-text);
+  cursor: not-allowed;
+}
+
+.rebalance-control-row {
+  align-items: flex-end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--foundation-space-1);
+}
+
+.allocation-evidence {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--foundation-radius-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--foundation-space-1);
+  padding: var(--foundation-space-1);
+}
+
+.rebalance-pending-list {
+  display: grid;
+  gap: var(--foundation-space-1);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.rebalance-pending-list li {
+  background: var(--surface-elevated);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--foundation-radius-8);
+  padding: var(--foundation-space-1);
+}
+
+.allocation-form-error-surface {
+  background: var(--status-critical-bg);
+  border: 1px solid var(--state-error-border);
+  border-radius: var(--foundation-radius-12);
+  padding: var(--foundation-space-1);
+}
+
+.allocation-form-error-list {
+  margin: var(--foundation-space-1) 0 0;
+  padding-left: 1rem;
+}
+
 .shell-rail {
   background: var(--shell-rail-bg);
   border: 1px solid var(--shell-rail-border);
@@ -522,6 +688,10 @@ a {
 
 @media (min-width: 80rem) {
   .risk-command-surface {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .portfolio-allocation-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
