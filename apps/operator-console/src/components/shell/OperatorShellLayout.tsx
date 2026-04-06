@@ -1,5 +1,7 @@
 import Link from "next/link";
+import { RiskCommandSurface } from "@/components/risk/RiskCommandSurface";
 import { ShellTopBar } from "@/components/shell/ShellTopBar";
+import type { RiskPostureViewModel } from "@/lib/risk/posture";
 import type { ShellFreshnessSnapshot } from "@/lib/shell/read-models";
 
 const PRIMARY_ROUTES = [
@@ -16,6 +18,7 @@ interface OperatorShellLayoutProps {
   description: string;
   freshness: ShellFreshnessSnapshot;
   p95TargetMs: number;
+  riskPosture: RiskPostureViewModel;
   children: React.ReactNode;
 }
 
@@ -25,6 +28,7 @@ export function OperatorShellLayout({
   description,
   freshness,
   p95TargetMs,
+  riskPosture,
   children,
 }: OperatorShellLayoutProps) {
   return (
@@ -33,13 +37,14 @@ export function OperatorShellLayout({
         Skip to main content
       </a>
 
-      <header>
+      <header className="shell-header-stack">
         <ShellTopBar
           description={description}
           freshness={freshness}
           p95TargetMs={p95TargetMs}
           title={title}
         />
+        <RiskCommandSurface riskPosture={riskPosture} />
       </header>
 
       <div className="shell-frame">

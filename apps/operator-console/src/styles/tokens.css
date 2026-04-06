@@ -68,6 +68,27 @@
   --status-critical-bg: var(--foundation-color-rose-100);
   --status-locked-safe-bg: var(--foundation-color-indigo-100);
 
+  --risk-banner-normal-bg: var(--status-normal-bg);
+  --risk-banner-warning-bg: var(--status-warning-bg);
+  --risk-banner-critical-bg: var(--status-critical-bg);
+  --risk-banner-locked-safe-bg: var(--status-locked-safe-bg);
+  --risk-required-action-bg: var(--surface-muted);
+  --risk-required-action-border: var(--risk-warning);
+
+  --safety-action-danger-bg: var(--risk-critical);
+  --safety-action-danger-text: var(--text-inverse);
+  --safety-action-secondary-bg: var(--interactive-subtle-bg);
+  --safety-action-secondary-text: var(--interactive-subtle-text);
+  --safety-action-tertiary-bg: var(--surface-muted);
+  --safety-action-tertiary-text: var(--text-secondary);
+  --safety-action-gated-bg: var(--surface-muted);
+  --safety-action-gated-border: var(--border-strong);
+  --safety-action-gated-text: var(--text-secondary);
+  --safety-action-progress-bg: var(--status-warning-bg);
+  --safety-action-progress-text: var(--risk-warning);
+  --safety-action-completed-bg: var(--status-normal-bg);
+  --safety-action-completed-text: var(--risk-normal);
+
   --state-loading-border: var(--foundation-color-indigo-500);
   --state-empty-border: var(--foundation-color-slate-200);
   --state-error-border: var(--foundation-color-rose-500);
@@ -106,5 +127,10 @@
     --status-warning-bg: #35290f;
     --status-critical-bg: #3a1520;
     --status-locked-safe-bg: #1b2f61;
+
+    --risk-required-action-bg: var(--surface-elevated);
+    --safety-action-secondary-bg: #253251;
+    --safety-action-secondary-text: #9ab5ff;
+    --safety-action-gated-bg: var(--surface-elevated);
   }
 }

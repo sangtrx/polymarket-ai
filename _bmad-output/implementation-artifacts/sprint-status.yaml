@@ -1,5 +1,5 @@
 # generated: 2026-04-04T17:40:16Z
-# last_updated: 2026-04-06T05:52:45Z
+# last_updated: 2026-04-06T13:59:25Z
 # project: polymarket-ai
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-04T17:40:16Z
-last_updated: 2026-04-06T05:52:45Z
+last_updated: 2026-04-06T13:59:25Z
 project: polymarket-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -63,7 +63,7 @@ development_status:
   epic-2-retrospective: optional
   epic-3: in-progress
   3-1-build-token-first-dashboard-shell-and-navigation-model: done
-  3-2-implement-risk-posture-banner-and-persistent-safety-action-rail: backlog
+  3-2-implement-risk-posture-banner-and-persistent-safety-action-rail: done
   3-3-deliver-allocation-policy-and-drift-rebalance-workflows: backlog
   3-4-build-cost-aware-pnl-and-attribution-surfaces: backlog
   3-5-implement-incident-search-and-causal-timeline-forensics: backlog

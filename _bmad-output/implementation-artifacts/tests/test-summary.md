@@ -74,3 +74,35 @@
 
 - `npm run qa:test:story-3-1` ✅
 - `node --test tests/api/story-3-1*.test.mjs tests/e2e/story-3-1*.test.mjs` ✅
+
+---
+
+## Story
+
+- 3-2-implement-risk-posture-banner-and-persistent-safety-action-rail
+
+## Generated Tests
+
+### Story 3.2 Risk Banner + Safety Rail QA
+
+- [x] `tests/story-3-2/risk-command-surface.story-3-2.test.mjs` — validates persistent shell composition for banner/rail across dashboard/incidents/governance, accessibility semantics (`role="status"`/`aria-live`), resume gating messaging, and tokenized style contract surfaces.
+- [x] `tests/api/story-3-2-safety-control-api.test.mjs` — validates emergency control client contract mapping for accepted/evidence payloads, explicit machine-readable failure propagation (403/503/404 + malformed action-id), canonical action-result endpoint usage, and deterministic risk posture resolver thresholds/gating metadata.
+- [x] `tests/e2e/story-3-2-risk-safety-rail.e2e.test.mjs` — validates root QA command wiring, emergency endpoint string contract alignment, removal of Story 3.1 non-interactive destructive-control placeholder copy, and timestamped confirmation/error evidence + danger-dialog semantics in the safety rail.
+
+## Coverage
+
+- Story 3.2 operator console contracts covered across view-model mapping, control API payload handling, shell integration, and UX/accessibility boundaries:
+  - risk posture states (`normal`, `warning`, `critical`, `locked-safe`) with deterministic read-model fallback mapping and required-action guidance,
+  - persistent privileged safety controls (`pause`, `reduce-only`, `cancel-all`, `resume[gated]`) with explicit hierarchy and confirmation semantics,
+  - canonical emergency control API alignment for `/control/emergency/pause`, `/control/emergency/reduce-only`, `/control/emergency/cancel-all`, and `/control/emergency/actions/{action_id}`,
+  - machine-readable error behavior with no success-shaped fallback, including explicit unauthorized/dependency-unavailable/not-found surfaces and malformed action-id preflight validation,
+  - timestamped action evidence fields (`action_id`, `reason_code`, `resulting_mode`, `correlation_id`, `audit_reference`) plus deterministic stale read-model fallback behavior,
+  - token-driven risk/action styling and responsive/accessibility expectations.
+- Automated Story 3.2 regression inventory in this QA pass: **17 tests passing** (`story-shell: 4`, `api: 8`, `e2e: 5`).
+
+## Execution Result
+
+- `npm run qa:test:story-3-1` ✅
+- `npm run qa:test:story-3-2` ✅
+- `npm test` ✅
+- `npm run qa:test:story-3-2` ✅ (expanded API/E2E critical-flow coverage)

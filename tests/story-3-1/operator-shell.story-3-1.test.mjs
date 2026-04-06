@@ -102,7 +102,7 @@ test("Story 3.1 responsive policy enforces deterministic breakpoints and monitor
   assert.match(globals, /layout-grid-columns-tablet\), minmax\(0, 1fr\)\)/i);
   assert.match(globals, /layout-grid-columns-desktop\), minmax\(0, 1fr\)\)/i);
   assert.match(topBar, /monitor-first/i);
-  assert.match(topBar, /disabled by default/i);
+  assert.match(topBar, /persistent safety action rail/i);
 });
 
 test("Story 3.1 accessibility baseline includes focus and reduced-motion safeguards", () => {

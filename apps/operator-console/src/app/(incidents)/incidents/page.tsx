@@ -2,6 +2,7 @@ import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
+import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
   type ShellSearchParams,
   resolveShellReadModel,
@@ -17,6 +18,7 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
     resolvedSearchParams,
     "incidents.read-model.shell",
   );
+  const riskPosture = resolveRiskPostureViewModel(resolvedSearchParams, stateModel);
 
   const tabViews = [
     {
@@ -29,8 +31,9 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
             <p className="type-eyebrow">Incident context</p>
             <h2 className="type-heading-m">Root-cause queue</h2>
             <p className="type-body text-muted">
-              Route remains read-only while incident data is investigated.
-              Destructive controls remain disabled until Story 3.2.
+              Route remains traceability-first while incident data is
+              investigated. Persistent safety controls are available in the rail
+              for pause/reduce-only/cancel-all interventions.
             </p>
             <p className="type-metadata text-muted">
               Monitor-first policy applies on mobile breakpoints.
@@ -45,15 +48,16 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
       content: (
         <article className="shell-panel">
           <p className="type-eyebrow">Triage flow</p>
-          <h2 className="type-heading-m">Operator guidance</h2>
-          <p className="type-body text-muted">
-            Use this shell route to inspect incident freshness and timeline
-            ordering before any governance escalation. No mutation controls are
-            available in Story 3.1.
-          </p>
-        </article>
-      ),
-    },
+            <h2 className="type-heading-m">Operator guidance</h2>
+            <p className="type-body text-muted">
+              Use this shell route to inspect incident freshness and timeline
+              ordering before any governance escalation. Mutation requests route
+              through explicit safety-rail confirmation and machine-readable
+              outcome evidence.
+            </p>
+          </article>
+        ),
+      },
   ] as const;
 
   return (
@@ -62,6 +66,7 @@ export default async function IncidentsPage({ searchParams }: IncidentsPageProps
       description="Timeline and triage shell surfaces with explicit failure evidence."
       freshness={stateModel.freshness}
       p95TargetMs={stateModel.p95TargetMs}
+      riskPosture={riskPosture}
       title="Incident response workspace"
     >
       {stateModel.dataState === "ready" ? (

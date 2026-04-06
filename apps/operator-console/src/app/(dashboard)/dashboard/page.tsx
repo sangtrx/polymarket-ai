@@ -1,11 +1,11 @@
 import { ExecutionSummaryCard } from "@/components/execution/ExecutionSummaryCard";
 import { GovernanceQueueCard } from "@/components/governance/GovernanceQueueCard";
 import { PortfolioSummaryCard } from "@/components/portfolio/PortfolioSummaryCard";
-import { RiskPostureCard } from "@/components/risk/RiskPostureCard";
 import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
+import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
   type ShellSearchParams,
   resolveShellReadModel,
@@ -21,6 +21,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     resolvedSearchParams,
     "dashboard.read-model.shell",
   );
+  const riskPosture = resolveRiskPostureViewModel(resolvedSearchParams, stateModel);
 
   const tabViews = [
     {
@@ -29,7 +30,6 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
       content: (
         <section className="shell-panel-grid">
           <PortfolioSummaryCard freshness={stateModel.freshness} />
-          <RiskPostureCard freshness={stateModel.freshness} />
           <ExecutionSummaryCard freshness={stateModel.freshness} />
           <GovernanceQueueCard freshness={stateModel.freshness} />
           <IncidentTimelineCard freshness={stateModel.freshness} />
@@ -42,7 +42,6 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
       content: (
         <section className="shell-panel-grid">
           <PortfolioSummaryCard freshness={stateModel.freshness} />
-          <RiskPostureCard freshness={stateModel.freshness} />
           <ExecutionSummaryCard freshness={stateModel.freshness} />
           <article className="shell-panel shell-panel-grid-item">
             <p className="type-eyebrow">NFR1 readiness</p>
@@ -100,6 +99,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
       description="Risk, execution, and governance shell surfaces with deterministic fallback evidence."
       freshness={stateModel.freshness}
       p95TargetMs={stateModel.p95TargetMs}
+      riskPosture={riskPosture}
       title="Portfolio command center"
     >
       {stateModel.dataState === "ready" ? (

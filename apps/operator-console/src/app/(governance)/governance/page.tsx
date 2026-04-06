@@ -2,6 +2,7 @@ import { GovernanceQueueCard } from "@/components/governance/GovernanceQueueCard
 import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
+import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
   type ShellSearchParams,
   resolveShellReadModel,
@@ -19,6 +20,7 @@ export default async function GovernancePage({
     resolvedSearchParams,
     "governance.read-model.shell",
   );
+  const riskPosture = resolveRiskPostureViewModel(resolvedSearchParams, stateModel);
 
   const tabViews = [
     {
@@ -29,10 +31,13 @@ export default async function GovernancePage({
           <GovernanceQueueCard freshness={stateModel.freshness} />
           <article className="shell-panel shell-panel-grid-item">
             <p className="type-eyebrow">Control boundary</p>
-            <h2 className="type-heading-m">No mutation actions in Story 3.1</h2>
+            <h2 className="type-heading-m">
+              Safety actions are governed with explicit evidence
+            </h2>
             <p className="type-body text-muted">
-              Governance surfaces stay non-destructive in this story. Persistent
-              safety rail interactions are explicitly deferred to Story 3.2.
+              Governance surfaces remain approval-centric while emergency safety
+              mutations execute through persistent rail confirmations and audit
+              metadata.
             </p>
           </article>
         </section>
@@ -74,6 +79,7 @@ export default async function GovernancePage({
       description="Approval and audit shell views with explicit non-destructive fallback states."
       freshness={stateModel.freshness}
       p95TargetMs={stateModel.p95TargetMs}
+      riskPosture={riskPosture}
       title="Governance control plane"
     >
       {stateModel.dataState === "ready" ? (

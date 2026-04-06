@@ -101,5 +101,5 @@ test("Story 3.1 e2e top-bar contract preserves freshness and monitor-first polic
   assert.match(topBar, /Source: \{freshness\.source\}/);
   assert.match(topBar, /p95 read-model budget: \{p95TargetMs\}ms/);
   assert.match(topBar, /Mobile policy: monitor-first and action-limited/);
-  assert.match(topBar, /Destructive controls disabled by default/);
+  assert.match(topBar, /Persistent safety action rail is available below/);
 });

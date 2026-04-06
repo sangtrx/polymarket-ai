@@ -48,17 +48,14 @@ export function ShellTopBar({
         </div>
 
         <div>
+          <p className="type-metadata text-muted">Safety response contract</p>
+          <p className="type-body text-muted">
+            Persistent safety action rail is available below with explicit
+            confirmations and machine-readable outcomes.
+          </p>
           <p className="type-metadata text-muted">
             Mobile policy: monitor-first and action-limited
           </p>
-          <button
-            aria-disabled="true"
-            className="shell-action-disabled"
-            disabled
-            type="button"
-          >
-            Destructive controls disabled by default
-          </button>
         </div>
       </div>
     </div>
