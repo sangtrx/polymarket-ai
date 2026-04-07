@@ -49,9 +49,9 @@ use domain::reporting_schedule::{
     parse_utc_timestamp,
 };
 use domain::research::{
-    AlphaHypothesisReasonCode, CounterfactualReplayReasonCode, PromotionDecisionReasonCode,
-    PromotionDecisionState, ShadowEvaluationReasonCode, ValidationGateReasonCode,
-    ValidationWorkflowReasonCode, normalize_research_identifier,
+    AlphaHealthReasonCode, AlphaHypothesisReasonCode, CounterfactualReplayReasonCode,
+    PromotionDecisionReasonCode, PromotionDecisionState, ShadowEvaluationReasonCode,
+    ValidationGateReasonCode, ValidationWorkflowReasonCode, normalize_research_identifier,
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
@@ -107,6 +107,11 @@ use reporting_service::exports::scheduling::{
 use reporting_service::exports::workflows::{
     GetExportArtifactInput, ListExportArtifactsInput, QueryExportJobInput, ReportExportJobEvidence,
     TriggerIncidentExportInput, TriggerOnDemandExportInput,
+};
+use research_gateway::promotion::alpha_health::{
+    AlphaHealthMetricEvidence, AlphaHealthServiceError, AlphaThresholdBreachEvidence,
+    ListAlphaHealthMetricsInput, ListAlphaThresholdBreachesInput, ReadAlphaHealthMetricInput,
+    ReadAlphaThresholdBreachInput, StartAlphaHealthMetricInput,
 };
 use research_gateway::promotion::counterfactual_replay::{
     CounterfactualReplayEvidence, CounterfactualReplayServiceError,
@@ -254,6 +259,22 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/research/shadow-evaluations/{evaluation_id}",
             get(read_shadow_evaluation),
+        )
+        .route(
+            "/control/research/alpha-health-metrics",
+            post(start_alpha_health_metric).get(list_alpha_health_metrics),
+        )
+        .route(
+            "/control/research/alpha-health-metrics/{metric_id}",
+            get(read_alpha_health_metric),
+        )
+        .route(
+            "/control/research/alpha-threshold-breaches",
+            get(list_alpha_threshold_breaches),
+        )
+        .route(
+            "/control/research/alpha-threshold-breaches/{breach_id}",
+            get(read_alpha_threshold_breach),
         )
         .route(
             "/control/research/counterfactual-replay-runs",
@@ -1923,6 +1944,353 @@ pub async fn list_shadow_evaluations(
         evaluations,
         endpoint,
         "shadow_evaluation_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn start_alpha_health_metric(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<AlphaHealthMetricStartPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = "/control/research/alpha-health-metrics".to_string();
+    let authorization = match authorize_alpha_health_mutation(
+        &state,
+        &actor,
+        &endpoint,
+        "alpha_health_metric_start",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return alpha_health_payload_rejection_response(
+                &state,
+                &actor,
+                "alpha_health_metric_start",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_alpha_health_orchestrator
+        .start_alpha_health_metric(StartAlphaHealthMetricInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            alpha_id: payload.alpha_id,
+            rolling_sharpe: payload.rolling_sharpe,
+            rolling_hit_rate: payload.rolling_hit_rate,
+            rolling_drawdown: payload.rolling_drawdown,
+            stability_score: payload.stability_score,
+            windows: payload.windows,
+            thresholds: payload.thresholds,
+            correlation_id: effective_correlation_id.clone(),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return alpha_health_service_error_response(
+                &state,
+                error,
+                "alpha_health_metric_start",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    alpha_health_metric_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "alpha_health_metric_start",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_alpha_health_metric(
+    State(state): State<ControlApiState>,
+    Path(metric_id): Path<String>,
+    Query(query): Query<AlphaHealthMetricReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/alpha-health-metrics/{metric_id}");
+    let authorization = match authorize_alpha_health_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "alpha_health_metric_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_alpha_health_orchestrator
+        .read_alpha_health_metric(ReadAlphaHealthMetricInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            metric_id,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return alpha_health_service_error_response(
+                &state,
+                error,
+                "alpha_health_metric_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    alpha_health_metric_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "alpha_health_metric_read",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn list_alpha_health_metrics(
+    State(state): State<ControlApiState>,
+    query: Result<Query<AlphaHealthMetricsQuery>, QueryRejection>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/alpha-health-metrics".to_string();
+    let authorization = match authorize_alpha_health_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "alpha_health_metric_list",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return alpha_health_query_rejection_response(
+                &state,
+                &actor,
+                "alpha_health_metric_list",
+                authorization.timestamp_utc,
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let alpha_id = query.alpha_id.clone();
+    let canonical_alpha_id = normalize_research_identifier(&alpha_id);
+
+    let metrics = match state
+        .research_alpha_health_orchestrator
+        .list_alpha_health_metrics(ListAlphaHealthMetricsInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            alpha_id,
+            limit: query.limit,
+            recorded_after_utc: query.recorded_after_utc,
+            recorded_before_utc: query.recorded_before_utc,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(metrics) => metrics,
+        Err(error) => {
+            return alpha_health_service_error_response(
+                &state,
+                error,
+                "alpha_health_metric_list",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id.clone(),
+            );
+        }
+    };
+
+    alpha_health_metric_list_response(
+        &state,
+        &actor,
+        canonical_alpha_id,
+        metrics,
+        endpoint,
+        "alpha_health_metric_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_alpha_threshold_breach(
+    State(state): State<ControlApiState>,
+    Path(breach_id): Path<String>,
+    Query(query): Query<AlphaThresholdBreachReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/alpha-threshold-breaches/{breach_id}");
+    let authorization = match authorize_alpha_health_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "alpha_threshold_breach_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_alpha_health_orchestrator
+        .read_alpha_threshold_breach(ReadAlphaThresholdBreachInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            breach_id,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return alpha_health_service_error_response(
+                &state,
+                error,
+                "alpha_threshold_breach_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    alpha_threshold_breach_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "alpha_threshold_breach_read",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn list_alpha_threshold_breaches(
+    State(state): State<ControlApiState>,
+    query: Result<Query<AlphaThresholdBreachesQuery>, QueryRejection>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/alpha-threshold-breaches".to_string();
+    let authorization = match authorize_alpha_health_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "alpha_threshold_breach_list",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return alpha_health_query_rejection_response(
+                &state,
+                &actor,
+                "alpha_threshold_breach_list",
+                authorization.timestamp_utc,
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let alpha_id = query.alpha_id.clone();
+    let canonical_alpha_id = normalize_research_identifier(&alpha_id);
+
+    let breaches = match state
+        .research_alpha_health_orchestrator
+        .list_alpha_threshold_breaches(ListAlphaThresholdBreachesInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            alpha_id,
+            limit: query.limit,
+            breached_after_utc: query.breached_after_utc,
+            breached_before_utc: query.breached_before_utc,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(breaches) => breaches,
+        Err(error) => {
+            return alpha_health_service_error_response(
+                &state,
+                error,
+                "alpha_threshold_breach_list",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id.clone(),
+            );
+        }
+    };
+
+    alpha_threshold_breach_list_response(
+        &state,
+        &actor,
+        canonical_alpha_id,
+        breaches,
+        endpoint,
+        "alpha_threshold_breach_list",
         effective_correlation_id,
         authorization.timestamp_utc,
     )
@@ -6901,6 +7269,113 @@ fn authorize_promotion_decision_read(
     )))
 }
 
+fn authorize_alpha_health_mutation(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ExecuteControlPlaneAction);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(alpha_health_service_error_response(
+        state,
+        AlphaHealthServiceError {
+            code: AlphaHealthReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
+fn authorize_alpha_health_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(alpha_health_service_error_response(
+        state,
+        AlphaHealthServiceError {
+            code: AlphaHealthReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
 fn authorize_counterfactual_replay_mutation(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -9375,6 +9850,500 @@ fn shadow_simulation_outcome_to_item(
         simulation_reason_code: outcome.simulation_reason_code,
         decision_timestamp_utc: outcome.decision_timestamp_utc,
         simulated_at_utc: outcome.simulated_at_utc,
+    }
+}
+
+fn alpha_health_metric_detail_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: AlphaHealthMetricEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let correlation_id = evidence.metric.correlation_id.clone();
+    let reason_code = evidence.reason_code.clone();
+    let metric = evidence.metric;
+    let breaches = evidence
+        .breaches
+        .into_iter()
+        .map(alpha_threshold_breach_to_item)
+        .collect::<Vec<_>>();
+    let metric_id = metric.metric_id.clone();
+    let alpha_id = metric.alpha_id.clone();
+    let breach_count = breaches.len();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "metric_id": metric_id,
+            "alpha_id": alpha_id,
+            "breach_count": breach_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    let status = if http_method == "POST" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        axum::Json(AlphaHealthEnvelope {
+            data: Some(AlphaHealthData::Metric {
+                metric: alpha_health_metric_to_item(metric),
+                breaches,
+                reason_code: evidence.reason_code,
+            }),
+            meta: AlphaHealthMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_health_metric_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    alpha_id: String,
+    metrics: Vec<domain::research::AlphaHealthMetricRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let metric_count = metrics.len();
+    let reason_code = AlphaHealthReasonCode::MetricListed.code().to_string();
+    let metric_items = metrics
+        .into_iter()
+        .map(alpha_health_metric_to_item)
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "alpha_id": alpha_id,
+            "metric_count": metric_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(AlphaHealthEnvelope {
+            data: Some(AlphaHealthData::Metrics {
+                alpha_id,
+                metrics: metric_items,
+            }),
+            meta: AlphaHealthMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_threshold_breach_detail_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: AlphaThresholdBreachEvidence,
+    endpoint: String,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let correlation_id = evidence.breach.correlation_id.clone();
+    let reason_code = evidence.reason_code.clone();
+    let breach = evidence.breach;
+    let breach_id = breach.breach_id.clone();
+    let alpha_id = breach.alpha_id.clone();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "breach_id": breach_id,
+            "alpha_id": alpha_id,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(AlphaHealthEnvelope {
+            data: Some(AlphaHealthData::Breach {
+                breach: alpha_threshold_breach_to_item(breach),
+                reason_code: evidence.reason_code,
+            }),
+            meta: AlphaHealthMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_threshold_breach_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    alpha_id: String,
+    breaches: Vec<domain::research::AlphaThresholdBreachRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let breach_count = breaches.len();
+    let reason_code = AlphaHealthReasonCode::ThresholdBreachListed
+        .code()
+        .to_string();
+    let breach_items = breaches
+        .into_iter()
+        .map(alpha_threshold_breach_to_item)
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "alpha_id": alpha_id,
+            "breach_count": breach_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(AlphaHealthEnvelope {
+            data: Some(AlphaHealthData::Breaches {
+                alpha_id,
+                breaches: breach_items,
+            }),
+            meta: AlphaHealthMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_health_payload_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: JsonRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    alpha_health_service_error_response(
+        state,
+        AlphaHealthServiceError {
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: format!("invalid alpha health payload: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn alpha_health_query_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: QueryRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    alpha_health_service_error_response(
+        state,
+        AlphaHealthServiceError {
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: format!("invalid alpha health query: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn alpha_health_service_error_response(
+    state: &ControlApiState,
+    error: AlphaHealthServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+    correlation_id: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") || action.ends_with("_list") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "error_code": error.code,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == AlphaHealthReasonCode::UnauthorizedRole.code() {
+        Some(AlphaHealthSecuritySignal {
+            name: if action.ends_with("_read") || action.ends_with("_list") {
+                "unauthorized_alpha_health_read_attempt_v1"
+            } else {
+                "unauthorized_alpha_health_mutation_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        alpha_health_service_error_status(error.code),
+        axum::Json(AlphaHealthEnvelope::<AlphaHealthData> {
+            data: None,
+            meta: AlphaHealthMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(AlphaHealthEnvelopeError {
+                error_code: error.code.to_string(),
+                message: error.message,
+                field_errors: error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlphaHealthFieldError {
+                        field: issue.field,
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_health_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == AlphaHealthReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == AlphaHealthReasonCode::UnauthorizedRole.code() => StatusCode::FORBIDDEN,
+        "alpha_health_constraint_violation"
+        | "alpha_health_metric_constraint_violation"
+        | "alpha_threshold_breach_constraint_violation" => {
+            StatusCode::CONFLICT
+        }
+        code if code == AlphaHealthReasonCode::MetricNotFound.code()
+            || code == AlphaHealthReasonCode::BreachNotFound.code() =>
+        {
+            StatusCode::NOT_FOUND
+        }
+        code if code == AlphaHealthReasonCode::DependencyUnavailable.code()
+            || code == AlphaHealthReasonCode::StateUnavailable.code()
+            || code == AlphaHealthReasonCode::PersistenceUnavailable.code()
+            || code == "alpha_health_metric_query_failed"
+            || code == "alpha_health_metric_row_decode_failed"
+            || code == "alpha_threshold_breach_query_failed"
+            || code == "alpha_threshold_breach_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn alpha_health_metric_to_item(metric: domain::research::AlphaHealthMetricRecord) -> AlphaHealthMetricItem {
+    AlphaHealthMetricItem {
+        metric_id: metric.metric_id,
+        alpha_id: metric.alpha_id,
+        rolling_sharpe: metric.rolling_sharpe,
+        rolling_hit_rate: metric.rolling_hit_rate,
+        rolling_drawdown: metric.rolling_drawdown,
+        stability_score: metric.stability_score,
+        windows: metric
+            .windows
+            .into_iter()
+            .map(alpha_health_window_to_item)
+            .collect(),
+        reason_code: metric.reason_code,
+        actor_id: metric.actor_id,
+        correlation_id: metric.correlation_id,
+        recorded_at_utc: metric.recorded_at_utc,
+    }
+}
+
+fn alpha_health_window_to_item(
+    window: domain::research::AlphaHealthAttributionWindowMetrics,
+) -> AlphaHealthWindowItem {
+    AlphaHealthWindowItem {
+        window: window.window.as_str().to_string(),
+        net_pnl: window.net_pnl,
+        rolling_sharpe: window.rolling_sharpe,
+        rolling_hit_rate: window.rolling_hit_rate,
+        rolling_drawdown: window.rolling_drawdown,
+        stability_score: window.stability_score,
+    }
+}
+
+fn alpha_threshold_breach_to_item(
+    breach: domain::research::AlphaThresholdBreachRecord,
+) -> AlphaThresholdBreachItem {
+    AlphaThresholdBreachItem {
+        breach_id: breach.breach_id,
+        metric_id: breach.metric_id,
+        alpha_id: breach.alpha_id,
+        metric_key: breach.metric_key.as_str().to_string(),
+        comparator: breach.comparator.as_str().to_string(),
+        observed_value: breach.observed_value,
+        threshold_value: breach.threshold_value,
+        breach_reason: breach.breach_reason,
+        reason_code: breach.reason_code,
+        actor_id: breach.actor_id,
+        correlation_id: breach.correlation_id,
+        breached_at_utc: breach.breached_at_utc,
     }
 }
 
@@ -12971,6 +13940,57 @@ pub struct ShadowEvaluationReadQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AlphaHealthMetricStartPayload {
+    pub alpha_id: String,
+    pub rolling_sharpe: f64,
+    pub rolling_hit_rate: f64,
+    pub rolling_drawdown: f64,
+    pub stability_score: f64,
+    pub windows: Vec<domain::research::AlphaHealthAttributionWindowMetrics>,
+    pub thresholds: Vec<domain::research::AlphaHealthThresholdDefinition>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlphaHealthMetricsQuery {
+    pub alpha_id: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub recorded_after_utc: Option<String>,
+    #[serde(default)]
+    pub recorded_before_utc: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AlphaHealthMetricReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlphaThresholdBreachesQuery {
+    pub alpha_id: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub breached_after_utc: Option<String>,
+    #[serde(default)]
+    pub breached_before_utc: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AlphaThresholdBreachReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CounterfactualReplayStartPayload {
     pub candidate_id: String,
     pub validation_run_id: String,
@@ -14183,6 +15203,113 @@ pub struct ShadowSimulationOutcomeItem {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AlphaHealthEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: AlphaHealthMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AlphaHealthEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AlphaHealthData {
+    Metric {
+        metric: AlphaHealthMetricItem,
+        breaches: Vec<AlphaThresholdBreachItem>,
+        reason_code: String,
+    },
+    Metrics {
+        alpha_id: String,
+        metrics: Vec<AlphaHealthMetricItem>,
+    },
+    Breach {
+        breach: AlphaThresholdBreachItem,
+        reason_code: String,
+    },
+    Breaches {
+        alpha_id: String,
+        breaches: Vec<AlphaThresholdBreachItem>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHealthMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHealthEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<AlphaHealthFieldError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<AlphaHealthSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHealthFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHealthSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHealthMetricItem {
+    pub metric_id: String,
+    pub alpha_id: String,
+    pub rolling_sharpe: f64,
+    pub rolling_hit_rate: f64,
+    pub rolling_drawdown: f64,
+    pub stability_score: f64,
+    pub windows: Vec<AlphaHealthWindowItem>,
+    pub reason_code: String,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub recorded_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHealthWindowItem {
+    pub window: String,
+    pub net_pnl: f64,
+    pub rolling_sharpe: f64,
+    pub rolling_hit_rate: f64,
+    pub rolling_drawdown: f64,
+    pub stability_score: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaThresholdBreachItem {
+    pub breach_id: String,
+    pub metric_id: String,
+    pub alpha_id: String,
+    pub metric_key: String,
+    pub comparator: String,
+    pub observed_value: f64,
+    pub threshold_value: f64,
+    pub breach_reason: String,
+    pub reason_code: String,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub breached_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CounterfactualReplayEnvelope<T: Serialize> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
@@ -14899,16 +16026,19 @@ mod tests {
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::research::{
-        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, CounterfactualReplayGateOutcome,
-        CounterfactualReplayReasonCode, CounterfactualReplayRunRecord,
-        CounterfactualReplayRunState, CounterfactualReplayScenarioKind,
-        PromotionDecisionReasonCode, PromotionDecisionState, ShadowEvaluationReasonCode,
-        ShadowEvaluationRecord, ShadowEvaluationState, ShadowSimulationDecisionSide,
-        ShadowSimulationOutcome, ShadowSimulationReasonCode, ValidationDiagnosticsPayload,
-        ValidationGateComparator, ValidationGateReasonCode, ValidationGateValidationIssue,
-        ValidationMetricDelta, ValidationStageComparison, ValidationWorkflowArtifactRecord,
-        ValidationWorkflowReasonCode, ValidationWorkflowRunRecord, ValidationWorkflowRunState,
-        ValidationWorkflowStage, ValidationWorkflowStageOutcome, ValidationWorkflowValidationIssue,
+        AlphaHealthAttributionWindowMetrics, AlphaHealthMetricKey, AlphaHealthMetricRecord,
+        AlphaHealthMetricWindow, AlphaHealthReasonCode,
+        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, AlphaThresholdBreachRecord,
+        CounterfactualReplayGateOutcome, CounterfactualReplayReasonCode,
+        CounterfactualReplayRunRecord, CounterfactualReplayRunState,
+        CounterfactualReplayScenarioKind, PromotionDecisionReasonCode, PromotionDecisionState,
+        ShadowEvaluationReasonCode, ShadowEvaluationRecord, ShadowEvaluationState,
+        ShadowSimulationDecisionSide, ShadowSimulationOutcome, ShadowSimulationReasonCode,
+        ValidationDiagnosticsPayload, ValidationGateComparator, ValidationGateReasonCode,
+        ValidationGateValidationIssue, ValidationMetricDelta, ValidationStageComparison,
+        ValidationWorkflowArtifactRecord, ValidationWorkflowReasonCode, ValidationWorkflowRunRecord,
+        ValidationWorkflowRunState, ValidationWorkflowStage, ValidationWorkflowStageOutcome,
+        ValidationWorkflowValidationIssue,
     };
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
@@ -14960,6 +16090,11 @@ mod tests {
         DispatchWeeklyExportInput, GetExportArtifactInput, ListExportArtifactsInput,
         QueryExportJobInput, ReportExportJobEvidence, ReportExportOrchestrator,
         ReportExportWorkflowError, TriggerIncidentExportInput, TriggerOnDemandExportInput,
+    };
+    use research_gateway::promotion::alpha_health::{
+        AlphaHealthMetricEvidence, AlphaHealthOrchestrator, AlphaHealthServiceError,
+        AlphaThresholdBreachEvidence, ListAlphaHealthMetricsInput, ListAlphaThresholdBreachesInput,
+        ReadAlphaHealthMetricInput, ReadAlphaThresholdBreachInput, StartAlphaHealthMetricInput,
     };
     use research_gateway::promotion::counterfactual_replay::{
         CounterfactualReplayEvidence, CounterfactualReplayOrchestrator,
@@ -16385,6 +17520,234 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct StubAlphaHealthOrchestrator {
+        start_error: Option<(&'static str, &'static str)>,
+        read_metric_error: Option<(&'static str, &'static str)>,
+        list_metrics_error: Option<(&'static str, &'static str)>,
+        read_breach_error: Option<(&'static str, &'static str)>,
+        list_breaches_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl StubAlphaHealthOrchestrator {
+        fn service_error(code: &'static str, message: &'static str) -> AlphaHealthServiceError {
+            AlphaHealthServiceError {
+                code,
+                message: message.to_string(),
+                field_errors: if code == AlphaHealthReasonCode::InvalidPayload.code() {
+                    vec![domain::research::AlphaHealthValidationIssue {
+                        field: "alpha_id".to_string(),
+                        code: AlphaHealthReasonCode::InvalidPayload.code(),
+                        message: "alpha_id cannot be blank".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+
+        fn sample_windows() -> Vec<AlphaHealthAttributionWindowMetrics> {
+            vec![
+                AlphaHealthAttributionWindowMetrics {
+                    window: AlphaHealthMetricWindow::OneHour,
+                    net_pnl: 38.2,
+                    rolling_sharpe: 1.19,
+                    rolling_hit_rate: 0.57,
+                    rolling_drawdown: 0.08,
+                    stability_score: 0.91,
+                },
+                AlphaHealthAttributionWindowMetrics {
+                    window: AlphaHealthMetricWindow::TwentyFourHours,
+                    net_pnl: 112.4,
+                    rolling_sharpe: 1.15,
+                    rolling_hit_rate: 0.56,
+                    rolling_drawdown: 0.09,
+                    stability_score: 0.89,
+                },
+                AlphaHealthAttributionWindowMetrics {
+                    window: AlphaHealthMetricWindow::ThirtyDays,
+                    net_pnl: 684.0,
+                    rolling_sharpe: 1.08,
+                    rolling_hit_rate: 0.55,
+                    rolling_drawdown: 0.1,
+                    stability_score: 0.87,
+                },
+            ]
+        }
+
+        fn sample_metric(
+            metric_id: String,
+            alpha_id: String,
+            reason_code: String,
+            correlation_id: String,
+            timestamp_utc: String,
+        ) -> AlphaHealthMetricRecord {
+            AlphaHealthMetricRecord {
+                metric_id,
+                alpha_id,
+                rolling_sharpe: 1.19,
+                rolling_hit_rate: 0.57,
+                rolling_drawdown: 0.08,
+                stability_score: 0.91,
+                windows: Self::sample_windows(),
+                reason_code,
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                recorded_at_utc: timestamp_utc,
+            }
+        }
+
+        fn sample_breach(
+            breach_id: String,
+            metric_id: String,
+            alpha_id: String,
+            reason_code: String,
+            correlation_id: String,
+            timestamp_utc: String,
+        ) -> AlphaThresholdBreachRecord {
+            AlphaThresholdBreachRecord {
+                breach_id,
+                metric_id,
+                alpha_id,
+                metric_key: AlphaHealthMetricKey::RollingDrawdown,
+                comparator: ValidationGateComparator::Gt,
+                observed_value: 0.11,
+                threshold_value: 0.1,
+                breach_reason: "rolling_drawdown exceeded configured ceiling".to_string(),
+                reason_code,
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                breached_at_utc: timestamp_utc,
+            }
+        }
+    }
+
+    impl AlphaHealthOrchestrator for StubAlphaHealthOrchestrator {
+        fn start_alpha_health_metric(
+            &self,
+            input: StartAlphaHealthMetricInput,
+        ) -> Result<AlphaHealthMetricEvidence, AlphaHealthServiceError> {
+            if let Some((code, message)) = self.start_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            let metric = Self::sample_metric(
+                "alpha::mean-reversion::1712457600000000000".to_string(),
+                input.alpha_id,
+                AlphaHealthReasonCode::MetricRecorded.code().to_string(),
+                input.correlation_id.clone(),
+                input.requested_at_utc.clone(),
+            );
+            let breach = Self::sample_breach(
+                "alpha::mean-reversion::rolling_drawdown::1712457600000000000".to_string(),
+                metric.metric_id.clone(),
+                metric.alpha_id.clone(),
+                AlphaHealthReasonCode::ThresholdBreachDetected
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.requested_at_utc,
+            );
+            Ok(AlphaHealthMetricEvidence {
+                metric,
+                breaches: vec![breach],
+                reason_code: AlphaHealthReasonCode::MetricRecorded.code().to_string(),
+                alert_emitted: true,
+            })
+        }
+
+        fn read_alpha_health_metric(
+            &self,
+            input: ReadAlphaHealthMetricInput,
+        ) -> Result<AlphaHealthMetricEvidence, AlphaHealthServiceError> {
+            if let Some((code, message)) = self.read_metric_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            let metric = Self::sample_metric(
+                input.metric_id,
+                "alpha::mean-reversion".to_string(),
+                AlphaHealthReasonCode::MetricRead.code().to_string(),
+                input.correlation_id.clone(),
+                input.queried_at_utc.clone(),
+            );
+            let breach = Self::sample_breach(
+                "alpha::mean-reversion::rolling_drawdown::1712457600000000000".to_string(),
+                metric.metric_id.clone(),
+                metric.alpha_id.clone(),
+                AlphaHealthReasonCode::ThresholdBreachDetected
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            );
+            Ok(AlphaHealthMetricEvidence {
+                metric,
+                breaches: vec![breach],
+                reason_code: AlphaHealthReasonCode::MetricRead.code().to_string(),
+                alert_emitted: true,
+            })
+        }
+
+        fn list_alpha_health_metrics(
+            &self,
+            input: ListAlphaHealthMetricsInput,
+        ) -> Result<Vec<AlphaHealthMetricRecord>, AlphaHealthServiceError> {
+            if let Some((code, message)) = self.list_metrics_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            Ok(vec![Self::sample_metric(
+                "alpha::mean-reversion::1712457600000000000".to_string(),
+                input.alpha_id,
+                AlphaHealthReasonCode::MetricListed.code().to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            )])
+        }
+
+        fn read_alpha_threshold_breach(
+            &self,
+            input: ReadAlphaThresholdBreachInput,
+        ) -> Result<AlphaThresholdBreachEvidence, AlphaHealthServiceError> {
+            if let Some((code, message)) = self.read_breach_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            Ok(AlphaThresholdBreachEvidence {
+                breach: Self::sample_breach(
+                    input.breach_id,
+                    "alpha::mean-reversion::1712457600000000000".to_string(),
+                    "alpha::mean-reversion".to_string(),
+                    AlphaHealthReasonCode::ThresholdBreachRead.code().to_string(),
+                    input.correlation_id.clone(),
+                    input.queried_at_utc,
+                ),
+                reason_code: AlphaHealthReasonCode::ThresholdBreachRead
+                    .code()
+                    .to_string(),
+            })
+        }
+
+        fn list_alpha_threshold_breaches(
+            &self,
+            input: ListAlphaThresholdBreachesInput,
+        ) -> Result<Vec<AlphaThresholdBreachRecord>, AlphaHealthServiceError> {
+            if let Some((code, message)) = self.list_breaches_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            Ok(vec![Self::sample_breach(
+                "alpha::mean-reversion::rolling_drawdown::1712457600000000000".to_string(),
+                "alpha::mean-reversion::1712457600000000000".to_string(),
+                input.alpha_id,
+                AlphaHealthReasonCode::ThresholdBreachListed.code().to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            )])
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct StubCounterfactualReplayOrchestrator {
         start_error: Option<(&'static str, &'static str)>,
         read_error: Option<(&'static str, &'static str)>,
@@ -17631,6 +18994,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_research_shadow_mode_orchestrator(shadow_mode_orchestrator),
+        )
+    }
+
+    fn test_app_with_alpha_health_orchestrator(
+        alpha_health_orchestrator: Arc<dyn AlphaHealthOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_alpha_health_orchestrator(alpha_health_orchestrator),
         )
     }
 
@@ -22151,6 +23536,400 @@ mod tests {
         assert_eq!(
             read_payload["error"]["security_signal"]["name"],
             "unauthorized_shadow_evaluation_read_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpha_health_metric_start_route_returns_data_meta_error_envelope() {
+        let app = test_app_with_alpha_health_orchestrator(Arc::new(
+            StubAlphaHealthOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-health-metrics")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-health-start-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "alpha_id":"alpha::mean-reversion",
+                            "rolling_sharpe":1.19,
+                            "rolling_hit_rate":0.57,
+                            "rolling_drawdown":0.08,
+                            "stability_score":0.91,
+                            "windows":[
+                                {"window":"one_hour","net_pnl":38.2,"rolling_sharpe":1.19,"rolling_hit_rate":0.57,"rolling_drawdown":0.08,"stability_score":0.91},
+                                {"window":"twenty_four_hours","net_pnl":112.4,"rolling_sharpe":1.15,"rolling_hit_rate":0.56,"rolling_drawdown":0.09,"stability_score":0.89},
+                                {"window":"thirty_days","net_pnl":684.0,"rolling_sharpe":1.08,"rolling_hit_rate":0.55,"rolling_drawdown":0.10,"stability_score":0.87}
+                            ],
+                            "thresholds":[
+                                {"metric_key":"rolling_sharpe","comparator":"lt","threshold_value":1.0},
+                                {"metric_key":"rolling_hit_rate","comparator":"lt","threshold_value":0.52},
+                                {"metric_key":"rolling_drawdown","comparator":"gt","threshold_value":0.10},
+                                {"metric_key":"stability_score","comparator":"lt","threshold_value":0.85}
+                            ]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "metric");
+        assert_eq!(
+            payload["data"]["metric"]["metric_id"],
+            "alpha::mean-reversion::1712457600000000000"
+        );
+        assert_eq!(
+            payload["data"]["breaches"][0]["breach_reason"],
+            "rolling_drawdown exceeded configured ceiling"
+        );
+        assert_eq!(payload["meta"]["action"], "alpha_health_metric_start");
+        assert!(payload["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn alpha_health_read_list_routes_return_envelope_shapes() {
+        let app = test_app_with_alpha_health_orchestrator(Arc::new(
+            StubAlphaHealthOrchestrator::default(),
+        ));
+
+        let metric_read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-health-metrics/alpha::mean-reversion::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-health-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(metric_read_response.status(), StatusCode::OK);
+        let metric_read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(metric_read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(metric_read_payload["data"]["kind"], "metric");
+        assert_eq!(metric_read_payload["meta"]["action"], "alpha_health_metric_read");
+
+        let metric_list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-health-metrics?alpha_id=%20Alpha::Mean-Reversion%20&limit=1")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-health-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(metric_list_response.status(), StatusCode::OK);
+        let metric_list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(metric_list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(metric_list_payload["data"]["kind"], "metrics");
+        assert_eq!(metric_list_payload["data"]["alpha_id"], "alpha::mean-reversion");
+        assert_eq!(metric_list_payload["meta"]["action"], "alpha_health_metric_list");
+
+        let breach_read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-threshold-breaches/alpha::mean-reversion::rolling_drawdown::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-breach-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(breach_read_response.status(), StatusCode::OK);
+        let breach_read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(breach_read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(breach_read_payload["data"]["kind"], "breach");
+        assert_eq!(breach_read_payload["meta"]["action"], "alpha_threshold_breach_read");
+
+        let breach_list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-threshold-breaches?alpha_id=%20Alpha::Mean-Reversion%20&limit=1")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-breach-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(breach_list_response.status(), StatusCode::OK);
+        let breach_list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(breach_list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(breach_list_payload["data"]["kind"], "breaches");
+        assert_eq!(breach_list_payload["data"]["alpha_id"], "alpha::mean-reversion");
+        assert_eq!(
+            breach_list_payload["meta"]["action"],
+            "alpha_threshold_breach_list"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpha_health_start_route_maps_json_rejection_to_bad_request_envelope() {
+        let app = test_app_with_alpha_health_orchestrator(Arc::new(
+            StubAlphaHealthOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-health-metrics")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-health-start-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "alpha_id":123,
+                            "rolling_sharpe":1.19,
+                            "rolling_hit_rate":0.57,
+                            "rolling_drawdown":0.08,
+                            "stability_score":0.91,
+                            "windows":[],
+                            "thresholds":[]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error"]["error_code"], "alpha_health_invalid_payload");
+        assert_eq!(payload["meta"]["action"], "alpha_health_metric_start");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn alpha_health_list_route_maps_query_rejection_to_bad_request_envelope() {
+        let app = test_app_with_alpha_health_orchestrator(Arc::new(
+            StubAlphaHealthOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-health-metrics?alpha_id=alpha::mean-reversion&limit=abc")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-health-list-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error"]["error_code"], "alpha_health_invalid_payload");
+        assert_eq!(payload["meta"]["action"], "alpha_health_metric_list");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn alpha_health_service_errors_emit_unauthorized_security_signals() {
+        let mutation_app = test_app_with_alpha_health_orchestrator(Arc::new(
+            StubAlphaHealthOrchestrator {
+                start_error: Some((
+                    AlphaHealthReasonCode::UnauthorizedRole.code(),
+                    "forbidden alpha health mutation",
+                )),
+                ..Default::default()
+            },
+        ));
+        let mutation_response = mutation_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-health-metrics")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-health-start-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "alpha_id":"alpha::mean-reversion",
+                            "rolling_sharpe":1.19,
+                            "rolling_hit_rate":0.57,
+                            "rolling_drawdown":0.08,
+                            "stability_score":0.91,
+                            "windows":[],
+                            "thresholds":[]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        let mutation_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(mutation_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            mutation_payload["error"]["security_signal"]["name"],
+            "unauthorized_alpha_health_mutation_attempt_v1"
+        );
+
+        let read_app = test_app_with_alpha_health_orchestrator(Arc::new(
+            StubAlphaHealthOrchestrator {
+                read_metric_error: Some((
+                    AlphaHealthReasonCode::UnauthorizedRole.code(),
+                    "forbidden alpha health read",
+                )),
+                ..Default::default()
+            },
+        ));
+        let read_response = read_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-health-metrics/alpha::mean-reversion::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-health-read-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::FORBIDDEN);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            read_payload["error"]["security_signal"]["name"],
+            "unauthorized_alpha_health_read_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpha_health_dependency_unavailable_maps_to_service_unavailable() {
+        let app = test_app_with_alpha_health_orchestrator(Arc::new(StubAlphaHealthOrchestrator {
+            list_breaches_error: Some((
+                AlphaHealthReasonCode::DependencyUnavailable.code(),
+                "live context is unavailable",
+            )),
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-threshold-breaches?alpha_id=alpha::mean-reversion&limit=1")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-breach-list-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "alpha_health_dependency_unavailable"
+        );
+        assert_eq!(payload["meta"]["action"], "alpha_threshold_breach_list");
+    }
+
+    #[test]
+    fn alpha_health_status_mapping_covers_not_found_and_constraint_codes() {
+        assert_eq!(
+            alpha_health_service_error_status(AlphaHealthReasonCode::MetricNotFound.code()),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            alpha_health_service_error_status(AlphaHealthReasonCode::BreachNotFound.code()),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            alpha_health_service_error_status("alpha_health_constraint_violation"),
+            StatusCode::CONFLICT
         );
     }
 

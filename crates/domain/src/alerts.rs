@@ -132,6 +132,7 @@ pub enum AlertReasonCode {
     DeliveryPrimaryFailed,
     DeliveryFallbackFailed,
     DeliverySlaBreached,
+    AlphaHealthThresholdBreach,
 }
 
 impl AlertReasonCode {
@@ -155,6 +156,7 @@ impl AlertReasonCode {
             Self::DeliveryPrimaryFailed => "alert_delivery_primary_failed",
             Self::DeliveryFallbackFailed => "alert_delivery_fallback_failed",
             Self::DeliverySlaBreached => "alert_delivery_sla_breached",
+            Self::AlphaHealthThresholdBreach => "alert_alpha_health_threshold_breach",
         }
     }
 
@@ -178,6 +180,7 @@ impl AlertReasonCode {
             "alert_delivery_primary_failed" => Ok(Self::DeliveryPrimaryFailed),
             "alert_delivery_fallback_failed" => Ok(Self::DeliveryFallbackFailed),
             "alert_delivery_sla_breached" => Ok(Self::DeliverySlaBreached),
+            "alert_alpha_health_threshold_breach" => Ok(Self::AlphaHealthThresholdBreach),
             _ => Err(AlertContractError::invalid_payload(format!(
                 "unknown alert reason code `{value}`"
             ))),
@@ -918,6 +921,11 @@ mod tests {
             AlertReasonCode::parse("alert_delivery_primary_failed")
                 .expect("primary delivery fail should parse"),
             AlertReasonCode::DeliveryPrimaryFailed
+        );
+        assert_eq!(
+            AlertReasonCode::parse("alert_alpha_health_threshold_breach")
+                .expect("alpha-health threshold breach reason should parse"),
+            AlertReasonCode::AlphaHealthThresholdBreach
         );
         assert_eq!(
             AlertReasonCode::parse("alert_unknown")

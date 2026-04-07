@@ -1,3 +1,4 @@
+pub mod alpha_health;
 pub mod counterfactual_replay;
 pub mod decisions;
 

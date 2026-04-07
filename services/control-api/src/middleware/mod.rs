@@ -24,6 +24,7 @@ use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportS
 use reporting_service::exports::workflows::{
     ReportExportOrchestrator, ReportExportWorkflowService,
 };
+use research_gateway::promotion::alpha_health::{AlphaHealthOrchestrator, AlphaHealthService};
 use research_gateway::promotion::counterfactual_replay::{
     CounterfactualReplayOrchestrator, CounterfactualReplayService,
 };
@@ -248,6 +249,7 @@ pub struct ControlApiState {
     pub research_validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
     pub research_validation_workflow_orchestrator: Arc<dyn ValidationWorkflowRunOrchestrator>,
     pub research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
+    pub research_alpha_health_orchestrator: Arc<dyn AlphaHealthOrchestrator>,
     pub research_counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
     pub research_promotion_decision_orchestrator: Arc<dyn PromotionDecisionOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
@@ -366,6 +368,7 @@ impl ControlApiState {
                 ValidationWorkflowRunService::default(),
             ),
             research_shadow_mode_orchestrator: Arc::new(ShadowModeService::default()),
+            research_alpha_health_orchestrator: Arc::new(AlphaHealthService::default()),
             research_counterfactual_replay_orchestrator: Arc::new(
                 CounterfactualReplayService::default(),
             ),
@@ -435,6 +438,15 @@ impl ControlApiState {
         research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
     ) -> Self {
         self.research_shadow_mode_orchestrator = research_shadow_mode_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_research_alpha_health_orchestrator(
+        mut self,
+        research_alpha_health_orchestrator: Arc<dyn AlphaHealthOrchestrator>,
+    ) -> Self {
+        self.research_alpha_health_orchestrator = research_alpha_health_orchestrator;
         self
     }
 

@@ -17,6 +17,7 @@ use governance_service::safety_controls::SafetyControlService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
 use reporting_service::exports::scheduling::ReportSchedulingService;
 use reporting_service::exports::workflows::ReportExportWorkflowService;
+use research_gateway::promotion::alpha_health::AlphaHealthService;
 use research_gateway::promotion::counterfactual_replay::CounterfactualReplayService;
 use research_gateway::promotion::decisions::PromotionDecisionService;
 use research_gateway::validation::gate_policies::{
@@ -45,6 +46,7 @@ async fn main() {
             Arc::clone(&research_validation_gate_orchestrator),
         ));
     let research_shadow_mode_orchestrator = Arc::new(ShadowModeService::postgres(pool.clone()));
+    let research_alpha_health_orchestrator = Arc::new(AlphaHealthService::postgres(pool.clone()));
     let research_counterfactual_replay_orchestrator =
         Arc::new(CounterfactualReplayService::postgres(pool.clone()));
     let research_promotion_decision_orchestrator = Arc::new(PromotionDecisionService::postgres(
@@ -79,6 +81,7 @@ async fn main() {
     .with_research_validation_gate_orchestrator(research_validation_gate_orchestrator)
     .with_research_validation_workflow_orchestrator(research_validation_workflow_orchestrator)
     .with_research_shadow_mode_orchestrator(research_shadow_mode_orchestrator)
+    .with_research_alpha_health_orchestrator(research_alpha_health_orchestrator)
     .with_research_counterfactual_replay_orchestrator(research_counterfactual_replay_orchestrator)
     .with_research_promotion_decision_orchestrator(research_promotion_decision_orchestrator)
     .with_attribution_pool(pool);

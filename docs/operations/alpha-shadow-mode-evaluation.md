@@ -63,3 +63,4 @@ Unauthorized security-signal names:
 1. Validation workflow and diagnostics (Story 6.3): `docs/operations/alpha-validation-workflow-and-diagnostics.md`
 2. Validation gate policies (Story 6.2): `docs/operations/alpha-validation-gate-policies.md`
 3. Counterfactual replay stress gating (Story 6.6): `docs/operations/alpha-counterfactual-replay-stress-gating.md`
+4. Live alpha health monitoring and threshold breaches (Story 6.7): `docs/operations/alpha-live-health-monitoring-threshold-breaches.md`

@@ -90,4 +90,5 @@ Unauthorized security-signal names:
 1. Promotion lifecycle governance (Story 6.5): `docs/operations/alpha-promotion-lifecycle-governance.md`
 2. Validation workflow and diagnostics (Story 6.3): `docs/operations/alpha-validation-workflow-and-diagnostics.md`
 3. Shadow-mode evaluation (Story 6.4): `docs/operations/alpha-shadow-mode-evaluation.md`
-4. Governance approval workflow implementation: `services/governance-service/src/approvals/mod.rs`
+4. Live alpha health monitoring and threshold breaches (Story 6.7): `docs/operations/alpha-live-health-monitoring-threshold-breaches.md`
+5. Governance approval workflow implementation: `services/governance-service/src/approvals/mod.rs`

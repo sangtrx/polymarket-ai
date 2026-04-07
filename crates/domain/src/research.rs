@@ -3273,6 +3273,789 @@ fn validate_finite_validation_metric(
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AlphaHealthMetricWindow {
+    OneHour,
+    TwentyFourHours,
+    ThirtyDays,
+}
+
+impl AlphaHealthMetricWindow {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OneHour => "1h",
+            Self::TwentyFourHours => "24h",
+            Self::ThirtyDays => "30d",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AlphaHealthContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "1h" => Ok(Self::OneHour),
+            "24h" => Ok(Self::TwentyFourHours),
+            "30d" => Ok(Self::ThirtyDays),
+            _ => Err(AlphaHealthContractError::invalid_payload(format!(
+                "unknown alpha-health attribution window `{value}`"
+            ))),
+        }
+    }
+}
+
+pub const FR10_ALPHA_HEALTH_REQUIRED_WINDOWS: [AlphaHealthMetricWindow; 3] = [
+    AlphaHealthMetricWindow::OneHour,
+    AlphaHealthMetricWindow::TwentyFourHours,
+    AlphaHealthMetricWindow::ThirtyDays,
+];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AlphaHealthMetricKey {
+    RollingSharpe,
+    RollingHitRate,
+    RollingDrawdown,
+    StabilityScore,
+}
+
+impl AlphaHealthMetricKey {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RollingSharpe => "rolling_sharpe",
+            Self::RollingHitRate => "rolling_hit_rate",
+            Self::RollingDrawdown => "rolling_drawdown",
+            Self::StabilityScore => "stability_score",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AlphaHealthContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "rolling_sharpe" => Ok(Self::RollingSharpe),
+            "rolling_hit_rate" => Ok(Self::RollingHitRate),
+            "rolling_drawdown" => Ok(Self::RollingDrawdown),
+            "stability_score" => Ok(Self::StabilityScore),
+            _ => Err(AlphaHealthContractError::invalid_payload(format!(
+                "unknown alpha-health metric_key `{value}`"
+            ))),
+        }
+    }
+
+    pub const fn is_floor_metric(self) -> bool {
+        matches!(
+            self,
+            Self::RollingSharpe | Self::RollingHitRate | Self::StabilityScore
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlphaHealthReasonCode {
+    MetricRecorded,
+    MetricRead,
+    MetricListed,
+    ThresholdBreachDetected,
+    ThresholdBreachRead,
+    ThresholdBreachListed,
+    ThresholdSatisfied,
+    InvalidPayload,
+    UnauthorizedRole,
+    MetricNotFound,
+    BreachNotFound,
+    DependencyUnavailable,
+    StateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl AlphaHealthReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MetricRecorded => "alpha_health_metric_recorded",
+            Self::MetricRead => "alpha_health_metric_read",
+            Self::MetricListed => "alpha_health_metric_listed",
+            Self::ThresholdBreachDetected => "alpha_health_threshold_breach_detected",
+            Self::ThresholdBreachRead => "alpha_health_threshold_breach_read",
+            Self::ThresholdBreachListed => "alpha_health_threshold_breach_listed",
+            Self::ThresholdSatisfied => "alpha_health_threshold_satisfied",
+            Self::InvalidPayload => "alpha_health_invalid_payload",
+            Self::UnauthorizedRole => "alpha_health_unauthorized_role",
+            Self::MetricNotFound => "alpha_health_metric_not_found",
+            Self::BreachNotFound => "alpha_health_breach_not_found",
+            Self::DependencyUnavailable => "alpha_health_dependency_unavailable",
+            Self::StateUnavailable => "alpha_health_state_unavailable",
+            Self::PersistenceUnavailable => "alpha_health_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AlphaHealthContractError> {
+        match value {
+            "alpha_health_metric_recorded" => Ok(Self::MetricRecorded),
+            "alpha_health_metric_read" => Ok(Self::MetricRead),
+            "alpha_health_metric_listed" => Ok(Self::MetricListed),
+            "alpha_health_threshold_breach_detected" => Ok(Self::ThresholdBreachDetected),
+            "alpha_health_threshold_breach_read" => Ok(Self::ThresholdBreachRead),
+            "alpha_health_threshold_breach_listed" => Ok(Self::ThresholdBreachListed),
+            "alpha_health_threshold_satisfied" => Ok(Self::ThresholdSatisfied),
+            "alpha_health_invalid_payload" => Ok(Self::InvalidPayload),
+            "alpha_health_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "alpha_health_metric_not_found" => Ok(Self::MetricNotFound),
+            "alpha_health_breach_not_found" => Ok(Self::BreachNotFound),
+            "alpha_health_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "alpha_health_state_unavailable" => Ok(Self::StateUnavailable),
+            "alpha_health_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(AlphaHealthContractError::invalid_payload(format!(
+                "unknown alpha-health reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlphaHealthValidationIssue {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlphaHealthContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<AlphaHealthValidationIssue>,
+}
+
+impl AlphaHealthContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<AlphaHealthValidationIssue>,
+    ) -> Self {
+        Self {
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+
+    pub fn dependency_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaHealthReasonCode::DependencyUnavailable.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn state_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaHealthReasonCode::StateUnavailable.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn persistence_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaHealthReasonCode::PersistenceUnavailable.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlphaHealthAttributionWindowMetrics {
+    pub window: AlphaHealthMetricWindow,
+    pub net_pnl: f64,
+    pub rolling_sharpe: f64,
+    pub rolling_hit_rate: f64,
+    pub rolling_drawdown: f64,
+    pub stability_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlphaHealthMetricRecord {
+    pub metric_id: String,
+    pub alpha_id: String,
+    pub rolling_sharpe: f64,
+    pub rolling_hit_rate: f64,
+    pub rolling_drawdown: f64,
+    pub stability_score: f64,
+    pub windows: Vec<AlphaHealthAttributionWindowMetrics>,
+    pub reason_code: String,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub recorded_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlphaHealthThresholdDefinition {
+    pub metric_key: AlphaHealthMetricKey,
+    pub comparator: ValidationGateComparator,
+    pub threshold_value: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlphaThresholdBreachRecord {
+    pub breach_id: String,
+    pub metric_id: String,
+    pub alpha_id: String,
+    pub metric_key: AlphaHealthMetricKey,
+    pub comparator: ValidationGateComparator,
+    pub observed_value: f64,
+    pub threshold_value: f64,
+    pub breach_reason: String,
+    pub reason_code: String,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub breached_at_utc: String,
+}
+
+pub fn parse_alpha_health_utc_timestamp(
+    value: &str,
+) -> Result<OffsetDateTime, AlphaHealthContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        AlphaHealthContractError::invalid_payload(format!("timestamp `{value}` must be RFC3339 UTC"))
+    })?;
+    if parsed.offset() != UtcOffset::UTC {
+        return Err(AlphaHealthContractError::invalid_payload(
+            "timestamps must use UTC `Z` offset",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn compose_alpha_health_metric_id(
+    alpha_id: &str,
+    recorded_at_utc: &str,
+) -> Result<String, AlphaHealthContractError> {
+    let normalized_alpha_id = normalize_research_identifier(alpha_id);
+    if normalized_alpha_id.is_empty() {
+        return Err(AlphaHealthContractError::invalid_payload_with_issues(
+            "alpha_id cannot be blank",
+            vec![AlphaHealthValidationIssue {
+                field: "alpha_id".to_string(),
+                code: AlphaHealthReasonCode::InvalidPayload.code(),
+                message: "alpha_id cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let recorded_at = parse_alpha_health_utc_timestamp(recorded_at_utc)?;
+    Ok(format!(
+        "{}::{}",
+        normalized_alpha_id,
+        recorded_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn compose_alpha_threshold_breach_id(
+    alpha_id: &str,
+    metric_key: AlphaHealthMetricKey,
+    breached_at_utc: &str,
+) -> Result<String, AlphaHealthContractError> {
+    let normalized_alpha_id = normalize_research_identifier(alpha_id);
+    if normalized_alpha_id.is_empty() {
+        return Err(AlphaHealthContractError::invalid_payload_with_issues(
+            "alpha_id cannot be blank",
+            vec![AlphaHealthValidationIssue {
+                field: "alpha_id".to_string(),
+                code: AlphaHealthReasonCode::InvalidPayload.code(),
+                message: "alpha_id cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let breached_at = parse_alpha_health_utc_timestamp(breached_at_utc)?;
+    Ok(format!(
+        "{}::{}::{}",
+        normalized_alpha_id,
+        metric_key.as_str(),
+        breached_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn canonicalize_alpha_health_metric_record(
+    record: &AlphaHealthMetricRecord,
+) -> Result<AlphaHealthMetricRecord, AlphaHealthContractError> {
+    let mut windows = record
+        .windows
+        .iter()
+        .map(canonicalize_alpha_health_window_metrics)
+        .collect::<Result<Vec<_>, _>>()?;
+    windows.sort_by_key(|window| alpha_health_window_order(window.window));
+
+    let normalized_reason_code = normalize_research_identifier(&record.reason_code);
+    let reason_code = AlphaHealthReasonCode::parse(&normalized_reason_code)
+        .map(|reason| reason.code().to_string())
+        .unwrap_or(normalized_reason_code);
+
+    let normalized = AlphaHealthMetricRecord {
+        metric_id: normalize_research_identifier(&record.metric_id),
+        alpha_id: normalize_research_identifier(&record.alpha_id),
+        rolling_sharpe: record.rolling_sharpe,
+        rolling_hit_rate: record.rolling_hit_rate,
+        rolling_drawdown: record.rolling_drawdown,
+        stability_score: record.stability_score,
+        windows,
+        reason_code,
+        actor_id: record.actor_id.trim().to_string(),
+        correlation_id: record.correlation_id.trim().to_string(),
+        recorded_at_utc: record.recorded_at_utc.trim().to_string(),
+    };
+    validate_alpha_health_metric_record(&normalized)?;
+    Ok(normalized)
+}
+
+pub fn validate_alpha_health_metric_record(
+    record: &AlphaHealthMetricRecord,
+) -> Result<(), AlphaHealthContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_alpha_health_field(&mut field_errors, "metric_id", &record.metric_id);
+    validate_non_empty_alpha_health_field(&mut field_errors, "alpha_id", &record.alpha_id);
+    validate_non_empty_alpha_health_field(&mut field_errors, "reason_code", &record.reason_code);
+    validate_non_empty_alpha_health_field(&mut field_errors, "actor_id", &record.actor_id);
+    validate_non_empty_alpha_health_field(
+        &mut field_errors,
+        "correlation_id",
+        &record.correlation_id,
+    );
+    validate_non_empty_alpha_health_field(
+        &mut field_errors,
+        "recorded_at_utc",
+        &record.recorded_at_utc,
+    );
+
+    if parse_alpha_health_utc_timestamp(&record.recorded_at_utc).is_err() {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: "recorded_at_utc".to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: "recorded_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    if AlphaHealthReasonCode::parse(&record.reason_code).is_err() {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: "reason_code".to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: "reason_code is not a supported alpha-health reason".to_string(),
+        });
+    }
+
+    validate_finite_alpha_health_value(
+        record.rolling_sharpe,
+        "rolling_sharpe",
+        &mut field_errors,
+    );
+    validate_finite_alpha_health_value(
+        record.rolling_hit_rate,
+        "rolling_hit_rate",
+        &mut field_errors,
+    );
+    validate_finite_alpha_health_value(
+        record.rolling_drawdown,
+        "rolling_drawdown",
+        &mut field_errors,
+    );
+    validate_finite_alpha_health_value(
+        record.stability_score,
+        "stability_score",
+        &mut field_errors,
+    );
+    validate_alpha_health_windows(record.windows.as_slice(), &mut field_errors);
+
+    if !field_errors.is_empty() {
+        return Err(AlphaHealthContractError::invalid_payload_with_issues(
+            "alpha-health metric record failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn canonicalize_alpha_threshold_breach_record(
+    record: &AlphaThresholdBreachRecord,
+) -> Result<AlphaThresholdBreachRecord, AlphaHealthContractError> {
+    let normalized_reason_code = normalize_research_identifier(&record.reason_code);
+    let reason_code = AlphaHealthReasonCode::parse(&normalized_reason_code)
+        .map(|reason| reason.code().to_string())
+        .unwrap_or(normalized_reason_code);
+
+    let normalized = AlphaThresholdBreachRecord {
+        breach_id: normalize_research_identifier(&record.breach_id),
+        metric_id: normalize_research_identifier(&record.metric_id),
+        alpha_id: normalize_research_identifier(&record.alpha_id),
+        metric_key: record.metric_key,
+        comparator: record.comparator,
+        observed_value: record.observed_value,
+        threshold_value: record.threshold_value,
+        breach_reason: record.breach_reason.trim().to_string(),
+        reason_code,
+        actor_id: record.actor_id.trim().to_string(),
+        correlation_id: record.correlation_id.trim().to_string(),
+        breached_at_utc: record.breached_at_utc.trim().to_string(),
+    };
+    validate_alpha_threshold_breach_record(&normalized)?;
+    Ok(normalized)
+}
+
+pub fn validate_alpha_threshold_breach_record(
+    record: &AlphaThresholdBreachRecord,
+) -> Result<(), AlphaHealthContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_alpha_health_field(&mut field_errors, "breach_id", &record.breach_id);
+    validate_non_empty_alpha_health_field(&mut field_errors, "metric_id", &record.metric_id);
+    validate_non_empty_alpha_health_field(&mut field_errors, "alpha_id", &record.alpha_id);
+    validate_non_empty_alpha_health_field(
+        &mut field_errors,
+        "breach_reason",
+        &record.breach_reason,
+    );
+    validate_non_empty_alpha_health_field(&mut field_errors, "reason_code", &record.reason_code);
+    validate_non_empty_alpha_health_field(&mut field_errors, "actor_id", &record.actor_id);
+    validate_non_empty_alpha_health_field(
+        &mut field_errors,
+        "correlation_id",
+        &record.correlation_id,
+    );
+    validate_non_empty_alpha_health_field(
+        &mut field_errors,
+        "breached_at_utc",
+        &record.breached_at_utc,
+    );
+
+    if parse_alpha_health_utc_timestamp(&record.breached_at_utc).is_err() {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: "breached_at_utc".to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: "breached_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    if AlphaHealthReasonCode::parse(&record.reason_code).is_err() {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: "reason_code".to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: "reason_code is not a supported alpha-health reason".to_string(),
+        });
+    }
+    if let Err(error) = validate_alpha_health_threshold_definition(&AlphaHealthThresholdDefinition {
+        metric_key: record.metric_key,
+        comparator: record.comparator,
+        threshold_value: record.threshold_value,
+    }) {
+        field_errors.extend(error.field_errors);
+    }
+    validate_finite_alpha_health_value(
+        record.observed_value,
+        "observed_value",
+        &mut field_errors,
+    );
+
+    if !field_errors.is_empty() {
+        return Err(AlphaHealthContractError::invalid_payload_with_issues(
+            "alpha-health threshold breach record failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn evaluate_alpha_health_thresholds(
+    metric_record: &AlphaHealthMetricRecord,
+    thresholds: &[AlphaHealthThresholdDefinition],
+) -> Result<Vec<AlphaThresholdBreachRecord>, AlphaHealthContractError> {
+    if thresholds.is_empty() {
+        return Err(AlphaHealthContractError::invalid_payload_with_issues(
+            "thresholds cannot be empty",
+            vec![AlphaHealthValidationIssue {
+                field: "thresholds".to_string(),
+                code: AlphaHealthReasonCode::InvalidPayload.code(),
+                message: "at least one threshold definition is required".to_string(),
+            }],
+        ));
+    }
+
+    let metric_record = canonicalize_alpha_health_metric_record(metric_record)?;
+    let mut canonical_thresholds = thresholds
+        .iter()
+        .map(canonicalize_alpha_health_threshold_definition)
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical_thresholds.sort_by(|left, right| {
+        left.metric_key
+            .as_str()
+            .cmp(right.metric_key.as_str())
+            .then_with(|| left.threshold_value.total_cmp(&right.threshold_value))
+    });
+
+    let mut seen_metric_keys = std::collections::BTreeSet::new();
+    let mut breaches = Vec::new();
+    for threshold in canonical_thresholds {
+        if !seen_metric_keys.insert(threshold.metric_key) {
+            return Err(AlphaHealthContractError::invalid_payload_with_issues(
+                "duplicate threshold metric_key entries are not allowed",
+                vec![AlphaHealthValidationIssue {
+                    field: "thresholds".to_string(),
+                    code: AlphaHealthReasonCode::InvalidPayload.code(),
+                    message: format!(
+                        "duplicate threshold definition for metric_key `{}`",
+                        threshold.metric_key.as_str()
+                    ),
+                }],
+            ));
+        }
+        let observed_value = alpha_health_observed_value(&metric_record, threshold.metric_key);
+        let breached = is_alpha_health_threshold_breached(
+            threshold.metric_key,
+            observed_value,
+            threshold.threshold_value,
+        );
+        if breached {
+            let breach_id = compose_alpha_threshold_breach_id(
+                &metric_record.alpha_id,
+                threshold.metric_key,
+                &metric_record.recorded_at_utc,
+            )?;
+            let breach_reason = format!(
+                "{} breached {} {} with observed {}",
+                threshold.metric_key.as_str(),
+                threshold.comparator.as_str(),
+                threshold.threshold_value,
+                observed_value
+            );
+            breaches.push(canonicalize_alpha_threshold_breach_record(
+                &AlphaThresholdBreachRecord {
+                    breach_id,
+                    metric_id: metric_record.metric_id.clone(),
+                    alpha_id: metric_record.alpha_id.clone(),
+                    metric_key: threshold.metric_key,
+                    comparator: threshold.comparator,
+                    observed_value,
+                    threshold_value: threshold.threshold_value,
+                    breach_reason,
+                    reason_code: AlphaHealthReasonCode::ThresholdBreachDetected
+                        .code()
+                        .to_string(),
+                    actor_id: metric_record.actor_id.clone(),
+                    correlation_id: metric_record.correlation_id.clone(),
+                    breached_at_utc: metric_record.recorded_at_utc.clone(),
+                },
+            )?);
+        }
+    }
+    breaches.sort_by(|left, right| {
+        right
+            .breached_at_utc
+            .cmp(&left.breached_at_utc)
+            .then_with(|| left.breach_id.cmp(&right.breach_id))
+    });
+    Ok(breaches)
+}
+
+pub fn is_alpha_health_threshold_breached(
+    metric_key: AlphaHealthMetricKey,
+    observed_value: f64,
+    threshold_value: f64,
+) -> bool {
+    if metric_key.is_floor_metric() {
+        observed_value < threshold_value
+    } else {
+        observed_value > threshold_value
+    }
+}
+
+pub fn expected_alpha_health_comparator(metric_key: AlphaHealthMetricKey) -> ValidationGateComparator {
+    if metric_key.is_floor_metric() {
+        ValidationGateComparator::Lt
+    } else {
+        ValidationGateComparator::Gt
+    }
+}
+
+pub fn canonicalize_alpha_health_threshold_definition(
+    definition: &AlphaHealthThresholdDefinition,
+) -> Result<AlphaHealthThresholdDefinition, AlphaHealthContractError> {
+    let normalized = AlphaHealthThresholdDefinition {
+        metric_key: definition.metric_key,
+        comparator: definition.comparator,
+        threshold_value: definition.threshold_value,
+    };
+    validate_alpha_health_threshold_definition(&normalized)?;
+    Ok(normalized)
+}
+
+pub fn validate_alpha_health_threshold_definition(
+    definition: &AlphaHealthThresholdDefinition,
+) -> Result<(), AlphaHealthContractError> {
+    let mut field_errors = Vec::new();
+    validate_finite_alpha_health_value(
+        definition.threshold_value,
+        "threshold_value",
+        &mut field_errors,
+    );
+    let expected = expected_alpha_health_comparator(definition.metric_key);
+    if definition.comparator != expected {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: "comparator".to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: format!(
+                "{} requires `{}` comparator semantics",
+                definition.metric_key.as_str(),
+                expected.as_str()
+            ),
+        });
+    }
+    if !field_errors.is_empty() {
+        return Err(AlphaHealthContractError::invalid_payload_with_issues(
+            "alpha-health threshold definition failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+fn alpha_health_observed_value(
+    metric_record: &AlphaHealthMetricRecord,
+    metric_key: AlphaHealthMetricKey,
+) -> f64 {
+    match metric_key {
+        AlphaHealthMetricKey::RollingSharpe => metric_record.rolling_sharpe,
+        AlphaHealthMetricKey::RollingHitRate => metric_record.rolling_hit_rate,
+        AlphaHealthMetricKey::RollingDrawdown => metric_record.rolling_drawdown,
+        AlphaHealthMetricKey::StabilityScore => metric_record.stability_score,
+    }
+}
+
+fn canonicalize_alpha_health_window_metrics(
+    window: &AlphaHealthAttributionWindowMetrics,
+) -> Result<AlphaHealthAttributionWindowMetrics, AlphaHealthContractError> {
+    let normalized = AlphaHealthAttributionWindowMetrics {
+        window: window.window,
+        net_pnl: window.net_pnl,
+        rolling_sharpe: window.rolling_sharpe,
+        rolling_hit_rate: window.rolling_hit_rate,
+        rolling_drawdown: window.rolling_drawdown,
+        stability_score: window.stability_score,
+    };
+    validate_finite_alpha_health_window_metrics(&normalized, 0)?;
+    Ok(normalized)
+}
+
+fn validate_alpha_health_windows(
+    windows: &[AlphaHealthAttributionWindowMetrics],
+    field_errors: &mut Vec<AlphaHealthValidationIssue>,
+) {
+    if windows.len() != FR10_ALPHA_HEALTH_REQUIRED_WINDOWS.len() {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: "windows".to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: "windows must include exactly 1h, 24h, and 30d entries".to_string(),
+        });
+    }
+
+    let mut seen = Vec::new();
+    for (index, window) in windows.iter().enumerate() {
+        if let Err(error) = validate_finite_alpha_health_window_metrics(window, index) {
+            field_errors.extend(error.field_errors);
+        }
+        if seen.contains(&window.window) {
+            field_errors.push(AlphaHealthValidationIssue {
+                field: format!("windows[{index}].window"),
+                code: AlphaHealthReasonCode::InvalidPayload.code(),
+                message: format!("duplicate window `{}`", window.window.as_str()),
+            });
+        } else {
+            seen.push(window.window);
+        }
+    }
+
+    for required in FR10_ALPHA_HEALTH_REQUIRED_WINDOWS {
+        if !seen.contains(&required) {
+            field_errors.push(AlphaHealthValidationIssue {
+                field: "windows".to_string(),
+                code: AlphaHealthReasonCode::InvalidPayload.code(),
+                message: format!("missing required window `{}`", required.as_str()),
+            });
+        }
+    }
+}
+
+fn validate_finite_alpha_health_window_metrics(
+    window: &AlphaHealthAttributionWindowMetrics,
+    index: usize,
+) -> Result<(), AlphaHealthContractError> {
+    let mut field_errors = Vec::new();
+    validate_finite_alpha_health_value(
+        window.net_pnl,
+        &format!("windows[{index}].net_pnl"),
+        &mut field_errors,
+    );
+    validate_finite_alpha_health_value(
+        window.rolling_sharpe,
+        &format!("windows[{index}].rolling_sharpe"),
+        &mut field_errors,
+    );
+    validate_finite_alpha_health_value(
+        window.rolling_hit_rate,
+        &format!("windows[{index}].rolling_hit_rate"),
+        &mut field_errors,
+    );
+    validate_finite_alpha_health_value(
+        window.rolling_drawdown,
+        &format!("windows[{index}].rolling_drawdown"),
+        &mut field_errors,
+    );
+    validate_finite_alpha_health_value(
+        window.stability_score,
+        &format!("windows[{index}].stability_score"),
+        &mut field_errors,
+    );
+    if !field_errors.is_empty() {
+        return Err(AlphaHealthContractError::invalid_payload_with_issues(
+            "alpha-health attribution windows must contain finite values",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_empty_alpha_health_field(
+    field_errors: &mut Vec<AlphaHealthValidationIssue>,
+    field: &str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: field.to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_finite_alpha_health_value(
+    value: f64,
+    field: &str,
+    field_errors: &mut Vec<AlphaHealthValidationIssue>,
+) {
+    if !value.is_finite() {
+        field_errors.push(AlphaHealthValidationIssue {
+            field: field.to_string(),
+            code: AlphaHealthReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite"),
+        });
+    }
+}
+
+fn alpha_health_window_order(window: AlphaHealthMetricWindow) -> i32 {
+    match window {
+        AlphaHealthMetricWindow::OneHour => 0,
+        AlphaHealthMetricWindow::TwentyFourHours => 1,
+        AlphaHealthMetricWindow::ThirtyDays => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4167,5 +4950,186 @@ mod tests {
             issue.field == "approval_reference"
                 && issue.code == PromotionDecisionReasonCode::ApprovalRequired.code()
         }));
+    }
+
+    fn sample_alpha_health_record() -> AlphaHealthMetricRecord {
+        AlphaHealthMetricRecord {
+            metric_id: "alpha::mean-reversion::1712534400000000000".to_string(),
+            alpha_id: "alpha::mean-reversion".to_string(),
+            rolling_sharpe: 1.2,
+            rolling_hit_rate: 0.58,
+            rolling_drawdown: 0.07,
+            stability_score: 0.81,
+            windows: vec![
+                AlphaHealthAttributionWindowMetrics {
+                    window: AlphaHealthMetricWindow::ThirtyDays,
+                    net_pnl: 345.0,
+                    rolling_sharpe: 1.2,
+                    rolling_hit_rate: 0.58,
+                    rolling_drawdown: 0.07,
+                    stability_score: 0.81,
+                },
+                AlphaHealthAttributionWindowMetrics {
+                    window: AlphaHealthMetricWindow::OneHour,
+                    net_pnl: 11.2,
+                    rolling_sharpe: 1.25,
+                    rolling_hit_rate: 0.62,
+                    rolling_drawdown: 0.03,
+                    stability_score: 0.84,
+                },
+                AlphaHealthAttributionWindowMetrics {
+                    window: AlphaHealthMetricWindow::TwentyFourHours,
+                    net_pnl: 84.3,
+                    rolling_sharpe: 1.22,
+                    rolling_hit_rate: 0.6,
+                    rolling_drawdown: 0.05,
+                    stability_score: 0.82,
+                },
+            ],
+            reason_code: AlphaHealthReasonCode::MetricRecorded.code().to_string(),
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-alpha-health-001".to_string(),
+            recorded_at_utc: "2026-04-08T01:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn alpha_health_reason_code_parse_accepts_known_values() {
+        assert_eq!(
+            AlphaHealthReasonCode::parse("alpha_health_threshold_breach_detected")
+                .expect("known alpha-health reason code should parse"),
+            AlphaHealthReasonCode::ThresholdBreachDetected
+        );
+        assert_eq!(
+            AlphaHealthReasonCode::parse("alpha_health_metric_not_found")
+                .expect("known alpha-health reason code should parse"),
+            AlphaHealthReasonCode::MetricNotFound
+        );
+    }
+
+    #[test]
+    fn alpha_health_threshold_boundaries_apply_floor_and_ceiling_semantics() {
+        let mut metric = sample_alpha_health_record();
+        metric.rolling_sharpe = 1.0;
+        metric.rolling_hit_rate = 0.5;
+        metric.stability_score = 0.8;
+        metric.rolling_drawdown = 0.1;
+
+        let thresholds = vec![
+            AlphaHealthThresholdDefinition {
+                metric_key: AlphaHealthMetricKey::RollingSharpe,
+                comparator: ValidationGateComparator::Lt,
+                threshold_value: 1.0,
+            },
+            AlphaHealthThresholdDefinition {
+                metric_key: AlphaHealthMetricKey::RollingHitRate,
+                comparator: ValidationGateComparator::Lt,
+                threshold_value: 0.5,
+            },
+            AlphaHealthThresholdDefinition {
+                metric_key: AlphaHealthMetricKey::StabilityScore,
+                comparator: ValidationGateComparator::Lt,
+                threshold_value: 0.8,
+            },
+            AlphaHealthThresholdDefinition {
+                metric_key: AlphaHealthMetricKey::RollingDrawdown,
+                comparator: ValidationGateComparator::Gt,
+                threshold_value: 0.1,
+            },
+        ];
+        let breaches = evaluate_alpha_health_thresholds(&metric, &thresholds)
+            .expect("exact boundary should stay on allow path");
+        assert!(breaches.is_empty());
+
+        metric.rolling_sharpe = 0.99;
+        metric.rolling_drawdown = 0.1001;
+        let breaches = evaluate_alpha_health_thresholds(&metric, &thresholds)
+            .expect("strict floor/ceiling boundary breach evaluation should succeed");
+        assert_eq!(breaches.len(), 2);
+        assert!(breaches.iter().any(|breach| {
+            breach.metric_key == AlphaHealthMetricKey::RollingSharpe
+                && breach.reason_code == AlphaHealthReasonCode::ThresholdBreachDetected.code()
+        }));
+        assert!(breaches.iter().any(|breach| {
+            breach.metric_key == AlphaHealthMetricKey::RollingDrawdown
+                && breach.reason_code == AlphaHealthReasonCode::ThresholdBreachDetected.code()
+        }));
+    }
+
+    #[test]
+    fn alpha_health_threshold_rejects_comparator_mismatch() {
+        let threshold = AlphaHealthThresholdDefinition {
+            metric_key: AlphaHealthMetricKey::RollingDrawdown,
+            comparator: ValidationGateComparator::Lt,
+            threshold_value: 0.09,
+        };
+        let error = validate_alpha_health_threshold_definition(&threshold)
+            .expect_err("drawdown threshold should require `gt` comparator");
+        assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
+        assert!(error.field_errors.iter().any(|issue| issue.field == "comparator"));
+    }
+
+    #[test]
+    fn alpha_health_thresholds_require_non_empty_definition_list() {
+        let metric = sample_alpha_health_record();
+        let error = evaluate_alpha_health_thresholds(&metric, &[])
+            .expect_err("empty thresholds should fail validation");
+        assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
+        assert!(error.field_errors.iter().any(|issue| issue.field == "thresholds"));
+    }
+
+    #[test]
+    fn alpha_health_thresholds_reject_duplicate_metric_keys() {
+        let metric = sample_alpha_health_record();
+        let thresholds = vec![
+            AlphaHealthThresholdDefinition {
+                metric_key: AlphaHealthMetricKey::RollingSharpe,
+                comparator: ValidationGateComparator::Lt,
+                threshold_value: 1.0,
+            },
+            AlphaHealthThresholdDefinition {
+                metric_key: AlphaHealthMetricKey::RollingSharpe,
+                comparator: ValidationGateComparator::Lt,
+                threshold_value: 1.1,
+            },
+        ];
+        let error = evaluate_alpha_health_thresholds(&metric, &thresholds)
+            .expect_err("duplicate threshold metric keys should fail validation");
+        assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
+        assert!(error.field_errors.iter().any(|issue| issue.field == "thresholds"));
+    }
+
+    #[test]
+    fn alpha_health_metric_validation_requires_fr10_windows() {
+        let mut metric = sample_alpha_health_record();
+        metric.windows.pop();
+
+        let error = validate_alpha_health_metric_record(&metric)
+            .expect_err("missing required 30d/24h/1h windows should fail");
+        assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "windows")
+        );
+    }
+
+    #[test]
+    fn alpha_health_identifier_composition_is_canonical_and_deterministic() {
+        let metric_id = compose_alpha_health_metric_id(
+            " Alpha::Mean-Reversion ",
+            "2026-04-08T01:00:00Z",
+        )
+        .expect("metric id composition should succeed");
+        assert!(metric_id.starts_with("alpha::mean-reversion::"));
+
+        let breach_id = compose_alpha_threshold_breach_id(
+            " Alpha::Mean-Reversion ",
+            AlphaHealthMetricKey::RollingSharpe,
+            "2026-04-08T01:00:00Z",
+        )
+        .expect("breach id composition should succeed");
+        assert!(breach_id.contains("alpha::mean-reversion::rolling_sharpe::"));
     }
 }

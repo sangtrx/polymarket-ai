@@ -920,3 +920,31 @@
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-6` ✅
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-5` ✅ (regression verification after Story 6.6 replay integration)
 - `source "$HOME/.cargo/env" && node --test tests/api/story-6-6*.test.mjs tests/e2e/story-6-6*.test.mjs && npm run --silent qa:test:story-6-6` ✅ (2026-04-08 01:13:10 QA automation refresh with expanded negative-path and telemetry coverage)
+
+---
+
+## Story 6.7 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::alpha_health_`) — validates FR10 required-window coverage, canonical UTC/identifier contracts, deterministic threshold comparator behavior (`<`, `==`, `>`), and machine-readable alpha-health reason-code continuity.
+- [x] `crates/domain/src/alerts.rs` (`alerts::tests::alert_reason_code_parse_accepts_fr29_fr40_and_delivery_codes`) — validates alpha-health breach alert reason-code taxonomy parse continuity.
+- [x] `crates/persistence/src/postgres/alpha_health_metrics.rs` (`postgres::alpha_health_metrics::tests::`) — validates strict schema-scope isolation (`alpha_health_metrics`, `alpha_threshold_breaches`), deterministic list ordering (`timestamp DESC`, id tie-break), explicit window-boundary diagnostics, and fail-closed persistence classification.
+- [x] `services/research-gateway/src/promotion/alpha_health.rs` (`promotion::alpha_health::tests::`) — validates telemetry update orchestration, deterministic breach detection + alert emission, Story 6.4/6.6 seam reuse for live-monitoring context, fail-closed dependency behavior, and deterministic list/read boundary handling.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::alpha_health_`) — validates authenticated alpha-health metric/breach start/read/list route behavior, canonical `data/meta/error` envelopes, deterministic status/error mapping (`400/403/409/503/500`), malformed payload/query handling, and unauthorized security-signal continuity.
+- [x] `tests/api/story-6-7-live-alpha-health-monitoring-api.test.mjs` — validates route wiring, payload/query/envelope contracts, middleware/main alpha-health orchestrator wiring, research-gateway seam exports, deterministic list canonicalization/correlation handling, route-level negative-path guard coverage, and AC2 breach DTO field completeness (`alpha_id`, `metric_key`, `observed_value`, `threshold_value`, `comparator`, `breach_reason`).
+- [x] `tests/e2e/story-6-7-live-alpha-health-monitoring.e2e.test.mjs` — validates migration scope boundaries, FR10/FR47 runbook contract coverage, deterministic domain/persistence semantics, orchestration seam reuse + telemetry continuity, control-api route-test inventory continuity, exact-boundary allow-path assertions, incident-alert payload contract fields, and Story 6.7 QA command wiring.
+
+### Coverage
+
+- Story 6.7 now has deterministic automated coverage for:
+  - live alpha health telemetry persistence and FR10 attribution windows (`1h`, `24h`, `30d`),
+  - exact threshold-boundary semantics (floor `<`, ceiling `>`, equality allow-path),
+  - breach-record persistence + incident-alert contract reuse (`alpha_id`, `breach_reason`, reason-code parse continuity),
+  - Story 6.4/6.6 seam reuse for live-monitoring context with fail-closed unavailability handling,
+  - authenticated control-plane route envelopes and machine-readable status/error/security-signal continuity.
+
+### Execution Result
+
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-7` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-7` ✅ (2026-04-08 03:14:32 QA refresh with expanded breach DTO + boundary/alert contract checks)
