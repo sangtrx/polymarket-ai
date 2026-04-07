@@ -1512,6 +1512,651 @@ fn validate_finite_non_negative_shadow_metric(
     }
 }
 
+pub const FR45_REQUIRED_PROMOTION_PACKET_FIELDS: [&str; 4] = [
+    "data_quality_report",
+    "purged_cpcv_results",
+    "calibration_report",
+    "counterfactual_replay_summary",
+];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionLifecycleAction {
+    Promote,
+    Pause,
+    Retire,
+}
+
+impl PromotionLifecycleAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Promote => "promote",
+            Self::Pause => "pause",
+            Self::Retire => "retire",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PromotionDecisionContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "promote" => Ok(Self::Promote),
+            "pause" => Ok(Self::Pause),
+            "retire" => Ok(Self::Retire),
+            _ => Err(PromotionDecisionContractError::invalid_payload_with_issues(
+                "unsupported lifecycle action",
+                vec![PromotionDecisionValidationIssue {
+                    field: "lifecycle_action".to_string(),
+                    code: PromotionDecisionReasonCode::UnsupportedAction.code(),
+                    message: format!(
+                        "lifecycle_action must be one of: promote, pause, retire (received `{value}`)"
+                    ),
+                }],
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionDecisionState {
+    Allowed,
+    Denied,
+}
+
+impl PromotionDecisionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PromotionDecisionContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "allowed" => Ok(Self::Allowed),
+            "denied" => Ok(Self::Denied),
+            _ => Err(PromotionDecisionContractError::invalid_payload(format!(
+                "unknown promotion decision state `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionDecisionReasonCode {
+    DecisionStarted,
+    DecisionAllowed,
+    DecisionDenied,
+    DecisionRead,
+    DecisionListed,
+    InvalidPayload,
+    UnauthorizedRole,
+    DecisionNotFound,
+    UnsupportedAction,
+    MissingEvidence,
+    ThresholdFailed,
+    GateDenied,
+    ApprovalRequired,
+    ApprovalInvalidState,
+    DependencyUnavailable,
+    StateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl PromotionDecisionReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::DecisionStarted => "promotion_decision_started",
+            Self::DecisionAllowed => "promotion_decision_allowed",
+            Self::DecisionDenied => "promotion_decision_denied",
+            Self::DecisionRead => "promotion_decision_read",
+            Self::DecisionListed => "promotion_decision_listed",
+            Self::InvalidPayload => "promotion_decision_invalid_payload",
+            Self::UnauthorizedRole => "promotion_decision_unauthorized_role",
+            Self::DecisionNotFound => "promotion_decision_not_found",
+            Self::UnsupportedAction => "promotion_decision_unsupported_action",
+            Self::MissingEvidence => "promotion_decision_missing_evidence",
+            Self::ThresholdFailed => "promotion_decision_threshold_failed",
+            Self::GateDenied => "promotion_decision_gate_denied",
+            Self::ApprovalRequired => "promotion_decision_approval_required",
+            Self::ApprovalInvalidState => "promotion_decision_approval_invalid_state",
+            Self::DependencyUnavailable => "promotion_decision_dependency_unavailable",
+            Self::StateUnavailable => "promotion_decision_state_unavailable",
+            Self::PersistenceUnavailable => "promotion_decision_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PromotionDecisionContractError> {
+        match value {
+            "promotion_decision_started" => Ok(Self::DecisionStarted),
+            "promotion_decision_allowed" => Ok(Self::DecisionAllowed),
+            "promotion_decision_denied" => Ok(Self::DecisionDenied),
+            "promotion_decision_read" => Ok(Self::DecisionRead),
+            "promotion_decision_listed" => Ok(Self::DecisionListed),
+            "promotion_decision_invalid_payload" => Ok(Self::InvalidPayload),
+            "promotion_decision_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "promotion_decision_not_found" => Ok(Self::DecisionNotFound),
+            "promotion_decision_unsupported_action" => Ok(Self::UnsupportedAction),
+            "promotion_decision_missing_evidence" => Ok(Self::MissingEvidence),
+            "promotion_decision_threshold_failed" => Ok(Self::ThresholdFailed),
+            "promotion_decision_gate_denied" => Ok(Self::GateDenied),
+            "promotion_decision_approval_required" => Ok(Self::ApprovalRequired),
+            "promotion_decision_approval_invalid_state" => Ok(Self::ApprovalInvalidState),
+            "promotion_decision_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "promotion_decision_state_unavailable" => Ok(Self::StateUnavailable),
+            "promotion_decision_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(PromotionDecisionContractError::invalid_payload(format!(
+                "unknown promotion decision reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionThresholdReasonCode {
+    Passed,
+    Failed,
+}
+
+impl PromotionThresholdReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Passed => "promotion_threshold_passed",
+            Self::Failed => "promotion_threshold_failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PromotionDecisionContractError> {
+        match value {
+            "promotion_threshold_passed" => Ok(Self::Passed),
+            "promotion_threshold_failed" => Ok(Self::Failed),
+            _ => Err(PromotionDecisionContractError::invalid_payload(format!(
+                "unknown promotion threshold reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromotionDecisionValidationIssue {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromotionDecisionContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<PromotionDecisionValidationIssue>,
+}
+
+impl PromotionDecisionContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<PromotionDecisionValidationIssue>,
+    ) -> Self {
+        Self {
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromotionThresholdDefinition {
+    pub metric_key: String,
+    pub comparator: ValidationGateComparator,
+    pub threshold_value: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromotionThresholdOutcome {
+    pub metric_key: String,
+    pub comparator: ValidationGateComparator,
+    pub threshold_value: f64,
+    pub observed_value: f64,
+    pub passed: bool,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromotionDecisionRecord {
+    pub decision_id: String,
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub lifecycle_action: PromotionLifecycleAction,
+    pub decision_state: PromotionDecisionState,
+    pub reason_code: String,
+    pub observed_metrics: Value,
+    pub evidence_packet: Value,
+    pub threshold_results: Vec<PromotionThresholdOutcome>,
+    pub missing_evidence_fields: Vec<String>,
+    pub gate_evaluation: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_readiness: Option<Value>,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub decided_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+}
+
+pub fn parse_promotion_utc_timestamp(
+    value: &str,
+) -> Result<OffsetDateTime, PromotionDecisionContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        PromotionDecisionContractError::invalid_payload(format!(
+            "timestamp `{value}` must be RFC3339 UTC"
+        ))
+    })?;
+    if parsed.offset() != UtcOffset::UTC {
+        return Err(PromotionDecisionContractError::invalid_payload(
+            "timestamps must use UTC `Z` offset",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn compose_promotion_decision_id(
+    candidate_id: &str,
+    decided_at_utc: &str,
+) -> Result<String, PromotionDecisionContractError> {
+    let normalized_candidate_id = normalize_research_identifier(candidate_id);
+    if normalized_candidate_id.is_empty() {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "candidate_id cannot be blank",
+            vec![PromotionDecisionValidationIssue {
+                field: "candidate_id".to_string(),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "candidate_id cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let decided_at = parse_promotion_utc_timestamp(decided_at_utc)?;
+    Ok(format!(
+        "{}::{}",
+        normalized_candidate_id,
+        decided_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn evaluate_promotion_thresholds(
+    thresholds: &[PromotionThresholdDefinition],
+    observed_metrics: &Value,
+) -> Result<Vec<PromotionThresholdOutcome>, PromotionDecisionContractError> {
+    if thresholds.is_empty() {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "at least one promotion threshold is required",
+            vec![PromotionDecisionValidationIssue {
+                field: "thresholds".to_string(),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "at least one promotion threshold is required".to_string(),
+            }],
+        ));
+    }
+    let Value::Object(observed_map) = observed_metrics else {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "observed_metrics must be a JSON object",
+            vec![PromotionDecisionValidationIssue {
+                field: "observed_metrics".to_string(),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "observed_metrics must be a JSON object".to_string(),
+            }],
+        ));
+    };
+
+    let mut outcomes = Vec::with_capacity(thresholds.len());
+    let mut field_errors = Vec::new();
+    for (index, threshold) in thresholds.iter().enumerate() {
+        let metric_key = normalize_research_identifier(&threshold.metric_key);
+        if metric_key.is_empty() {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("thresholds[{index}].metric_key"),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "metric_key is required".to_string(),
+            });
+            continue;
+        }
+        if !threshold.threshold_value.is_finite() {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("thresholds[{index}].threshold_value"),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "threshold_value must be finite".to_string(),
+            });
+            continue;
+        }
+        let observed_value = observed_map
+            .iter()
+            .find(|(key, _)| normalize_research_identifier(key) == metric_key)
+            .and_then(|(_, value)| value.as_f64());
+        let Some(observed_value) = observed_value else {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("observed_metrics.{metric_key}"),
+                code: PromotionDecisionReasonCode::StateUnavailable.code(),
+                message: format!("observed metric `{metric_key}` is unavailable"),
+            });
+            continue;
+        };
+        if !observed_value.is_finite() {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("observed_metrics.{metric_key}"),
+                code: PromotionDecisionReasonCode::StateUnavailable.code(),
+                message: format!("observed metric `{metric_key}` must be finite"),
+            });
+            continue;
+        }
+
+        let passed = match threshold.comparator {
+            ValidationGateComparator::Lt => observed_value < threshold.threshold_value,
+            ValidationGateComparator::Lte => observed_value <= threshold.threshold_value,
+            ValidationGateComparator::Gt => observed_value > threshold.threshold_value,
+            ValidationGateComparator::Gte => observed_value >= threshold.threshold_value,
+        };
+        outcomes.push(PromotionThresholdOutcome {
+            metric_key,
+            comparator: threshold.comparator,
+            threshold_value: threshold.threshold_value,
+            observed_value,
+            passed,
+            reason_code: if passed {
+                PromotionThresholdReasonCode::Passed.code().to_string()
+            } else {
+                PromotionThresholdReasonCode::Failed.code().to_string()
+            },
+        });
+    }
+    if !field_errors.is_empty() {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "promotion threshold evaluation failed",
+            field_errors,
+        ));
+    }
+
+    outcomes.sort_by(|left, right| {
+        left.metric_key
+            .cmp(&right.metric_key)
+            .then_with(|| left.comparator.as_str().cmp(right.comparator.as_str()))
+    });
+    Ok(outcomes)
+}
+
+pub fn validate_promotion_evidence_packet(
+    action: PromotionLifecycleAction,
+    evidence_packet: &Value,
+) -> Result<Vec<String>, PromotionDecisionContractError> {
+    let Value::Object(map) = evidence_packet else {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "evidence_packet must be a JSON object",
+            vec![PromotionDecisionValidationIssue {
+                field: "evidence_packet".to_string(),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "evidence_packet must be a JSON object".to_string(),
+            }],
+        ));
+    };
+    if action != PromotionLifecycleAction::Promote {
+        return Ok(Vec::new());
+    }
+
+    let missing = FR45_REQUIRED_PROMOTION_PACKET_FIELDS
+        .iter()
+        .filter_map(|field| {
+            let is_missing = match map.get(*field) {
+                None | Some(Value::Null) => true,
+                Some(Value::String(text)) => text.trim().is_empty(),
+                Some(Value::Object(object)) => object.is_empty(),
+                Some(Value::Array(array)) => array.is_empty(),
+                Some(_) => false,
+            };
+            if is_missing {
+                Some((*field).to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(missing)
+}
+
+pub fn canonicalize_promotion_decision_record(
+    record: &PromotionDecisionRecord,
+) -> Result<PromotionDecisionRecord, PromotionDecisionContractError> {
+    let mut canonical = PromotionDecisionRecord {
+        decision_id: normalize_research_identifier(&record.decision_id),
+        candidate_id: normalize_research_identifier(&record.candidate_id),
+        validation_run_id: normalize_research_identifier(&record.validation_run_id),
+        lifecycle_action: record.lifecycle_action,
+        decision_state: record.decision_state,
+        reason_code: normalize_research_identifier(&record.reason_code),
+        observed_metrics: record.observed_metrics.clone(),
+        evidence_packet: record.evidence_packet.clone(),
+        threshold_results: record.threshold_results.clone(),
+        missing_evidence_fields: record
+            .missing_evidence_fields
+            .iter()
+            .map(|field| normalize_research_identifier(field))
+            .filter(|field| !field.is_empty())
+            .collect(),
+        gate_evaluation: record.gate_evaluation.clone(),
+        shadow_readiness: record.shadow_readiness.clone(),
+        actor_id: record.actor_id.trim().to_string(),
+        correlation_id: record.correlation_id.trim().to_string(),
+        decided_at_utc: record.decided_at_utc.trim().to_string(),
+        approval_request_id: record
+            .approval_request_id
+            .as_ref()
+            .map(|value| normalize_research_identifier(value))
+            .filter(|value| !value.is_empty()),
+        approval_reference: record
+            .approval_reference
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    canonical.threshold_results.sort_by(|left, right| {
+        left.metric_key
+            .cmp(&right.metric_key)
+            .then_with(|| left.comparator.as_str().cmp(right.comparator.as_str()))
+    });
+    canonical.missing_evidence_fields.sort();
+    canonical.missing_evidence_fields.dedup();
+
+    validate_promotion_decision_record(&canonical)?;
+    Ok(canonical)
+}
+
+pub fn validate_promotion_decision_record(
+    record: &PromotionDecisionRecord,
+) -> Result<(), PromotionDecisionContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_promotion_field(&mut field_errors, "decision_id", &record.decision_id);
+    validate_non_empty_promotion_field(&mut field_errors, "candidate_id", &record.candidate_id);
+    validate_non_empty_promotion_field(
+        &mut field_errors,
+        "validation_run_id",
+        &record.validation_run_id,
+    );
+    validate_non_empty_promotion_field(&mut field_errors, "reason_code", &record.reason_code);
+    validate_non_empty_promotion_field(&mut field_errors, "actor_id", &record.actor_id);
+    validate_non_empty_promotion_field(&mut field_errors, "correlation_id", &record.correlation_id);
+    validate_non_empty_promotion_field(&mut field_errors, "decided_at_utc", &record.decided_at_utc);
+
+    if parse_promotion_utc_timestamp(&record.decided_at_utc).is_err() {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "decided_at_utc".to_string(),
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: "decided_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    if PromotionDecisionReasonCode::parse(&record.reason_code).is_err() {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "reason_code".to_string(),
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: "reason_code is not recognized".to_string(),
+        });
+    }
+    if !matches!(record.observed_metrics, Value::Object(_)) {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "observed_metrics".to_string(),
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: "observed_metrics must be a JSON object".to_string(),
+        });
+    }
+    if !matches!(record.evidence_packet, Value::Object(_)) {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "evidence_packet".to_string(),
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: "evidence_packet must be a JSON object".to_string(),
+        });
+    }
+    if !matches!(record.gate_evaluation, Value::Object(_)) {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "gate_evaluation".to_string(),
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: "gate_evaluation must be a JSON object".to_string(),
+        });
+    }
+    if let Some(shadow_readiness) = record.shadow_readiness.as_ref()
+        && !matches!(shadow_readiness, Value::Object(_))
+    {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "shadow_readiness".to_string(),
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: "shadow_readiness must be a JSON object when present".to_string(),
+        });
+    }
+    if record.approval_reference.is_some() && record.approval_request_id.is_none() {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "approval_request_id".to_string(),
+            code: PromotionDecisionReasonCode::ApprovalInvalidState.code(),
+            message: "approval_request_id is required when approval_reference is provided"
+                .to_string(),
+        });
+    }
+    if record.lifecycle_action == PromotionLifecycleAction::Promote
+        && record.decision_state == PromotionDecisionState::Allowed
+        && record.approval_reference.is_none()
+    {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "approval_reference".to_string(),
+            code: PromotionDecisionReasonCode::ApprovalRequired.code(),
+            message: "promotion allow decisions require approval_reference".to_string(),
+        });
+    }
+
+    for (index, threshold) in record.threshold_results.iter().enumerate() {
+        if normalize_research_identifier(&threshold.metric_key).is_empty() {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("threshold_results[{index}].metric_key"),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "metric_key is required".to_string(),
+            });
+        }
+        if !threshold.threshold_value.is_finite() {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("threshold_results[{index}].threshold_value"),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "threshold_value must be finite".to_string(),
+            });
+        }
+        if !threshold.observed_value.is_finite() {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("threshold_results[{index}].observed_value"),
+                code: PromotionDecisionReasonCode::StateUnavailable.code(),
+                message: "observed_value must be finite".to_string(),
+            });
+        }
+        if PromotionThresholdReasonCode::parse(&threshold.reason_code).is_err() {
+            field_errors.push(PromotionDecisionValidationIssue {
+                field: format!("threshold_results[{index}].reason_code"),
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message: "threshold reason_code is not recognized".to_string(),
+            });
+        }
+    }
+
+    if record.lifecycle_action == PromotionLifecycleAction::Promote {
+        match validate_promotion_evidence_packet(record.lifecycle_action, &record.evidence_packet) {
+            Ok(required_missing_fields) => {
+                let absent_required_fields = required_missing_fields
+                    .into_iter()
+                    .filter(|required| {
+                        !record
+                            .missing_evidence_fields
+                            .iter()
+                            .any(|present| present == required)
+                    })
+                    .collect::<Vec<_>>();
+                if !absent_required_fields.is_empty() {
+                    field_errors.push(PromotionDecisionValidationIssue {
+                        field: "missing_evidence_fields".to_string(),
+                        code: PromotionDecisionReasonCode::MissingEvidence.code(),
+                        message: format!(
+                            "missing_evidence_fields must include FR45 evidence packet gaps: {}",
+                            absent_required_fields.join(", ")
+                        ),
+                    });
+                }
+            }
+            Err(error) => field_errors.extend(error.field_errors),
+        }
+    }
+
+    if record.decision_state == PromotionDecisionState::Allowed
+        && record.threshold_results.iter().any(|result| !result.passed)
+    {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "threshold_results".to_string(),
+            code: PromotionDecisionReasonCode::ThresholdFailed.code(),
+            message: "allowed decisions cannot include failed threshold_results".to_string(),
+        });
+    }
+    if record.decision_state == PromotionDecisionState::Allowed
+        && !record.missing_evidence_fields.is_empty()
+    {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: "missing_evidence_fields".to_string(),
+            code: PromotionDecisionReasonCode::MissingEvidence.code(),
+            message: "allowed decisions cannot contain missing evidence fields".to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "promotion decision payload failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_empty_promotion_field(
+    field_errors: &mut Vec<PromotionDecisionValidationIssue>,
+    field: &str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(PromotionDecisionValidationIssue {
+            field: field.to_string(),
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: format!("{field} is required"),
+        });
+    }
+}
+
 pub fn parse_validation_utc_timestamp(
     value: &str,
 ) -> Result<OffsetDateTime, ValidationWorkflowContractError> {
@@ -2159,5 +2804,231 @@ mod tests {
                 .iter()
                 .any(|issue| issue.field.contains("simulation_reason_code"))
         );
+    }
+
+    fn sample_promotion_decision_record() -> PromotionDecisionRecord {
+        PromotionDecisionRecord {
+            decision_id: "candidate::alpha-1::1712448000".to_string(),
+            candidate_id: "candidate::alpha-1".to_string(),
+            validation_run_id: "candidate::alpha-1::1712447000".to_string(),
+            lifecycle_action: PromotionLifecycleAction::Promote,
+            decision_state: PromotionDecisionState::Denied,
+            reason_code: PromotionDecisionReasonCode::MissingEvidence.code().to_string(),
+            observed_metrics: json!({
+                "out_of_sample_sharpe": 1.28,
+                "max_drawdown": -0.17,
+                "overfit_indicator": 0.23
+            }),
+            evidence_packet: json!({
+                "data_quality_report": { "artifact_id": "quality::001" },
+                "purged_cpcv_results": { "artifact_id": "cpcv::001" },
+                "calibration_report": { "artifact_id": "calibration::001" }
+            }),
+            threshold_results: vec![
+                PromotionThresholdOutcome {
+                    metric_key: "max_drawdown".to_string(),
+                    comparator: ValidationGateComparator::Gte,
+                    threshold_value: -0.2,
+                    observed_value: -0.17,
+                    passed: true,
+                    reason_code: PromotionThresholdReasonCode::Passed.code().to_string(),
+                },
+                PromotionThresholdOutcome {
+                    metric_key: "out_of_sample_sharpe".to_string(),
+                    comparator: ValidationGateComparator::Gte,
+                    threshold_value: 1.0,
+                    observed_value: 1.28,
+                    passed: true,
+                    reason_code: PromotionThresholdReasonCode::Passed.code().to_string(),
+                },
+            ],
+            missing_evidence_fields: vec!["counterfactual_replay_summary".to_string()],
+            gate_evaluation: json!({
+                "reason_code": "validation_gate_evaluation_allowed",
+                "gate_passed": true
+            }),
+            shadow_readiness: Some(json!({
+                "evaluation_id": "candidate::alpha-1::1712447999",
+                "reason_code": "shadow_evaluation_completed"
+            })),
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-promotion-001".to_string(),
+            decided_at_utc: "2026-04-07T00:00:00Z".to_string(),
+            approval_request_id: Some("request::promotion-001".to_string()),
+            approval_reference: Some("approval::promotion-001".to_string()),
+        }
+    }
+
+    #[test]
+    fn promotion_decision_lifecycle_action_parse_rejects_unsupported_actions() {
+        assert_eq!(
+            PromotionLifecycleAction::parse("promote").expect("promote should parse"),
+            PromotionLifecycleAction::Promote
+        );
+        assert_eq!(
+            PromotionLifecycleAction::parse("pause").expect("pause should parse"),
+            PromotionLifecycleAction::Pause
+        );
+        assert_eq!(
+            PromotionLifecycleAction::parse("retire").expect("retire should parse"),
+            PromotionLifecycleAction::Retire
+        );
+
+        let error = PromotionLifecycleAction::parse("deploy")
+            .expect_err("unsupported lifecycle action must fail");
+        assert_eq!(error.code, PromotionDecisionReasonCode::InvalidPayload.code());
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "lifecycle_action"
+                && issue.code == PromotionDecisionReasonCode::UnsupportedAction.code()
+        }));
+    }
+
+    #[test]
+    fn promotion_decision_threshold_evaluation_honors_boundary_semantics() {
+        let thresholds = vec![
+            PromotionThresholdDefinition {
+                metric_key: "metric_gt".to_string(),
+                comparator: ValidationGateComparator::Gt,
+                threshold_value: 1.0,
+            },
+            PromotionThresholdDefinition {
+                metric_key: "metric_gte".to_string(),
+                comparator: ValidationGateComparator::Gte,
+                threshold_value: 1.0,
+            },
+            PromotionThresholdDefinition {
+                metric_key: "metric_lt".to_string(),
+                comparator: ValidationGateComparator::Lt,
+                threshold_value: 1.0,
+            },
+            PromotionThresholdDefinition {
+                metric_key: "metric_lte".to_string(),
+                comparator: ValidationGateComparator::Lte,
+                threshold_value: 1.0,
+            },
+        ];
+        let observed_metrics = json!({
+            "metric_gt": 1.0,
+            "metric_gte": 1.0,
+            "metric_lt": 1.0,
+            "metric_lte": 1.0
+        });
+
+        let outcomes = evaluate_promotion_thresholds(&thresholds, &observed_metrics)
+            .expect("threshold evaluation should succeed");
+        let by_metric = outcomes
+            .iter()
+            .map(|outcome| (outcome.metric_key.as_str(), outcome))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert!(!by_metric["metric_gt"].passed);
+        assert_eq!(
+            by_metric["metric_gt"].reason_code,
+            PromotionThresholdReasonCode::Failed.code()
+        );
+        assert!(by_metric["metric_gte"].passed);
+        assert_eq!(
+            by_metric["metric_gte"].reason_code,
+            PromotionThresholdReasonCode::Passed.code()
+        );
+        assert!(!by_metric["metric_lt"].passed);
+        assert!(by_metric["metric_lte"].passed);
+    }
+
+    #[test]
+    fn promotion_decision_evidence_packet_reports_missing_fr45_fields_for_promote() {
+        let missing = validate_promotion_evidence_packet(
+            PromotionLifecycleAction::Promote,
+            &json!({
+                "data_quality_report": { "artifact_id": "quality::001" },
+                "purged_cpcv_results": { "artifact_id": "cpcv::001" }
+            }),
+        )
+        .expect("packet shape should parse");
+        assert_eq!(
+            missing,
+            vec![
+                "calibration_report".to_string(),
+                "counterfactual_replay_summary".to_string()
+            ]
+        );
+
+        let non_promote_missing = validate_promotion_evidence_packet(
+            PromotionLifecycleAction::Pause,
+            &json!({}),
+        )
+        .expect("pause packet should be accepted without FR45 requirements");
+        assert!(non_promote_missing.is_empty());
+    }
+
+    #[test]
+    fn promotion_decision_reason_code_parse_accepts_known_values() {
+        let code = PromotionDecisionReasonCode::parse("promotion_decision_threshold_failed")
+            .expect("known reason should parse");
+        assert_eq!(code, PromotionDecisionReasonCode::ThresholdFailed);
+    }
+
+    #[test]
+    fn promotion_decision_validation_accepts_additional_missing_evidence_diagnostics() {
+        let mut record = sample_promotion_decision_record();
+        record
+            .missing_evidence_fields
+            .push("validation_run_id".to_string());
+
+        validate_promotion_decision_record(&record)
+            .expect("validation should allow additional diagnostics beyond FR45 packet gaps");
+    }
+
+    #[test]
+    fn promotion_decision_validation_requires_fr45_missing_fields_to_be_present() {
+        let mut record = sample_promotion_decision_record();
+        record.missing_evidence_fields.clear();
+
+        let error = validate_promotion_decision_record(&record)
+            .expect_err("validation should fail if FR45 packet gaps are omitted");
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "missing_evidence_fields"
+                && issue.code == PromotionDecisionReasonCode::MissingEvidence.code()
+        }));
+    }
+
+    #[test]
+    fn promotion_decision_canonicalization_normalizes_identifiers_and_orders_thresholds() {
+        let mut record = sample_promotion_decision_record();
+        record.decision_id = " Candidate::Alpha-1::1712448000 ".to_string();
+        record.candidate_id = " Candidate::Alpha-1 ".to_string();
+        record.validation_run_id = " Candidate::Alpha-1::1712447000 ".to_string();
+        record.reason_code = " Promotion_Decision_Missing_Evidence ".to_string();
+        record.threshold_results.reverse();
+
+        let canonical = canonicalize_promotion_decision_record(&record)
+            .expect("canonical promotion decision should validate");
+        assert_eq!(canonical.decision_id, "candidate::alpha-1::1712448000");
+        assert_eq!(canonical.candidate_id, "candidate::alpha-1");
+        assert_eq!(
+            canonical.validation_run_id,
+            "candidate::alpha-1::1712447000"
+        );
+        assert_eq!(
+            canonical.reason_code,
+            PromotionDecisionReasonCode::MissingEvidence.code()
+        );
+        assert_eq!(canonical.threshold_results[0].metric_key, "max_drawdown");
+        assert_eq!(canonical.threshold_results[1].metric_key, "out_of_sample_sharpe");
+    }
+
+    #[test]
+    fn promotion_decision_allow_validation_requires_signoff_and_no_missing_evidence() {
+        let mut record = sample_promotion_decision_record();
+        record.decision_state = PromotionDecisionState::Allowed;
+        record.reason_code = PromotionDecisionReasonCode::DecisionAllowed.code().to_string();
+        record.approval_reference = None;
+
+        let error = validate_promotion_decision_record(&record)
+            .expect_err("allow decision without signoff should fail closed");
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "approval_reference"
+                && issue.code == PromotionDecisionReasonCode::ApprovalRequired.code()
+        }));
     }
 }

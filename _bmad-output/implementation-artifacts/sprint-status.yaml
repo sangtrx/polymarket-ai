@@ -1,5 +1,5 @@
 # generated: 2026-04-04T17:40:16Z
-# last_updated: 2026-04-07T21:22:53Z
+# last_updated: 2026-04-07T22:54:13Z
 # project: polymarket-ai
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-04T17:40:16Z
-last_updated: 2026-04-07T21:22:53Z
+last_updated: 2026-04-07T22:54:13Z
 project: polymarket-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -89,7 +89,7 @@ development_status:
   6-2-configure-leakage-and-data-quality-gate-definitions: done
   6-3-implement-validation-workflow-and-diagnostics-artifact-store: done
   6-4-add-shadow-mode-evaluation-pipeline: done
-  6-5-enforce-promotion-thresholds-evidence-criteria-and-lifecycle-actions: backlog
+  6-5-enforce-promotion-thresholds-evidence-criteria-and-lifecycle-actions: done
   6-6-integrate-counterfactual-replay-stress-gates: backlog
   6-7-implement-live-alpha-health-monitoring-and-threshold-detection: backlog
   6-8-deliver-alpha-governance-readiness-card-ux: backlog

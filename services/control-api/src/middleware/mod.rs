@@ -24,6 +24,9 @@ use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportS
 use reporting_service::exports::workflows::{
     ReportExportOrchestrator, ReportExportWorkflowService,
 };
+use research_gateway::promotion::decisions::{
+    PromotionDecisionOrchestrator, PromotionDecisionService,
+};
 use research_gateway::validation::gate_policies::{
     ValidationGatePolicyOrchestrator, ValidationGatePolicyService,
 };
@@ -242,6 +245,7 @@ pub struct ControlApiState {
     pub research_validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
     pub research_validation_workflow_orchestrator: Arc<dyn ValidationWorkflowRunOrchestrator>,
     pub research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
+    pub research_promotion_decision_orchestrator: Arc<dyn PromotionDecisionOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
@@ -358,6 +362,7 @@ impl ControlApiState {
                 ValidationWorkflowRunService::default(),
             ),
             research_shadow_mode_orchestrator: Arc::new(ShadowModeService::default()),
+            research_promotion_decision_orchestrator: Arc::new(PromotionDecisionService::default()),
             recovery_orchestrator,
             attribution_pool: None,
         }
@@ -423,6 +428,15 @@ impl ControlApiState {
         research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
     ) -> Self {
         self.research_shadow_mode_orchestrator = research_shadow_mode_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_research_promotion_decision_orchestrator(
+        mut self,
+        research_promotion_decision_orchestrator: Arc<dyn PromotionDecisionOrchestrator>,
+    ) -> Self {
+        self.research_promotion_decision_orchestrator = research_promotion_decision_orchestrator;
         self
     }
 

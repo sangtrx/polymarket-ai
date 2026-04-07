@@ -860,3 +860,32 @@
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-4` ✅
 - `source "$HOME/.cargo/env" && npm test` ✅
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-4` ✅ (2026-04-07 21:15:05 QA automation rerun with expanded API/E2E critical-flow coverage)
+
+---
+
+## Story 6.5 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::promotion_decision_`) — validates lifecycle action parsing, reason-code parsing, FR45 evidence-packet completeness checks, deterministic threshold boundary semantics, and canonical identifier ordering behavior.
+- [x] `crates/persistence/src/postgres/promotion_decisions.rs` (`postgres::promotion_decisions::tests::`) — validates `promotion_decisions` schema-scope isolation, canonical constraints/indexes, deterministic list ordering, and machine-readable persistence validation behavior.
+- [x] `services/research-gateway/src/promotion/decisions.rs` (`promotion::decisions::tests::`) — validates allow/deny lifecycle orchestration, FR45 evidence gating, Story 6.2 promotion-gate seam reuse, and fail-closed dependency/state/persistence handling.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::promotion_decision_`) — validates authenticated start/read/list route behavior, canonical `data/meta/error` envelopes, deterministic `400/403/409/503/500` status mapping, malformed payload rejection, and unauthorized security-signal emission.
+- [x] `tests/api/story-6-5-promotion-lifecycle-governance-api.test.mjs` — validates route wiring, payload/query/envelope contracts, governed sign-off integration (`strategy_promotion_override`), startup/state orchestration wiring, research-gateway seam exports, unauthorized signal token continuity, and correlation-id continuity in deny envelopes/audit records.
+- [x] `tests/e2e/story-6-5-promotion-lifecycle-governance.e2e.test.mjs` — validates migration scope boundaries, FR8/FR11/FR45 runbook contract coverage, seam-reuse/fail-closed orchestration guarantees, deterministic persistence ordering/boundary behavior, list-route deterministic limit/repository-call contracts, allow-telemetry continuity, and Story 6.5 QA command wiring.
+
+### Coverage
+
+- Story 6.5 now has deterministic automated coverage for:
+  - FR8 lifecycle action governance (`promote`/`pause`/`retire`) with canonical route and contract surfaces,
+  - FR45 required promotion packet completeness (`data_quality_report`, `purged_cpcv_results`, `calibration_report`, `counterfactual_replay_summary`) and explicit missing-field diagnostics,
+  - deterministic threshold comparator boundary semantics (`lt`/`lte`/`gt`/`gte`) with machine-readable pass/fail reason continuity,
+  - governed sign-off integration plus fail-closed dependency/state/persistence denial behavior across orchestration and control-plane status mapping.
+- Automated Story 6.5 regression inventory in this QA refresh: **41 Story-6.5 tests passing** (`domain: 8`, `persistence: 5`, `research-gateway: 6`, `control-api: 5`, `api/e2e: 17`).
+
+### Execution Result
+
+- `node --test tests/api/story-6-5*.test.mjs tests/e2e/story-6-5*.test.mjs` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-5` ✅
+- `source "$HOME/.cargo/env" && npm test` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-5` ✅ (2026-04-07 22:48:47 QA automation rerun with expanded Story 6.5 list critical-flow E2E coverage)

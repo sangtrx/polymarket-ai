@@ -46,8 +46,9 @@ use domain::reporting_schedule::{
     parse_utc_timestamp,
 };
 use domain::research::{
-    AlphaHypothesisReasonCode, ShadowEvaluationReasonCode, ValidationGateReasonCode,
-    ValidationWorkflowReasonCode, normalize_research_identifier,
+    AlphaHypothesisReasonCode, PromotionDecisionReasonCode, PromotionDecisionState,
+    ShadowEvaluationReasonCode, ValidationGateReasonCode, ValidationWorkflowReasonCode,
+    normalize_research_identifier,
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
@@ -103,6 +104,10 @@ use reporting_service::exports::scheduling::{
 use reporting_service::exports::workflows::{
     GetExportArtifactInput, ListExportArtifactsInput, QueryExportJobInput, ReportExportJobEvidence,
     TriggerIncidentExportInput, TriggerOnDemandExportInput,
+};
+use research_gateway::promotion::decisions::{
+    ListPromotionDecisionsInput, PromotionDecisionEvidence, PromotionDecisionServiceError,
+    ReadPromotionDecisionInput, StartPromotionDecisionInput,
 };
 use research_gateway::validation::gate_policies::{
     EvaluateValidationGatePoliciesInput, ListValidationGatePoliciesInput,
@@ -241,6 +246,14 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/research/shadow-evaluations/{evaluation_id}",
             get(read_shadow_evaluation),
+        )
+        .route(
+            "/control/research/promotion-decisions",
+            post(start_promotion_decision).get(list_promotion_decisions),
+        )
+        .route(
+            "/control/research/promotion-decisions/{decision_id}",
+            get(read_promotion_decision),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -1894,6 +1907,283 @@ pub async fn list_shadow_evaluations(
         evaluations,
         endpoint,
         "shadow_evaluation_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn start_promotion_decision(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<PromotionDecisionStartPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = "/control/research/promotion-decisions".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return promotion_decision_payload_rejection_response(
+                &state,
+                &actor,
+                "promotion_decision_start",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let approval_request_id = payload
+        .approval_request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let provided_approval_reference = payload
+        .approval_reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if provided_approval_reference.is_some() && approval_request_id.is_none() {
+        return promotion_decision_service_error_response(
+            &state,
+            PromotionDecisionServiceError {
+                code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                message:
+                    "approval_reference cannot be supplied directly; provide approval_request_id and rely on approval workflow evidence.".to_string(),
+                field_errors: vec![domain::research::PromotionDecisionValidationIssue {
+                    field: "approval_reference".to_string(),
+                    code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                    message:
+                        "approval_reference requires approval_request_id and must originate from an approved request.".to_string(),
+                }],
+            },
+            "promotion_decision_start",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint.clone(),
+            effective_correlation_id.clone(),
+        );
+    }
+
+    let mut approval_reference = provided_approval_reference;
+    let lifecycle_action = normalize_research_identifier(&payload.lifecycle_action);
+    if lifecycle_action == "promote"
+        && let Some(request_id) = approval_request_id.as_deref()
+    {
+        let approval_decision =
+            match state
+                .approval_orchestrator
+                .evaluate_execution(EvaluateApprovalExecutionInput {
+                    request_id: request_id.to_string(),
+                    action_id: "strategy_promotion_override".to_string(),
+                    actor_id: actor.actor_id.clone(),
+                    actor_role: actor.role.clone(),
+                    correlation_id: effective_correlation_id.clone(),
+                    now_utc: authorization.timestamp_utc.clone(),
+                }) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return promotion_decision_service_error_response(
+                        &state,
+                        PromotionDecisionServiceError {
+                            code: PromotionDecisionReasonCode::DependencyUnavailable.code(),
+                            message: error.message,
+                            field_errors: Vec::new(),
+                        },
+                        "promotion_decision_start",
+                        &actor,
+                        authorization.timestamp_utc.clone(),
+                        endpoint.clone(),
+                        effective_correlation_id.clone(),
+                    );
+                }
+            };
+        match approval_decision.outcome {
+            ApprovalDecisionOutcome::Allow => {
+                approval_reference = approval_decision
+                    .approval_reference
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            ApprovalDecisionOutcome::Pending | ApprovalDecisionOutcome::Deny => {
+                approval_reference = None;
+            }
+        }
+    }
+
+    let evidence = match state
+        .research_promotion_decision_orchestrator
+        .start_promotion_decision(StartPromotionDecisionInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: payload.candidate_id,
+            validation_run_id: payload.validation_run_id,
+            lifecycle_action: payload.lifecycle_action,
+            observed_metrics: payload.observed_metrics,
+            thresholds: payload.thresholds,
+            evidence_packet: payload.evidence_packet,
+            shadow_readiness: payload.shadow_readiness,
+            approval_request_id,
+            approval_reference,
+            correlation_id: effective_correlation_id.clone(),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return promotion_decision_service_error_response(
+                &state,
+                error,
+                "promotion_decision_start",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    promotion_decision_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "promotion_decision_start",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_promotion_decision(
+    State(state): State<ControlApiState>,
+    Path(decision_id): Path<String>,
+    Query(query): Query<PromotionDecisionReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/promotion-decisions/{decision_id}");
+    let authorization = match authorize_promotion_decision_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "promotion_decision_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_promotion_decision_orchestrator
+        .read_promotion_decision(ReadPromotionDecisionInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            decision_id,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return promotion_decision_service_error_response(
+                &state,
+                error,
+                "promotion_decision_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    promotion_decision_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "promotion_decision_read",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn list_promotion_decisions(
+    State(state): State<ControlApiState>,
+    Query(query): Query<PromotionDecisionsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/promotion-decisions".to_string();
+    let authorization = match authorize_promotion_decision_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "promotion_decision_list",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let candidate_id = query.candidate_id.clone();
+    let canonical_candidate_id = normalize_research_identifier(&candidate_id);
+
+    let decisions = match state
+        .research_promotion_decision_orchestrator
+        .list_promotion_decisions(ListPromotionDecisionsInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: candidate_id.clone(),
+            limit: query.limit,
+            decided_after_utc: query.decided_after_utc,
+            decided_before_utc: query.decided_before_utc,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(decisions) => decisions,
+        Err(error) => {
+            return promotion_decision_service_error_response(
+                &state,
+                error,
+                "promotion_decision_list",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id.clone(),
+            );
+        }
+    };
+
+    promotion_decision_list_response(
+        &state,
+        &actor,
+        canonical_candidate_id,
+        decisions,
+        endpoint,
+        "promotion_decision_list",
         effective_correlation_id,
         authorization.timestamp_utc,
     )
@@ -6334,6 +6624,60 @@ fn authorize_shadow_evaluation_read(
     )))
 }
 
+fn authorize_promotion_decision_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(promotion_decision_service_error_response(
+        state,
+        PromotionDecisionServiceError {
+            code: PromotionDecisionReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
 fn authorize_attribution_read(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -8763,6 +9107,333 @@ fn validation_stage_comparison_to_item(
                 delta: delta.delta,
             })
             .collect(),
+    }
+}
+
+fn promotion_decision_detail_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: PromotionDecisionEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let correlation_id = evidence.decision.correlation_id.clone();
+    let reason_code = evidence.reason_code.clone();
+    let decision = evidence.decision;
+    let decision_id = decision.decision_id.clone();
+    let candidate_id = decision.candidate_id.clone();
+    let lifecycle_action = decision.lifecycle_action.as_str().to_string();
+    let decision_state = decision.decision_state.as_str().to_string();
+    let missing_evidence_count = decision.missing_evidence_fields.len();
+    let threshold_results_count = decision.threshold_results.len();
+    let approval_reference = decision.approval_reference.clone();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "decision_id": decision_id,
+            "candidate_id": candidate_id,
+            "lifecycle_action": lifecycle_action,
+            "decision_state": decision_state,
+            "missing_evidence_count": missing_evidence_count,
+            "threshold_results_count": threshold_results_count,
+        }),
+        approval_reference: approval_reference.clone(),
+        timestamp: timestamp_utc.clone(),
+        outcome: if decision.decision_state == PromotionDecisionState::Allowed {
+            PrivilegedAuditOutcome::Allow
+        } else {
+            PrivilegedAuditOutcome::AuthorizationDenied
+        },
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    let status = if http_method == "POST" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        axum::Json(PromotionDecisionEnvelope {
+            data: Some(PromotionDecisionData::Decision {
+                decision: promotion_decision_to_item(decision),
+                reason_code: evidence.reason_code,
+            }),
+            meta: PromotionDecisionMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn promotion_decision_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    candidate_id: String,
+    decisions: Vec<domain::research::PromotionDecisionRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let decision_count = decisions.len();
+    let reason_code = PromotionDecisionReasonCode::DecisionListed.code().to_string();
+    let decision_items = decisions
+        .into_iter()
+        .map(promotion_decision_to_item)
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "candidate_id": candidate_id,
+            "decision_count": decision_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(PromotionDecisionEnvelope {
+            data: Some(PromotionDecisionData::Decisions {
+                candidate_id,
+                decisions: decision_items,
+            }),
+            meta: PromotionDecisionMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn promotion_decision_payload_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: JsonRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    promotion_decision_service_error_response(
+        state,
+        PromotionDecisionServiceError {
+            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+            message: format!("invalid promotion decision payload: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn promotion_decision_service_error_response(
+    state: &ControlApiState,
+    error: PromotionDecisionServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+    correlation_id: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") || action.ends_with("_list") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "error_code": error.code,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == PromotionDecisionReasonCode::UnauthorizedRole.code() {
+        Some(PromotionDecisionSecuritySignal {
+            name: if action.ends_with("_read") || action.ends_with("_list") {
+                "unauthorized_promotion_decision_read_attempt_v1"
+            } else {
+                "unauthorized_promotion_decision_mutation_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        promotion_decision_service_error_status(error.code),
+        axum::Json(PromotionDecisionEnvelope::<PromotionDecisionData> {
+            data: None,
+            meta: PromotionDecisionMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(PromotionDecisionEnvelopeError {
+                error_code: error.code.to_string(),
+                message: error.message,
+                field_errors: error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| PromotionDecisionFieldError {
+                        field: issue.field,
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn promotion_decision_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == PromotionDecisionReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == PromotionDecisionReasonCode::UnauthorizedRole.code() => {
+            StatusCode::FORBIDDEN
+        }
+        "promotion_decision_constraint_violation" => StatusCode::CONFLICT,
+        code if code == PromotionDecisionReasonCode::DecisionNotFound.code()
+            || code == PromotionDecisionReasonCode::MissingEvidence.code()
+            || code == PromotionDecisionReasonCode::ThresholdFailed.code()
+            || code == PromotionDecisionReasonCode::GateDenied.code()
+            || code == PromotionDecisionReasonCode::ApprovalRequired.code()
+            || code == PromotionDecisionReasonCode::ApprovalInvalidState.code() =>
+        {
+            StatusCode::CONFLICT
+        }
+        code if code == PromotionDecisionReasonCode::DependencyUnavailable.code()
+            || code == PromotionDecisionReasonCode::StateUnavailable.code()
+            || code == PromotionDecisionReasonCode::PersistenceUnavailable.code()
+            || code == "promotion_decision_query_failed"
+            || code == "promotion_decision_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn promotion_decision_to_item(
+    decision: domain::research::PromotionDecisionRecord,
+) -> PromotionDecisionItem {
+    PromotionDecisionItem {
+        decision_id: decision.decision_id,
+        candidate_id: decision.candidate_id,
+        validation_run_id: decision.validation_run_id,
+        lifecycle_action: decision.lifecycle_action.as_str().to_string(),
+        decision_state: decision.decision_state.as_str().to_string(),
+        reason_code: decision.reason_code,
+        observed_metrics: decision.observed_metrics,
+        evidence_packet: decision.evidence_packet,
+        threshold_results: decision
+            .threshold_results
+            .into_iter()
+            .map(|result| PromotionThresholdResultItem {
+                metric_key: result.metric_key,
+                comparator: result.comparator.as_str().to_string(),
+                threshold_value: result.threshold_value,
+                observed_value: result.observed_value,
+                passed: result.passed,
+                reason_code: result.reason_code,
+            })
+            .collect(),
+        missing_evidence_fields: decision.missing_evidence_fields,
+        gate_evaluation: decision.gate_evaluation,
+        shadow_readiness: decision.shadow_readiness,
+        actor_id: decision.actor_id,
+        correlation_id: decision.correlation_id,
+        decided_at_utc: decision.decided_at_utc,
+        approval_request_id: decision.approval_request_id,
+        approval_reference: decision.approval_reference,
     }
 }
 
@@ -11598,6 +12269,43 @@ pub struct ShadowEvaluationReadQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PromotionDecisionStartPayload {
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub lifecycle_action: String,
+    pub observed_metrics: serde_json::Value,
+    pub thresholds: Vec<domain::research::PromotionThresholdDefinition>,
+    pub evidence_packet: serde_json::Value,
+    #[serde(default)]
+    pub shadow_readiness: Option<serde_json::Value>,
+    #[serde(default)]
+    pub approval_request_id: Option<String>,
+    #[serde(default)]
+    pub approval_reference: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromotionDecisionsQuery {
+    pub candidate_id: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub decided_after_utc: Option<String>,
+    #[serde(default)]
+    pub decided_before_utc: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PromotionDecisionReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
@@ -12746,6 +13454,97 @@ pub struct ShadowSimulationOutcomeItem {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PromotionDecisionEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: PromotionDecisionMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<PromotionDecisionEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromotionDecisionData {
+    Decision {
+        decision: PromotionDecisionItem,
+        reason_code: String,
+    },
+    Decisions {
+        candidate_id: String,
+        decisions: Vec<PromotionDecisionItem>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromotionDecisionMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromotionDecisionEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<PromotionDecisionFieldError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<PromotionDecisionSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromotionDecisionFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromotionDecisionSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromotionDecisionItem {
+    pub decision_id: String,
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub lifecycle_action: String,
+    pub decision_state: String,
+    pub reason_code: String,
+    pub observed_metrics: serde_json::Value,
+    pub evidence_packet: serde_json::Value,
+    pub threshold_results: Vec<PromotionThresholdResultItem>,
+    pub missing_evidence_fields: Vec<String>,
+    pub gate_evaluation: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_readiness: Option<serde_json::Value>,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub decided_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromotionThresholdResultItem {
+    pub metric_key: String,
+    pub comparator: String,
+    pub threshold_value: f64,
+    pub observed_value: f64,
+    pub passed: bool,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct EmergencyControlDecisionResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13267,13 +14066,14 @@ mod tests {
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::research::{
-        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, ShadowEvaluationReasonCode,
-        ShadowEvaluationRecord, ShadowEvaluationState, ShadowSimulationDecisionSide,
+        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, PromotionDecisionReasonCode,
+        PromotionDecisionState, ShadowEvaluationReasonCode, ShadowEvaluationRecord,
+        ShadowEvaluationState, ShadowSimulationDecisionSide,
         ShadowSimulationOutcome, ShadowSimulationReasonCode, ValidationDiagnosticsPayload,
-        ValidationGateReasonCode, ValidationGateValidationIssue, ValidationMetricDelta,
-        ValidationStageComparison, ValidationWorkflowArtifactRecord, ValidationWorkflowReasonCode,
-        ValidationWorkflowRunRecord, ValidationWorkflowRunState, ValidationWorkflowStage,
-        ValidationWorkflowStageOutcome, ValidationWorkflowValidationIssue,
+        ValidationGateComparator, ValidationGateReasonCode, ValidationGateValidationIssue,
+        ValidationMetricDelta, ValidationStageComparison, ValidationWorkflowArtifactRecord,
+        ValidationWorkflowReasonCode, ValidationWorkflowRunRecord, ValidationWorkflowRunState,
+        ValidationWorkflowStage, ValidationWorkflowStageOutcome, ValidationWorkflowValidationIssue,
     };
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
@@ -13336,6 +14136,10 @@ mod tests {
     use research_gateway::validation::hypothesis_registry::{
         AlphaHypothesisEvidence, HypothesisRegistryOrchestrator, HypothesisRegistryServiceError,
         ReadAlphaHypothesisInput, UpsertAlphaHypothesisInput,
+    };
+    use research_gateway::promotion::decisions::{
+        ListPromotionDecisionsInput, PromotionDecisionEvidence, PromotionDecisionOrchestrator,
+        PromotionDecisionServiceError, ReadPromotionDecisionInput, StartPromotionDecisionInput,
     };
     use research_gateway::validation::shadow_mode::{
         ListShadowEvaluationsInput, ReadShadowEvaluationInput, ShadowEvaluationEvidence,
@@ -14741,6 +15545,174 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct StubPromotionDecisionOrchestrator {
+        start_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        list_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl StubPromotionDecisionOrchestrator {
+        fn service_error(code: &'static str, message: &'static str) -> PromotionDecisionServiceError {
+            PromotionDecisionServiceError {
+                code,
+                message: message.to_string(),
+                field_errors: if code == PromotionDecisionReasonCode::InvalidPayload.code() {
+                    vec![domain::research::PromotionDecisionValidationIssue {
+                        field: "candidate_id".to_string(),
+                        code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                        message: "candidate_id cannot be blank".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+
+        fn sample_decision(
+            decision_id: String,
+            candidate_id: String,
+            validation_run_id: String,
+            reason_code: String,
+            decision_state: PromotionDecisionState,
+            correlation_id: String,
+            timestamp_utc: String,
+        ) -> domain::research::PromotionDecisionRecord {
+            domain::research::PromotionDecisionRecord {
+                decision_id,
+                candidate_id,
+                validation_run_id,
+                lifecycle_action: domain::research::PromotionLifecycleAction::Promote,
+                decision_state,
+                reason_code,
+                observed_metrics: serde_json::json!({
+                    "out_of_sample_sharpe": 1.3,
+                    "max_drawdown": -0.18
+                }),
+                evidence_packet: serde_json::json!({
+                    "data_quality_report": { "artifact_id": "quality::001" },
+                    "purged_cpcv_results": { "artifact_id": "cpcv::001" },
+                    "calibration_report": { "artifact_id": "calibration::001" },
+                    "counterfactual_replay_summary": { "status": "deferred_to_story_6_6" }
+                }),
+                threshold_results: vec![domain::research::PromotionThresholdOutcome {
+                    metric_key: "out_of_sample_sharpe".to_string(),
+                    comparator: ValidationGateComparator::Gte,
+                    threshold_value: 1.0,
+                    observed_value: 1.3,
+                    passed: true,
+                    reason_code: "promotion_threshold_passed".to_string(),
+                }],
+                missing_evidence_fields: Vec::new(),
+                gate_evaluation: serde_json::json!({
+                    "reason_code": "validation_gate_evaluation_allowed",
+                    "outcome": "allow"
+                }),
+                shadow_readiness: Some(serde_json::json!({
+                    "evaluation_id": "candidate::alpha-1::1712457599",
+                    "reason_code": "shadow_evaluation_completed"
+                })),
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                decided_at_utc: timestamp_utc,
+                approval_request_id: Some("request::promotion-001".to_string()),
+                approval_reference: Some("approval::promotion-001".to_string()),
+            }
+        }
+    }
+
+    impl PromotionDecisionOrchestrator for StubPromotionDecisionOrchestrator {
+        fn start_promotion_decision(
+            &self,
+            input: StartPromotionDecisionInput,
+        ) -> Result<PromotionDecisionEvidence, PromotionDecisionServiceError> {
+            if let Some((code, message)) = self.start_error {
+                return Err(Self::service_error(code, message));
+            }
+            let mut decision = Self::sample_decision(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                input.validation_run_id,
+                PromotionDecisionReasonCode::DecisionAllowed.code().to_string(),
+                PromotionDecisionState::Allowed,
+                input.correlation_id,
+                input.requested_at_utc,
+            );
+            if input.lifecycle_action.trim().eq_ignore_ascii_case("promote")
+                && input
+                    .approval_reference
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+            {
+                decision.decision_state = PromotionDecisionState::Denied;
+                decision.reason_code = PromotionDecisionReasonCode::ApprovalRequired
+                    .code()
+                    .to_string();
+            }
+            if input
+                .evidence_packet
+                .get("counterfactual_replay_summary")
+                .is_none()
+            {
+                decision.decision_state = PromotionDecisionState::Denied;
+                decision.reason_code = PromotionDecisionReasonCode::MissingEvidence
+                    .code()
+                    .to_string();
+                decision.missing_evidence_fields =
+                    vec!["counterfactual_replay_summary".to_string()];
+            }
+            Ok(PromotionDecisionEvidence {
+                decision,
+                reason_code: PromotionDecisionReasonCode::DecisionStarted
+                    .code()
+                    .to_string(),
+            })
+        }
+
+        fn read_promotion_decision(
+            &self,
+            input: ReadPromotionDecisionInput,
+        ) -> Result<PromotionDecisionEvidence, PromotionDecisionServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(Self::service_error(code, message));
+            }
+            let decision = Self::sample_decision(
+                input.decision_id,
+                "candidate::alpha-1".to_string(),
+                "candidate::alpha-1::1712447000".to_string(),
+                PromotionDecisionReasonCode::DecisionAllowed.code().to_string(),
+                PromotionDecisionState::Allowed,
+                input.correlation_id,
+                input.queried_at_utc,
+            );
+            Ok(PromotionDecisionEvidence {
+                decision,
+                reason_code: PromotionDecisionReasonCode::DecisionRead.code().to_string(),
+            })
+        }
+
+        fn list_promotion_decisions(
+            &self,
+            input: ListPromotionDecisionsInput,
+        ) -> Result<Vec<domain::research::PromotionDecisionRecord>, PromotionDecisionServiceError>
+        {
+            if let Some((code, message)) = self.list_error {
+                return Err(Self::service_error(code, message));
+            }
+            Ok(vec![Self::sample_decision(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                "candidate::alpha-1::1712447000".to_string(),
+                PromotionDecisionReasonCode::DecisionAllowed.code().to_string(),
+                PromotionDecisionState::Allowed,
+                input.correlation_id,
+                input.queried_at_utc,
+            )])
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct StubAllocationPolicyOrchestrator {
         upsert_error: Option<(&'static str, &'static str)>,
         evaluate_error: Option<(&'static str, &'static str)>,
@@ -15622,6 +16594,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_research_shadow_mode_orchestrator(shadow_mode_orchestrator),
+        )
+    }
+
+    fn test_app_with_promotion_decision_orchestrator(
+        promotion_decision_orchestrator: Arc<dyn PromotionDecisionOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_promotion_decision_orchestrator(promotion_decision_orchestrator),
         )
     }
 
@@ -20098,6 +21092,298 @@ mod tests {
         assert_eq!(
             read_payload["error"]["security_signal"]["name"],
             "unauthorized_shadow_evaluation_read_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_decision_start_route_returns_data_meta_error_envelope() {
+        let app = test_app_with_promotion_decision_orchestrator(Arc::new(
+            StubPromotionDecisionOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/promotion-decisions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-promotion-decision-start-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "lifecycle_action":"promote",
+                            "observed_metrics":{"out_of_sample_sharpe":1.28,"max_drawdown":-0.17},
+                            "thresholds":[{"metric_key":"out_of_sample_sharpe","comparator":"gte","threshold_value":1.0}],
+                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"status":"deferred_to_story_6_6"}}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "decision");
+        assert_eq!(
+            payload["data"]["decision"]["decision_id"],
+            "candidate::alpha-1::1712457600000000000"
+        );
+        assert_eq!(payload["meta"]["action"], "promotion_decision_start");
+        assert!(payload["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn promotion_decision_read_list_routes_return_envelope_shapes() {
+        let app = test_app_with_promotion_decision_orchestrator(Arc::new(
+            StubPromotionDecisionOrchestrator::default(),
+        ));
+
+        let read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/promotion-decisions/candidate::alpha-1::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-promotion-decision-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(read_payload["data"]["kind"], "decision");
+        assert_eq!(read_payload["meta"]["action"], "promotion_decision_read");
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/promotion-decisions?candidate_id=%20Candidate::Alpha-1%20&limit=1")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-promotion-decision-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(list_payload["data"]["kind"], "decisions");
+        assert_eq!(
+            list_payload["data"]["decisions"][0]["reason_code"],
+            "promotion_decision_allowed"
+        );
+        assert_eq!(list_payload["data"]["candidate_id"], "candidate::alpha-1");
+        assert_eq!(list_payload["meta"]["action"], "promotion_decision_list");
+    }
+
+    #[tokio::test]
+    async fn promotion_decision_start_route_maps_approval_required_to_conflict() {
+        let app = test_app_with_promotion_decision_orchestrator(Arc::new(
+            StubPromotionDecisionOrchestrator {
+                start_error: Some((
+                    PromotionDecisionReasonCode::ApprovalRequired.code(),
+                    "promotion decision requires approval evidence",
+                )),
+                ..Default::default()
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/promotion-decisions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-promotion-decision-start-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "lifecycle_action":"promote",
+                            "observed_metrics":{"out_of_sample_sharpe":1.28,"max_drawdown":-0.17},
+                            "thresholds":[{"metric_key":"out_of_sample_sharpe","comparator":"gte","threshold_value":1.0}],
+                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"status":"deferred_to_story_6_6"}}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "promotion_decision_approval_required"
+        );
+        assert_eq!(payload["meta"]["action"], "promotion_decision_start");
+    }
+
+    #[tokio::test]
+    async fn promotion_decision_start_route_maps_json_rejection_to_bad_request_envelope() {
+        let app = test_app_with_promotion_decision_orchestrator(Arc::new(
+            StubPromotionDecisionOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/promotion-decisions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-promotion-decision-start-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":123,
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "lifecycle_action":"promote",
+                            "observed_metrics":{"out_of_sample_sharpe":1.28,"max_drawdown":-0.17},
+                            "thresholds":[{"metric_key":"out_of_sample_sharpe","comparator":"gte","threshold_value":1.0}],
+                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"}}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "promotion_decision_invalid_payload"
+        );
+        assert_eq!(payload["meta"]["action"], "promotion_decision_start");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn promotion_decision_service_errors_emit_unauthorized_security_signals() {
+        let mutation_app = test_app_with_promotion_decision_orchestrator(Arc::new(
+            StubPromotionDecisionOrchestrator {
+                start_error: Some((
+                    PromotionDecisionReasonCode::UnauthorizedRole.code(),
+                    "forbidden promotion decision mutation",
+                )),
+                ..Default::default()
+            },
+        ));
+        let mutation_response = mutation_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/promotion-decisions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-promotion-decision-start-004")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "lifecycle_action":"promote",
+                            "observed_metrics":{"out_of_sample_sharpe":1.28,"max_drawdown":-0.17},
+                            "thresholds":[{"metric_key":"out_of_sample_sharpe","comparator":"gte","threshold_value":1.0}],
+                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"status":"deferred_to_story_6_6"}}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        let mutation_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(mutation_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            mutation_payload["error"]["security_signal"]["name"],
+            "unauthorized_promotion_decision_mutation_attempt_v1"
+        );
+
+        let read_app = test_app_with_promotion_decision_orchestrator(Arc::new(
+            StubPromotionDecisionOrchestrator {
+                read_error: Some((
+                    PromotionDecisionReasonCode::UnauthorizedRole.code(),
+                    "forbidden promotion decision read",
+                )),
+                ..Default::default()
+            },
+        ));
+        let read_response = read_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/promotion-decisions/candidate::alpha-1::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-promotion-decision-read-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::FORBIDDEN);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            read_payload["error"]["security_signal"]["name"],
+            "unauthorized_promotion_decision_read_attempt_v1"
         );
     }
 

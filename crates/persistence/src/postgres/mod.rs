@@ -15,6 +15,7 @@ pub mod market_stream;
 pub mod orders;
 pub mod participation_guardrail_events;
 pub mod pretrade_gate;
+pub mod promotion_decisions;
 pub mod rbac;
 pub mod reconciliation;
 pub mod recovery_gate_runs;
