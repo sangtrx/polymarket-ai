@@ -14,3 +14,8 @@
 
 - Add a dedicated due-loader performance index on `(status, next_run_at_utc, schedule_id)` for large production datasets after sizing and query-plan validation.
 - `.scripts/bmad-auto/copilot/bmad-progress.log` appeared in git status cross-check but sits outside Story 4.3 application-source review scope.
+
+## Deferred from: code review of 6-2-configure-leakage-and-data-quality-gate-definitions (2026-04-07T11:07:10Z)
+
+- `.scripts/bmad-auto/copilot/bmad-progress.log` appeared in git status cross-check but is outside Story 6.2 application-source review scope.
+- Repository-wide `TIMESTAMPTZ` timezone-offset CHECK convention appears across migrations; changing only Story 6.2 constraints requires a coordinated platform migration policy update.

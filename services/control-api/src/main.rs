@@ -17,6 +17,7 @@ use governance_service::safety_controls::SafetyControlService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
 use reporting_service::exports::scheduling::ReportSchedulingService;
 use reporting_service::exports::workflows::ReportExportWorkflowService;
+use research_gateway::validation::gate_policies::ValidationGatePolicyService;
 use research_gateway::validation::hypothesis_registry::HypothesisRegistryService;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -53,6 +54,9 @@ async fn main() {
         pool.clone(),
     )))
     .with_research_hypothesis_orchestrator(Arc::new(HypothesisRegistryService::postgres(
+        pool.clone(),
+    )))
+    .with_research_validation_gate_orchestrator(Arc::new(ValidationGatePolicyService::postgres(
         pool.clone(),
     )))
     .with_attribution_pool(pool);

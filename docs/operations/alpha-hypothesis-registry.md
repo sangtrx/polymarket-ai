@@ -74,3 +74,4 @@ LIMIT 20;
 3. Risk-limit policy operations: `docs/operations/risk-limit-policy-operations.md`
 4. Core/satellite market stratification operations: `docs/operations/core-satellite-market-stratification.md`
 5. Allocation/rebalance workflows: `docs/operations/allocation-rebalance-workflows.md`
+6. Alpha validation gate policy operations (FR43): `docs/operations/alpha-validation-gate-policies.md`

@@ -773,3 +773,32 @@
 - `npm run --silent test` ✅
 - `npm run --silent rust:build` ✅
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-1` ✅ (2026-04-07 16:57:57 QA automation rerun)
+
+---
+
+## Story 6.2 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::validation_gate_`) — validates FR43 gate-taxonomy contracts, mandatory-gate enforcement, deterministic comparator boundary semantics (`lt/lte/gt/gte`), stage-applicability behavior, and machine-readable reason-code parsing.
+- [x] `crates/persistence/src/postgres/validation_gate_policies.rs` (`postgres::validation_gate_policies::tests::`) — validates schema-scope isolation (`validation_gate_policies` only), canonical constraints/indexes, deterministic list ordering, and fail-closed policy validation behavior.
+- [x] `services/research-gateway/src/validation/gate_policies.rs` (`validation::gate_policies::tests::`) — validates role boundaries, mandatory-catalog fail-closed behavior, dependency/state-unavailable deny paths, deterministic threshold boundary outcomes, and stage-filtered list semantics.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::validation_gate_`) — validates authenticated mutation/read/list/evaluation route behavior, canonical `data/meta/error` envelope shapes, unauthorized-role denials, and deterministic `400/403/409/503/500` status mapping continuity.
+- [x] `tests/api/story-6-2-validation-gate-policies-api.test.mjs` — validates route wiring, payload/envelope contracts, control-api state/startup wiring, research-gateway seam exports, stage-filter query contracts, deterministic `failed_gate_ids` diagnostics, and unauthorized security-signal tokens.
+- [x] `tests/e2e/story-6-2-validation-gate-policies.e2e.test.mjs` — validates migration scope boundaries, FR43 runbook contract coverage, deterministic comparator boundary semantics, explicit no-fallback fail-closed posture, cross-runbook continuity links, and Story 6.2 QA command wiring.
+
+### Coverage
+
+- Story 6.2 now has deterministic automated coverage for:
+  - FR43 mandatory gate-catalog enforcement (`forward_bias`, `data_leakage`, `regime_survivability`, plus stage-required `data_quality`),
+  - deterministic stage-scoped comparator boundary behavior with explicit inclusive/exclusive semantics,
+  - fail-closed unresolved-policy, missing-mandatory, gate-failed, dependency-unavailable, and state-unavailable outcomes,
+  - authenticated control-plane policy mutate/read/list/evaluate surfaces using canonical `data/meta/error` envelope conventions plus deterministic failed-gate diagnostics and unauthorized security-signal contracts,
+  - telemetry/audit continuity and runbook traceability across FR6/FR39/risk-limit/report-export operations.
+- Automated Story 6.2 regression inventory in this QA refresh: **41 Story-6.2 tests passing** (`domain: 6`, `persistence: 7`, `research-gateway: 10`, `control-api: 7`, `api/e2e: 11`).
+
+### Execution Result
+
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-2` ✅
+- `source "$HOME/.cargo/env" && npm test` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-2` ✅ (2026-04-07 18:16:21 QA automation rerun)

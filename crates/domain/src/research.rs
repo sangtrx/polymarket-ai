@@ -349,6 +349,400 @@ fn validate_nested_assumption_value(
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationGateType {
+    ForwardBias,
+    DataLeakage,
+    RegimeSurvivability,
+    DataQuality,
+}
+
+impl ValidationGateType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ForwardBias => "forward_bias",
+            Self::DataLeakage => "data_leakage",
+            Self::RegimeSurvivability => "regime_survivability",
+            Self::DataQuality => "data_quality",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationGateContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "forward_bias" => Ok(Self::ForwardBias),
+            "data_leakage" => Ok(Self::DataLeakage),
+            "regime_survivability" => Ok(Self::RegimeSurvivability),
+            "data_quality" => Ok(Self::DataQuality),
+            _ => Err(ValidationGateContractError::invalid_payload(format!(
+                "unknown validation gate type `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationGateStageScope {
+    Training,
+    Promotion,
+    TrainingAndPromotion,
+}
+
+impl ValidationGateStageScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Training => "training",
+            Self::Promotion => "promotion",
+            Self::TrainingAndPromotion => "training_and_promotion",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationGateContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "training" => Ok(Self::Training),
+            "promotion" => Ok(Self::Promotion),
+            "training_and_promotion" => Ok(Self::TrainingAndPromotion),
+            _ => Err(ValidationGateContractError::invalid_payload(format!(
+                "unknown validation gate stage scope `{value}`"
+            ))),
+        }
+    }
+
+    pub const fn applies_to(self, stage: ValidationGateWorkflowStage) -> bool {
+        match (self, stage) {
+            (Self::Training, ValidationGateWorkflowStage::Training)
+            | (Self::Promotion, ValidationGateWorkflowStage::Promotion)
+            | (Self::TrainingAndPromotion, _) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationGateWorkflowStage {
+    Training,
+    Promotion,
+}
+
+impl ValidationGateWorkflowStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Training => "training",
+            Self::Promotion => "promotion",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationGateContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "training" => Ok(Self::Training),
+            "promotion" => Ok(Self::Promotion),
+            _ => Err(ValidationGateContractError::invalid_payload(format!(
+                "unknown validation workflow stage `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationGateComparator {
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+impl ValidationGateComparator {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lt => "lt",
+            Self::Lte => "lte",
+            Self::Gt => "gt",
+            Self::Gte => "gte",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationGateContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "lt" => Ok(Self::Lt),
+            "lte" => Ok(Self::Lte),
+            "gt" => Ok(Self::Gt),
+            "gte" => Ok(Self::Gte),
+            _ => Err(ValidationGateContractError::invalid_payload(format!(
+                "unknown validation gate comparator `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationGateReasonCode {
+    PolicyRegistered,
+    PolicyUpdated,
+    PolicyRead,
+    PolicyListed,
+    EvaluationAllowed,
+    EvaluationDenied,
+    InvalidPayload,
+    UnauthorizedRole,
+    PolicyNotFound,
+    PolicyUnresolved,
+    MissingMandatoryPolicy,
+    GateFailed,
+    DependencyUnavailable,
+    StateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl ValidationGateReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::PolicyRegistered => "validation_gate_policy_registered",
+            Self::PolicyUpdated => "validation_gate_policy_updated",
+            Self::PolicyRead => "validation_gate_policy_read",
+            Self::PolicyListed => "validation_gate_policy_listed",
+            Self::EvaluationAllowed => "validation_gate_evaluation_allowed",
+            Self::EvaluationDenied => "validation_gate_evaluation_denied",
+            Self::InvalidPayload => "validation_gate_invalid_payload",
+            Self::UnauthorizedRole => "validation_gate_unauthorized_role",
+            Self::PolicyNotFound => "validation_gate_policy_not_found",
+            Self::PolicyUnresolved => "validation_gate_policy_unresolved",
+            Self::MissingMandatoryPolicy => "validation_gate_missing_mandatory_policy",
+            Self::GateFailed => "validation_gate_failed",
+            Self::DependencyUnavailable => "validation_gate_dependency_unavailable",
+            Self::StateUnavailable => "validation_gate_state_unavailable",
+            Self::PersistenceUnavailable => "validation_gate_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationGateContractError> {
+        match value {
+            "validation_gate_policy_registered" => Ok(Self::PolicyRegistered),
+            "validation_gate_policy_updated" => Ok(Self::PolicyUpdated),
+            "validation_gate_policy_read" => Ok(Self::PolicyRead),
+            "validation_gate_policy_listed" => Ok(Self::PolicyListed),
+            "validation_gate_evaluation_allowed" => Ok(Self::EvaluationAllowed),
+            "validation_gate_evaluation_denied" => Ok(Self::EvaluationDenied),
+            "validation_gate_invalid_payload" => Ok(Self::InvalidPayload),
+            "validation_gate_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "validation_gate_policy_not_found" => Ok(Self::PolicyNotFound),
+            "validation_gate_policy_unresolved" => Ok(Self::PolicyUnresolved),
+            "validation_gate_missing_mandatory_policy" => Ok(Self::MissingMandatoryPolicy),
+            "validation_gate_failed" => Ok(Self::GateFailed),
+            "validation_gate_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "validation_gate_state_unavailable" => Ok(Self::StateUnavailable),
+            "validation_gate_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(ValidationGateContractError::invalid_payload(format!(
+                "unknown validation gate reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+pub const FR43_MANDATORY_GATE_TYPES: [ValidationGateType; 3] = [
+    ValidationGateType::ForwardBias,
+    ValidationGateType::DataLeakage,
+    ValidationGateType::RegimeSurvivability,
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationGateThreshold {
+    pub comparator: ValidationGateComparator,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationGatePolicyDefinition {
+    pub policy_key: String,
+    pub gate_type: ValidationGateType,
+    pub stage_scope: ValidationGateStageScope,
+    pub metric_key: String,
+    pub threshold: ValidationGateThreshold,
+    pub mandatory: bool,
+    pub diagnostics: Value,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidationGateValidationIssue {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidationGateContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<ValidationGateValidationIssue>,
+}
+
+impl ValidationGateContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<ValidationGateValidationIssue>,
+    ) -> Self {
+        Self {
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+pub fn canonicalize_validation_gate_policy_definition(
+    policy: &ValidationGatePolicyDefinition,
+) -> Result<ValidationGatePolicyDefinition, ValidationGateContractError> {
+    let canonical = ValidationGatePolicyDefinition {
+        policy_key: normalize_research_identifier(&policy.policy_key),
+        gate_type: policy.gate_type,
+        stage_scope: policy.stage_scope,
+        metric_key: normalize_research_identifier(&policy.metric_key),
+        threshold: policy.threshold.clone(),
+        mandatory: policy.mandatory,
+        diagnostics: policy.diagnostics.clone(),
+        actor_id: policy.actor_id.trim().to_string(),
+        correlation_id: policy.correlation_id.trim().to_string(),
+        updated_at_utc: policy.updated_at_utc.trim().to_string(),
+    };
+
+    validate_validation_gate_policy_definition(&canonical)?;
+    Ok(canonical)
+}
+
+pub fn validate_validation_gate_policy_definition(
+    policy: &ValidationGatePolicyDefinition,
+) -> Result<(), ValidationGateContractError> {
+    let mut field_errors = Vec::new();
+
+    validate_non_empty_validation_gate_field(&mut field_errors, "policy_key", &policy.policy_key);
+    validate_non_empty_validation_gate_field(&mut field_errors, "metric_key", &policy.metric_key);
+    validate_non_empty_validation_gate_field(&mut field_errors, "actor_id", &policy.actor_id);
+    validate_non_empty_validation_gate_field(
+        &mut field_errors,
+        "correlation_id",
+        &policy.correlation_id,
+    );
+    validate_non_empty_validation_gate_field(
+        &mut field_errors,
+        "updated_at_utc",
+        &policy.updated_at_utc,
+    );
+
+    if parse_utc_timestamp(&policy.updated_at_utc).is_err() {
+        field_errors.push(ValidationGateValidationIssue {
+            field: "updated_at_utc".to_string(),
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: "updated_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+
+    if !policy.threshold.value.is_finite() {
+        field_errors.push(ValidationGateValidationIssue {
+            field: "threshold.value".to_string(),
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: "threshold.value must be finite".to_string(),
+        });
+    }
+
+    match &policy.diagnostics {
+        Value::Object(map) if map.is_empty() => field_errors.push(ValidationGateValidationIssue {
+            field: "diagnostics".to_string(),
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: "diagnostics must include at least one machine-readable field".to_string(),
+        }),
+        Value::Object(_) => {}
+        _ => field_errors.push(ValidationGateValidationIssue {
+            field: "diagnostics".to_string(),
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: "diagnostics must be a JSON object".to_string(),
+        }),
+    }
+
+    let requires_mandatory = FR43_MANDATORY_GATE_TYPES.contains(&policy.gate_type)
+        || policy.gate_type == ValidationGateType::DataQuality;
+    if requires_mandatory && !policy.mandatory {
+        field_errors.push(ValidationGateValidationIssue {
+            field: "mandatory".to_string(),
+            code: ValidationGateReasonCode::MissingMandatoryPolicy.code(),
+            message: format!(
+                "gate type `{}` must remain mandatory under FR43 gate policy rules",
+                policy.gate_type.as_str()
+            ),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(ValidationGateContractError::invalid_payload_with_issues(
+            "validation gate policy payload failed validation",
+            field_errors,
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn evaluate_validation_gate_threshold(
+    threshold: &ValidationGateThreshold,
+    observed_value: f64,
+) -> Result<bool, ValidationGateContractError> {
+    if !observed_value.is_finite() {
+        return Err(ValidationGateContractError::invalid_payload_with_issues(
+            "observed gate metric is unavailable",
+            vec![ValidationGateValidationIssue {
+                field: "observed_value".to_string(),
+                code: ValidationGateReasonCode::StateUnavailable.code(),
+                message: "observed_value must be finite".to_string(),
+            }],
+        ));
+    }
+
+    if !threshold.value.is_finite() {
+        return Err(ValidationGateContractError::invalid_payload_with_issues(
+            "threshold metric is unavailable",
+            vec![ValidationGateValidationIssue {
+                field: "threshold.value".to_string(),
+                code: ValidationGateReasonCode::InvalidPayload.code(),
+                message: "threshold.value must be finite".to_string(),
+            }],
+        ));
+    }
+
+    Ok(match threshold.comparator {
+        ValidationGateComparator::Lt => observed_value < threshold.value,
+        ValidationGateComparator::Lte => observed_value <= threshold.value,
+        ValidationGateComparator::Gt => observed_value > threshold.value,
+        ValidationGateComparator::Gte => observed_value >= threshold.value,
+    })
+}
+
+fn validate_non_empty_validation_gate_field(
+    field_errors: &mut Vec<ValidationGateValidationIssue>,
+    field: &str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(ValidationGateValidationIssue {
+            field: field.to_string(),
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: format!("{field} is required"),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +844,116 @@ mod tests {
         let code = AlphaHypothesisReasonCode::parse("alpha_hypothesis_dataset_snapshot_unresolved")
             .expect("known reason should parse");
         assert_eq!(code, AlphaHypothesisReasonCode::DatasetSnapshotUnresolved);
+    }
+
+    fn sample_validation_gate_policy() -> ValidationGatePolicyDefinition {
+        ValidationGatePolicyDefinition {
+            policy_key: "fr43::forward-bias::primary".to_string(),
+            gate_type: ValidationGateType::ForwardBias,
+            stage_scope: ValidationGateStageScope::TrainingAndPromotion,
+            metric_key: "forward_bias_score".to_string(),
+            threshold: ValidationGateThreshold {
+                comparator: ValidationGateComparator::Lte,
+                value: 0.12,
+            },
+            mandatory: true,
+            diagnostics: json!({
+                "failure_reason": "forward_bias_above_limit",
+                "operator_action": "review feature windows"
+            }),
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-fr43-001".to_string(),
+            updated_at_utc: "2026-04-07T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn validation_gate_canonicalization_normalizes_identifiers() {
+        let mut policy = sample_validation_gate_policy();
+        policy.policy_key = " FR43::Forward-Bias::Primary ".to_string();
+        policy.metric_key = " Forward_Bias_Score ".to_string();
+
+        let canonical = canonicalize_validation_gate_policy_definition(&policy)
+            .expect("canonical validation gate policy should succeed");
+        assert_eq!(canonical.policy_key, "fr43::forward-bias::primary");
+        assert_eq!(canonical.metric_key, "forward_bias_score");
+    }
+
+    #[test]
+    fn validation_gate_rejects_non_mandatory_forward_bias_policy() {
+        let mut policy = sample_validation_gate_policy();
+        policy.mandatory = false;
+
+        let error = validate_validation_gate_policy_definition(&policy)
+            .expect_err("forward_bias policies must remain mandatory");
+        assert_eq!(error.code, ValidationGateReasonCode::InvalidPayload.code());
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "mandatory"
+                && issue.code == ValidationGateReasonCode::MissingMandatoryPolicy.code()
+        }));
+    }
+
+    #[test]
+    fn validation_gate_rejects_non_mandatory_data_quality_policy() {
+        let mut policy = sample_validation_gate_policy();
+        policy.gate_type = ValidationGateType::DataQuality;
+        policy.policy_key = "fr43::data-quality::training-core".to_string();
+        policy.metric_key = "data_quality_score".to_string();
+        policy.mandatory = false;
+
+        let error = validate_validation_gate_policy_definition(&policy)
+            .expect_err("data_quality policies must remain mandatory for stage enforcement");
+        assert_eq!(error.code, ValidationGateReasonCode::InvalidPayload.code());
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "mandatory"
+                && issue.code == ValidationGateReasonCode::MissingMandatoryPolicy.code()
+        }));
+    }
+
+    #[test]
+    fn validation_gate_threshold_boundaries_are_deterministic() {
+        let gt_threshold = ValidationGateThreshold {
+            comparator: ValidationGateComparator::Gt,
+            value: 1.0,
+        };
+        let gte_threshold = ValidationGateThreshold {
+            comparator: ValidationGateComparator::Gte,
+            value: 1.0,
+        };
+        let lt_threshold = ValidationGateThreshold {
+            comparator: ValidationGateComparator::Lt,
+            value: 1.0,
+        };
+        let lte_threshold = ValidationGateThreshold {
+            comparator: ValidationGateComparator::Lte,
+            value: 1.0,
+        };
+
+        assert!(!evaluate_validation_gate_threshold(&gt_threshold, 1.0).expect("gt should parse"));
+        assert!(evaluate_validation_gate_threshold(&gte_threshold, 1.0).expect("gte should parse"));
+        assert!(!evaluate_validation_gate_threshold(&lt_threshold, 1.0).expect("lt should parse"));
+        assert!(evaluate_validation_gate_threshold(&lte_threshold, 1.0).expect("lte should parse"));
+    }
+
+    #[test]
+    fn validation_gate_stage_scope_training_and_promotion_applies_to_both_workflow_stages() {
+        assert!(
+            ValidationGateStageScope::TrainingAndPromotion
+                .applies_to(ValidationGateWorkflowStage::Training)
+        );
+        assert!(
+            ValidationGateStageScope::TrainingAndPromotion
+                .applies_to(ValidationGateWorkflowStage::Promotion)
+        );
+        assert!(
+            !ValidationGateStageScope::Promotion.applies_to(ValidationGateWorkflowStage::Training)
+        );
+    }
+
+    #[test]
+    fn validation_gate_reason_code_parse_accepts_known_values() {
+        let code = ValidationGateReasonCode::parse("validation_gate_dependency_unavailable")
+            .expect("known reason should parse");
+        assert_eq!(code, ValidationGateReasonCode::DependencyUnavailable);
     }
 }

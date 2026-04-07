@@ -64,3 +64,4 @@ Operational guardrails:
 2. Severity alert delivery and fallback (Story 3.6): `docs/operations/severity-alert-delivery.md`
 3. Core/satellite market stratification operations (FR42): `docs/operations/core-satellite-market-stratification.md`
 4. Alpha hypothesis registry operations (FR6): `docs/operations/alpha-hypothesis-registry.md`
+5. Alpha validation gate policy operations (FR43): `docs/operations/alpha-validation-gate-policies.md`

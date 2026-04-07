@@ -65,3 +65,4 @@ Critical increase detection is fail-closed:
 2. Pre-trade pipeline sequencing and reason-code matrix: `docs/operations/pretrade-gate-pipeline.md`
 3. Core/satellite market stratification operations (FR42): `docs/operations/core-satellite-market-stratification.md`
 4. Alpha hypothesis registry operations (FR6): `docs/operations/alpha-hypothesis-registry.md`
+5. Alpha validation gate policy operations (FR43): `docs/operations/alpha-validation-gate-policies.md`

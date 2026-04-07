@@ -45,7 +45,7 @@ use domain::reporting_schedule::{
     ReportRunRecord, ReportingScheduleReasonCode, ReportingScheduleValidationIssue,
     parse_utc_timestamp,
 };
-use domain::research::AlphaHypothesisReasonCode;
+use domain::research::{AlphaHypothesisReasonCode, ValidationGateReasonCode};
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
     MarketPolicyReasonCode, MarketPolicyValidationIssue, MarketSnapshot,
@@ -100,6 +100,12 @@ use reporting_service::exports::scheduling::{
 use reporting_service::exports::workflows::{
     GetExportArtifactInput, ListExportArtifactsInput, QueryExportJobInput, ReportExportJobEvidence,
     TriggerIncidentExportInput, TriggerOnDemandExportInput,
+};
+use research_gateway::validation::gate_policies::{
+    EvaluateValidationGatePoliciesInput, ListValidationGatePoliciesInput,
+    ReadValidationGatePolicyInput, UpsertValidationGatePolicyInput,
+    ValidationGateEvaluationEvidence, ValidationGatePolicyEvidence,
+    ValidationGatePolicyServiceError,
 };
 use research_gateway::validation::hypothesis_registry::{
     AlphaHypothesisEvidence, HypothesisRegistryServiceError, ReadAlphaHypothesisInput,
@@ -191,6 +197,18 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/research/alpha-hypotheses/{hypothesis_id}",
             post(register_alpha_hypothesis).get(read_alpha_hypothesis),
+        )
+        .route(
+            "/control/research/validation-gate-policies/{policy_key}",
+            post(upsert_validation_gate_policy).get(read_validation_gate_policy),
+        )
+        .route(
+            "/control/research/validation-gate-policies",
+            get(list_validation_gate_policies),
+        )
+        .route(
+            "/control/research/validation-gate-policies/evaluate/{stage}",
+            post(evaluate_validation_gates),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -1209,6 +1227,214 @@ pub async fn read_alpha_hypothesis(
         endpoint,
         "GET",
         "alpha_hypothesis_read",
+    )
+}
+
+pub async fn upsert_validation_gate_policy(
+    State(state): State<ControlApiState>,
+    Path(policy_key): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<ValidationGatePolicyPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = format!("/control/research/validation-gate-policies/{policy_key}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return validation_gate_payload_rejection_response(
+                &state,
+                &actor,
+                "validation_gate_policy_upsert",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+
+    let evidence = match state
+        .research_validation_gate_orchestrator
+        .upsert_validation_gate_policy(UpsertValidationGatePolicyInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            policy_key,
+            gate_type: payload.gate_type,
+            stage_scope: payload.stage_scope,
+            metric_key: payload.metric_key,
+            comparator: payload.comparator,
+            threshold_value: payload.threshold_value,
+            mandatory: payload.mandatory,
+            diagnostics: payload.diagnostics,
+            correlation_id: actor.correlation_id.clone(),
+            updated_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return validation_gate_service_error_response(
+                &state,
+                error,
+                "validation_gate_policy_upsert",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    validation_gate_policy_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "validation_gate_policy_upsert",
+    )
+}
+
+pub async fn read_validation_gate_policy(
+    State(state): State<ControlApiState>,
+    Path(policy_key): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/validation-gate-policies/{policy_key}");
+    let authorization = match authorize_validation_gate_read(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let evidence = match state
+        .research_validation_gate_orchestrator
+        .read_validation_gate_policy(ReadValidationGatePolicyInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            policy_key,
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return validation_gate_service_error_response(
+                &state,
+                error,
+                "validation_gate_policy_read",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    validation_gate_policy_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "validation_gate_policy_read",
+    )
+}
+
+pub async fn list_validation_gate_policies(
+    State(state): State<ControlApiState>,
+    Query(query): Query<ValidationGatePoliciesQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/validation-gate-policies".to_string();
+    let authorization = match authorize_validation_gate_read(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let evidence = match state
+        .research_validation_gate_orchestrator
+        .list_validation_gate_policies(ListValidationGatePoliciesInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            stage_filter: query.stage,
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return validation_gate_service_error_response(
+                &state,
+                error,
+                "validation_gate_policy_list",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    validation_gate_policy_list_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "validation_gate_policy_list",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn evaluate_validation_gates(
+    State(state): State<ControlApiState>,
+    Path(stage): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<ValidationGateEvaluationPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = format!("/control/research/validation-gate-policies/evaluate/{stage}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return validation_gate_payload_rejection_response(
+                &state,
+                &actor,
+                "validation_gate_evaluate",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+
+    let evidence = match state
+        .research_validation_gate_orchestrator
+        .evaluate_validation_gates(EvaluateValidationGatePoliciesInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: payload.candidate_id,
+            stage,
+            observed_metrics: payload.observed_metrics,
+            correlation_id: actor.correlation_id.clone(),
+            evaluated_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return validation_gate_service_error_response(
+                &state,
+                error,
+                "validation_gate_evaluate",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    validation_gate_evaluation_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "validation_gate_evaluate",
     )
 }
 
@@ -5481,6 +5707,64 @@ fn authorize_alpha_hypothesis_read(
     )))
 }
 
+fn authorize_validation_gate_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    let action = if endpoint.ends_with("/validation-gate-policies") {
+        "validation_gate_policy_list"
+    } else {
+        "validation_gate_policy_read"
+    };
+    Err(Box::new(validation_gate_service_error_response(
+        state,
+        ValidationGatePolicyServiceError {
+            code: ValidationGateReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+            failed_gate_ids: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
+}
+
 fn authorize_attribution_read(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -6795,6 +7079,371 @@ fn alpha_hypothesis_service_error_status(code: &str) -> StatusCode {
             || code == AlphaHypothesisReasonCode::PersistenceUnavailable.code()
             || code == "alpha_hypothesis_query_failed"
             || code == "alpha_hypothesis_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn validation_gate_policy_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: ValidationGatePolicyEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "policy_key": evidence.policy_key,
+            "gate_type": evidence.gate_type,
+            "stage_scope": evidence.stage_scope,
+            "metric_key": evidence.metric_key,
+            "comparator": evidence.comparator,
+            "threshold_value": evidence.threshold_value,
+            "mandatory": evidence.mandatory,
+        }),
+        approval_reference: None,
+        timestamp: evidence.updated_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: evidence.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: evidence.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            evidence.correlation_id.clone(),
+            evidence.updated_at_utc,
+        );
+    }
+
+    (
+        if http_method == "GET" {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        axum::Json(ValidationGateEnvelope {
+            data: Some(ValidationGateData::Policy {
+                policy: ValidationGatePolicyItem {
+                    policy_key: evidence.policy_key,
+                    gate_type: evidence.gate_type,
+                    stage_scope: evidence.stage_scope,
+                    metric_key: evidence.metric_key,
+                    comparator: evidence.comparator,
+                    threshold_value: evidence.threshold_value,
+                    mandatory: evidence.mandatory,
+                    diagnostics: evidence.diagnostics,
+                    reason_code: evidence.reason_code,
+                },
+            }),
+            meta: ValidationGateMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                timestamp_utc: evidence.updated_at_utc.clone(),
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn validation_gate_policy_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: Vec<ValidationGatePolicyEvidence>,
+    endpoint: String,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let reason_code = ValidationGateReasonCode::PolicyListed.code().to_string();
+    let policies = evidence
+        .into_iter()
+        .map(|policy| ValidationGatePolicyItem {
+            policy_key: policy.policy_key,
+            gate_type: policy.gate_type,
+            stage_scope: policy.stage_scope,
+            metric_key: policy.metric_key,
+            comparator: policy.comparator,
+            threshold_value: policy.threshold_value,
+            mandatory: policy.mandatory,
+            diagnostics: policy.diagnostics,
+            reason_code: policy.reason_code,
+        })
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "policy_count": policies.len(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(ValidationGateEnvelope {
+            data: Some(ValidationGateData::Policies { policies }),
+            meta: ValidationGateMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn validation_gate_evaluation_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: ValidationGateEvaluationEvidence,
+    endpoint: String,
+    action: &'static str,
+) -> Response {
+    let audit_outcome = if evidence.outcome == "allow" {
+        PrivilegedAuditOutcome::Allow
+    } else {
+        PrivilegedAuditOutcome::AuthorizationDenied
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "POST",
+            "candidate_id": evidence.candidate_id,
+            "stage": evidence.stage,
+            "failed_gate_ids": evidence.failed_gate_ids,
+        }),
+        approval_reference: None,
+        timestamp: evidence.evaluated_at_utc.clone(),
+        outcome: audit_outcome,
+        reason_code: evidence.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: evidence.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            evidence.correlation_id.clone(),
+            evidence.evaluated_at_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(ValidationGateEnvelope {
+            data: Some(ValidationGateData::Evaluation {
+                evaluation: ValidationGateEvaluationItem {
+                    candidate_id: evidence.candidate_id,
+                    stage: evidence.stage,
+                    outcome: evidence.outcome,
+                    reason_code: evidence.reason_code,
+                    failed_gate_ids: evidence.failed_gate_ids,
+                    gate_results: evidence
+                        .gate_results
+                        .into_iter()
+                        .map(|result| ValidationGateEvaluationResultItem {
+                            policy_key: result.policy_key,
+                            gate_type: result.gate_type,
+                            metric_key: result.metric_key,
+                            comparator: result.comparator,
+                            threshold_value: result.threshold_value,
+                            observed_value: result.observed_value,
+                            passed: result.passed,
+                            reason_code: result.reason_code,
+                        })
+                        .collect(),
+                },
+            }),
+            meta: ValidationGateMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                timestamp_utc: evidence.evaluated_at_utc.clone(),
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn validation_gate_payload_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: JsonRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    validation_gate_service_error_response(
+        state,
+        ValidationGatePolicyServiceError {
+            code: ValidationGateReasonCode::InvalidPayload.code(),
+            message: format!("invalid validation gate payload: {rejection_message}"),
+            field_errors: Vec::new(),
+            failed_gate_ids: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+    )
+}
+
+fn validation_gate_service_error_response(
+    state: &ControlApiState,
+    error: ValidationGatePolicyServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") || action.ends_with("_list") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "error_code": error.code,
+            "failed_gate_ids": error.failed_gate_ids,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == ValidationGateReasonCode::UnauthorizedRole.code() {
+        Some(ValidationGateSecuritySignal {
+            name: if action.ends_with("_read") || action.ends_with("_list") {
+                "unauthorized_validation_gate_read_attempt_v1"
+            } else {
+                "unauthorized_validation_gate_mutation_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        validation_gate_service_error_status(error.code),
+        axum::Json(ValidationGateEnvelope::<ValidationGateData> {
+            data: None,
+            meta: ValidationGateMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(ValidationGateEnvelopeError {
+                error_code: error.code.to_string(),
+                message: error.message,
+                field_errors: error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| ValidationGateFieldError {
+                        field: issue.field,
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                failed_gate_ids: error.failed_gate_ids,
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn validation_gate_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == ValidationGateReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == ValidationGateReasonCode::UnauthorizedRole.code() => StatusCode::FORBIDDEN,
+        "validation_gate_policy_constraint_violation" => StatusCode::CONFLICT,
+        code if code == ValidationGateReasonCode::PolicyNotFound.code()
+            || code == ValidationGateReasonCode::PolicyUnresolved.code()
+            || code == ValidationGateReasonCode::MissingMandatoryPolicy.code()
+            || code == ValidationGateReasonCode::GateFailed.code() =>
+        {
+            StatusCode::CONFLICT
+        }
+        code if code == ValidationGateReasonCode::DependencyUnavailable.code()
+            || code == ValidationGateReasonCode::StateUnavailable.code()
+            || code == ValidationGateReasonCode::PersistenceUnavailable.code()
+            || code == "validation_gate_policy_query_failed"
+            || code == "validation_gate_policy_row_decode_failed" =>
         {
             StatusCode::SERVICE_UNAVAILABLE
         }
@@ -9552,6 +10201,29 @@ pub struct AlphaHypothesisRegistrationPayload {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ValidationGatePolicyPayload {
+    pub gate_type: String,
+    pub stage_scope: String,
+    pub metric_key: String,
+    pub comparator: String,
+    pub threshold_value: f64,
+    pub mandatory: bool,
+    pub diagnostics: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ValidationGateEvaluationPayload {
+    pub candidate_id: String,
+    pub observed_metrics: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ValidationGatePoliciesQuery {
+    #[serde(default)]
+    pub stage: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
@@ -10392,6 +11064,104 @@ pub struct AlphaHypothesisSecuritySignal {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ValidationGateEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: ValidationGateMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ValidationGateEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValidationGateData {
+    Policy {
+        policy: ValidationGatePolicyItem,
+    },
+    Policies {
+        policies: Vec<ValidationGatePolicyItem>,
+    },
+    Evaluation {
+        evaluation: ValidationGateEvaluationItem,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationGateMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationGateEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<ValidationGateFieldError>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_gate_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<ValidationGateSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationGateFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationGateSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationGatePolicyItem {
+    pub policy_key: String,
+    pub gate_type: String,
+    pub stage_scope: String,
+    pub metric_key: String,
+    pub comparator: String,
+    pub threshold_value: f64,
+    pub mandatory: bool,
+    pub diagnostics: serde_json::Value,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationGateEvaluationItem {
+    pub candidate_id: String,
+    pub stage: String,
+    pub outcome: String,
+    pub reason_code: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_gate_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_results: Vec<ValidationGateEvaluationResultItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationGateEvaluationResultItem {
+    pub policy_key: String,
+    pub gate_type: String,
+    pub metric_key: String,
+    pub comparator: String,
+    pub threshold_value: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_value: Option<f64>,
+    pub passed: bool,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct EmergencyControlDecisionResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10912,7 +11682,10 @@ mod tests {
         ReportingExportJobState, ReportingExportReasonCode, ReportingExportTriggerSource,
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
-    use domain::research::{AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue};
+    use domain::research::{
+        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, ValidationGateReasonCode,
+        ValidationGateValidationIssue,
+    };
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
         EmergencyControlTriggerSource, MarketBucketReasonCode, MarketPolicyValidationIssue,
@@ -10963,6 +11736,13 @@ mod tests {
         DispatchWeeklyExportInput, GetExportArtifactInput, ListExportArtifactsInput,
         QueryExportJobInput, ReportExportJobEvidence, ReportExportOrchestrator,
         ReportExportWorkflowError, TriggerIncidentExportInput, TriggerOnDemandExportInput,
+    };
+    use research_gateway::validation::gate_policies::{
+        EvaluateValidationGatePoliciesInput, ListValidationGatePoliciesInput,
+        ReadValidationGatePolicyInput, UpsertValidationGatePolicyInput,
+        ValidationGateEvaluationEvidence, ValidationGateEvaluationResultEvidence,
+        ValidationGatePolicyEvidence, ValidationGatePolicyOrchestrator,
+        ValidationGatePolicyServiceError,
     };
     use research_gateway::validation::hypothesis_registry::{
         AlphaHypothesisEvidence, HypothesisRegistryOrchestrator, HypothesisRegistryServiceError,
@@ -11814,6 +12594,187 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct StubValidationGatePolicyOrchestrator {
+        upsert_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        list_error: Option<(&'static str, &'static str)>,
+        evaluate_error: Option<(&'static str, &'static str)>,
+        read_missing: bool,
+        evaluate_failure: bool,
+    }
+
+    impl ValidationGatePolicyOrchestrator for StubValidationGatePolicyOrchestrator {
+        fn upsert_validation_gate_policy(
+            &self,
+            input: UpsertValidationGatePolicyInput,
+        ) -> Result<ValidationGatePolicyEvidence, ValidationGatePolicyServiceError> {
+            if let Some((code, message)) = self.upsert_error {
+                return Err(ValidationGatePolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: if code == ValidationGateReasonCode::InvalidPayload.code() {
+                        vec![ValidationGateValidationIssue {
+                            field: "threshold_value".to_string(),
+                            code: ValidationGateReasonCode::InvalidPayload.code(),
+                            message: "threshold_value must be finite".to_string(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    failed_gate_ids: Vec::new(),
+                });
+            }
+
+            Ok(ValidationGatePolicyEvidence {
+                policy_key: input.policy_key.trim().to_ascii_lowercase(),
+                gate_type: input.gate_type.trim().to_ascii_lowercase(),
+                stage_scope: input.stage_scope.trim().to_ascii_lowercase(),
+                metric_key: input.metric_key.trim().to_ascii_lowercase(),
+                comparator: input.comparator.trim().to_ascii_lowercase(),
+                threshold_value: input.threshold_value,
+                mandatory: input.mandatory,
+                diagnostics: input.diagnostics,
+                actor_id: input.actor_id,
+                reason_code: ValidationGateReasonCode::PolicyRegistered
+                    .code()
+                    .to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.updated_at_utc,
+            })
+        }
+
+        fn read_validation_gate_policy(
+            &self,
+            input: ReadValidationGatePolicyInput,
+        ) -> Result<ValidationGatePolicyEvidence, ValidationGatePolicyServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(ValidationGatePolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                    failed_gate_ids: Vec::new(),
+                });
+            }
+            if self.read_missing {
+                return Err(ValidationGatePolicyServiceError {
+                    code: ValidationGateReasonCode::PolicyNotFound.code(),
+                    message: "validation gate policy not found".to_string(),
+                    field_errors: Vec::new(),
+                    failed_gate_ids: Vec::new(),
+                });
+            }
+
+            Ok(ValidationGatePolicyEvidence {
+                policy_key: input.policy_key.trim().to_ascii_lowercase(),
+                gate_type: "forward_bias".to_string(),
+                stage_scope: "training_and_promotion".to_string(),
+                metric_key: "forward_bias_score".to_string(),
+                comparator: "lte".to_string(),
+                threshold_value: 0.12,
+                mandatory: true,
+                diagnostics: serde_json::json!({
+                    "failure_reason": "forward_bias_above_limit"
+                }),
+                actor_id: input.actor_id,
+                reason_code: ValidationGateReasonCode::PolicyRead.code().to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.queried_at_utc,
+            })
+        }
+
+        fn list_validation_gate_policies(
+            &self,
+            input: ListValidationGatePoliciesInput,
+        ) -> Result<Vec<ValidationGatePolicyEvidence>, ValidationGatePolicyServiceError> {
+            if let Some((code, message)) = self.list_error {
+                return Err(ValidationGatePolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                    failed_gate_ids: Vec::new(),
+                });
+            }
+
+            let stage_scope = match input.stage_filter.as_deref() {
+                Some("training") => "training".to_string(),
+                Some("promotion") => "promotion".to_string(),
+                _ => "training_and_promotion".to_string(),
+            };
+            Ok(vec![ValidationGatePolicyEvidence {
+                policy_key: "fr43::forward-bias::primary".to_string(),
+                gate_type: "forward_bias".to_string(),
+                stage_scope,
+                metric_key: "forward_bias_score".to_string(),
+                comparator: "lte".to_string(),
+                threshold_value: 0.12,
+                mandatory: true,
+                diagnostics: serde_json::json!({
+                    "failure_reason": "forward_bias_above_limit"
+                }),
+                actor_id: input.actor_id,
+                reason_code: ValidationGateReasonCode::PolicyListed.code().to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.queried_at_utc,
+            }])
+        }
+
+        fn evaluate_validation_gates(
+            &self,
+            input: EvaluateValidationGatePoliciesInput,
+        ) -> Result<ValidationGateEvaluationEvidence, ValidationGatePolicyServiceError> {
+            if let Some((code, message)) = self.evaluate_error {
+                return Err(ValidationGatePolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                    failed_gate_ids: if code == ValidationGateReasonCode::GateFailed.code() {
+                        vec!["fr43::data-leakage::primary".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+            if self.evaluate_failure {
+                return Err(ValidationGatePolicyServiceError {
+                    code: ValidationGateReasonCode::GateFailed.code(),
+                    message: "gate threshold comparison denied progression".to_string(),
+                    field_errors: vec![ValidationGateValidationIssue {
+                        field: "gate.fr43::data-leakage::primary".to_string(),
+                        code: ValidationGateReasonCode::GateFailed.code(),
+                        message: "gate threshold comparison denied progression".to_string(),
+                    }],
+                    failed_gate_ids: vec!["fr43::data-leakage::primary".to_string()],
+                });
+            }
+
+            Ok(ValidationGateEvaluationEvidence {
+                candidate_id: input.candidate_id,
+                stage: input.stage,
+                outcome: "allow".to_string(),
+                reason_code: ValidationGateReasonCode::EvaluationAllowed
+                    .code()
+                    .to_string(),
+                failed_gate_ids: Vec::new(),
+                gate_results: vec![ValidationGateEvaluationResultEvidence {
+                    policy_key: "fr43::forward-bias::primary".to_string(),
+                    gate_type: "forward_bias".to_string(),
+                    metric_key: "forward_bias_score".to_string(),
+                    comparator: "lte".to_string(),
+                    threshold_value: 0.12,
+                    observed_value: Some(0.1),
+                    passed: true,
+                    reason_code: ValidationGateReasonCode::EvaluationAllowed
+                        .code()
+                        .to_string(),
+                }],
+                actor_id: input.actor_id,
+                correlation_id: input.correlation_id,
+                evaluated_at_utc: input.evaluated_at_utc,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct StubAllocationPolicyOrchestrator {
         upsert_error: Option<(&'static str, &'static str)>,
         evaluate_error: Option<(&'static str, &'static str)>,
@@ -12629,6 +13590,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_research_hypothesis_orchestrator(hypothesis_registry_orchestrator),
+        )
+    }
+
+    fn test_app_with_validation_gate_policy_orchestrator(
+        validation_gate_policy_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_validation_gate_orchestrator(validation_gate_policy_orchestrator),
         )
     }
 
@@ -16161,6 +17144,346 @@ mod tests {
             "alpha_hypothesis_dataset_snapshot_unavailable"
         );
         assert_eq!(payload["action"], "alpha_hypothesis_register");
+    }
+
+    #[tokio::test]
+    async fn validation_gate_policy_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies/fr43::forward-bias::primary")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "gate_type":"forward_bias",
+                            "stage_scope":"training_and_promotion",
+                            "metric_key":"forward_bias_score",
+                            "comparator":"lte",
+                            "threshold_value":0.12,
+                            "mandatory":true,
+                            "diagnostics":{"failure_reason":"forward_bias_above_limit"}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn validation_gate_policy_upsert_route_returns_data_meta_error_envelope() {
+        let app = test_app_with_validation_gate_policy_orchestrator(Arc::new(
+            StubValidationGatePolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies/FR43::Forward-Bias::Primary")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-upsert-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "gate_type":"forward_bias",
+                            "stage_scope":"training_and_promotion",
+                            "metric_key":"forward_bias_score",
+                            "comparator":"lte",
+                            "threshold_value":0.12,
+                            "mandatory":true,
+                            "diagnostics":{"failure_reason":"forward_bias_above_limit"}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "policy");
+        assert_eq!(
+            payload["data"]["policy"]["policy_key"],
+            "fr43::forward-bias::primary"
+        );
+        assert_eq!(payload["data"]["policy"]["gate_type"], "forward_bias");
+        assert_eq!(payload["meta"]["action"], "validation_gate_policy_upsert");
+        assert!(payload["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn validation_gate_policy_upsert_route_maps_json_rejection_to_bad_request_envelope() {
+        let app = test_app_with_validation_gate_policy_orchestrator(Arc::new(
+            StubValidationGatePolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies/fr43::forward-bias::primary")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-upsert-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "gate_type":"forward_bias",
+                            "stage_scope":"training_and_promotion",
+                            "metric_key":"forward_bias_score",
+                            "comparator":"lte",
+                            "threshold_value":"invalid",
+                            "mandatory":true,
+                            "diagnostics":{"failure_reason":"forward_bias_above_limit"}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "validation_gate_invalid_payload"
+        );
+        assert_eq!(payload["meta"]["action"], "validation_gate_policy_upsert");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn validation_gate_policy_read_and_list_routes_return_envelope_shapes() {
+        let app = test_app_with_validation_gate_policy_orchestrator(Arc::new(
+            StubValidationGatePolicyOrchestrator::default(),
+        ));
+
+        let read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies/fr43::forward-bias::primary")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(read_payload["data"]["kind"], "policy");
+        assert_eq!(
+            read_payload["data"]["policy"]["reason_code"],
+            "validation_gate_policy_read"
+        );
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies?stage=training")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(list_payload["data"]["kind"], "policies");
+        assert_eq!(
+            list_payload["data"]["policies"][0]["stage_scope"],
+            "training"
+        );
+        assert_eq!(
+            list_payload["meta"]["action"],
+            "validation_gate_policy_list"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_gate_evaluate_route_returns_allow_evidence() {
+        let app = test_app_with_validation_gate_policy_orchestrator(Arc::new(
+            StubValidationGatePolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies/evaluate/training")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-eval-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "observed_metrics":{
+                                "forward_bias_score":0.10,
+                                "data_leakage_score":0.19,
+                                "regime_survivability_score":0.81,
+                                "data_quality_score":0.96
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "evaluation");
+        assert_eq!(payload["data"]["evaluation"]["outcome"], "allow");
+        assert_eq!(
+            payload["data"]["evaluation"]["reason_code"],
+            "validation_gate_evaluation_allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_gate_evaluate_route_maps_gate_failed_to_conflict_with_failed_gate_ids() {
+        let app = test_app_with_validation_gate_policy_orchestrator(Arc::new(
+            StubValidationGatePolicyOrchestrator {
+                evaluate_failure: true,
+                ..Default::default()
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies/evaluate/training")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-eval-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "observed_metrics":{
+                                "forward_bias_score":0.10
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error"]["error_code"], "validation_gate_failed");
+        assert_eq!(payload["meta"]["action"], "validation_gate_evaluate");
+        assert_eq!(
+            payload["error"]["failed_gate_ids"][0],
+            "fr43::data-leakage::primary"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_gate_evaluate_route_maps_json_rejection_to_bad_request_envelope() {
+        let app = test_app_with_validation_gate_policy_orchestrator(Arc::new(
+            StubValidationGatePolicyOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-gate-policies/evaluate/training")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-gate-eval-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":123,
+                            "observed_metrics":{"forward_bias_score":0.10}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "validation_gate_invalid_payload"
+        );
+        assert_eq!(payload["meta"]["action"], "validation_gate_evaluate");
+        assert!(payload["data"].is_null());
     }
 
     #[tokio::test]

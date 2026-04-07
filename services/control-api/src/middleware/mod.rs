@@ -24,6 +24,9 @@ use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportS
 use reporting_service::exports::workflows::{
     ReportExportOrchestrator, ReportExportWorkflowService,
 };
+use research_gateway::validation::gate_policies::{
+    ValidationGatePolicyOrchestrator, ValidationGatePolicyService,
+};
 use research_gateway::validation::hypothesis_registry::{
     HypothesisRegistryOrchestrator, HypothesisRegistryService,
 };
@@ -232,6 +235,7 @@ pub struct ControlApiState {
     pub report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
     pub report_export_orchestrator: Arc<dyn ReportExportOrchestrator>,
     pub research_hypothesis_orchestrator: Arc<dyn HypothesisRegistryOrchestrator>,
+    pub research_validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
@@ -343,6 +347,7 @@ impl ControlApiState {
             report_schedule_orchestrator,
             report_export_orchestrator: Arc::new(ReportExportWorkflowService::default()),
             research_hypothesis_orchestrator: Arc::new(HypothesisRegistryService::default()),
+            research_validation_gate_orchestrator: Arc::new(ValidationGatePolicyService::default()),
             recovery_orchestrator,
             attribution_pool: None,
         }
@@ -381,6 +386,15 @@ impl ControlApiState {
         research_hypothesis_orchestrator: Arc<dyn HypothesisRegistryOrchestrator>,
     ) -> Self {
         self.research_hypothesis_orchestrator = research_hypothesis_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_research_validation_gate_orchestrator(
+        mut self,
+        research_validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
+    ) -> Self {
+        self.research_validation_gate_orchestrator = research_validation_gate_orchestrator;
         self
     }
 
