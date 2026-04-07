@@ -1,3 +1,7 @@
+use crate::exports::workflows::{
+    DispatchWeeklyExportInput, ReportExportOrchestrator, ReportExportWorkflowError,
+    ReportExportWorkflowService,
+};
 use crate::read_models::queries::{
     ReportingReadModelError, ReportingReadModelOrchestrator, ReportingReadRequest,
 };
@@ -7,6 +11,7 @@ use domain::alerts::{
     AlertReasonCode, AlertSeverity, IncidentAlert, compose_alert_identifier,
 };
 use domain::reporting::{DEFAULT_REPORTING_LIMIT, ReportingReasonCode as ReadModelReasonCode};
+use domain::reporting_export::ReportingExportReasonCode;
 use domain::reporting_schedule::{
     DEFAULT_REPORT_RUN_HISTORY_LIMIT, MAX_REPORT_RUN_HISTORY_LIMIT, ReportRunRecord,
     ReportSchedule, ReportingCadence, ReportingRunState, ReportingScheduleContractError,
@@ -248,6 +253,7 @@ pub struct ReportSchedulingService {
     repository: Arc<dyn ReportScheduleRepositoryPort>,
     summary_port: Arc<dyn ReportingSummaryPort>,
     alert_port: Arc<dyn ReportScheduleAlertPort>,
+    export_orchestrator: Arc<dyn ReportExportOrchestrator>,
     operation_lock: Arc<Mutex<()>>,
 }
 
@@ -256,11 +262,13 @@ impl ReportSchedulingService {
         repository: Arc<dyn ReportScheduleRepositoryPort>,
         summary_port: Arc<dyn ReportingSummaryPort>,
         alert_port: Arc<dyn ReportScheduleAlertPort>,
+        export_orchestrator: Arc<dyn ReportExportOrchestrator>,
     ) -> Self {
         Self {
             repository,
             summary_port,
             alert_port,
+            export_orchestrator,
             operation_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -270,6 +278,7 @@ impl ReportSchedulingService {
             Arc::new(InMemoryReportScheduleRepository::default()),
             Arc::new(StubSummaryPort::default()),
             Arc::new(InMemoryAlertPort::default()),
+            Arc::new(ReportExportWorkflowService::in_memory()),
         )
     }
 
@@ -278,8 +287,18 @@ impl ReportSchedulingService {
         Self::new(
             Arc::new(PostgresReportScheduleRepository::new(pool.clone())),
             Arc::new(ReadModelSummaryPort::new(read_model)),
-            Arc::new(PostgresAlertPort::new(pool)),
+            Arc::new(PostgresAlertPort::new(pool.clone())),
+            Arc::new(ReportExportWorkflowService::postgres(pool)),
         )
+    }
+
+    #[cfg(test)]
+    fn with_export_orchestrator(
+        mut self,
+        export_orchestrator: Arc<dyn ReportExportOrchestrator>,
+    ) -> Self {
+        self.export_orchestrator = export_orchestrator;
+        self
     }
 
     pub fn bootstrap_from_env() -> Result<Option<Self>, ReportSchedulingServiceError> {
@@ -726,6 +745,25 @@ impl ReportScheduleOrchestrator for ReportSchedulingService {
             run.updated_at_utc = now.clone();
             run = self.repository.upsert_run(run)?;
 
+            if schedule.cadence == ReportingCadence::Weekly
+                && run.status == ReportingRunState::Succeeded
+            {
+                self.export_orchestrator
+                    .dispatch_weekly_export(DispatchWeeklyExportInput {
+                        actor_id: SCHEDULER_ACTOR_ID.to_string(),
+                        actor_role: SCHEDULER_ACTOR_ROLE.to_string(),
+                        schedule_id: schedule.schedule_id.clone(),
+                        schedule_window_key: run.window_key.clone(),
+                        report_run_id: run.run_id.clone(),
+                        correlation_id: run.correlation_id.clone(),
+                        requested_at_utc: now.clone(),
+                        as_of_utc: run.window_ended_at_utc.clone(),
+                        reason_code: None,
+                        unavailable_artifact_types: Vec::new(),
+                    })
+                    .map_err(map_export_error)?;
+            }
+
             schedule.next_run_at_utc =
                 advance_to_next_run_at_utc(schedule.cadence, &schedule.next_run_at_utc)
                     .map_err(map_contract_error)?;
@@ -968,6 +1006,24 @@ fn map_read_model_error(error: ReportingReadModelError) -> ReportSchedulingServi
             ReportSchedulingServiceError::stale_evidence(error.message)
         }
         _ => ReportSchedulingServiceError::dependency_unavailable(error.message),
+    }
+}
+
+fn map_export_error(error: ReportExportWorkflowError) -> ReportSchedulingServiceError {
+    match error.code {
+        code if code == ReportingExportReasonCode::DependencyUnavailable.code() => {
+            ReportSchedulingServiceError::dependency_unavailable(error.message)
+        }
+        code if code == ReportingExportReasonCode::StaleEvidence.code() => {
+            ReportSchedulingServiceError::stale_evidence(error.message)
+        }
+        code if code == ReportingExportReasonCode::PersistenceUnavailable.code() => {
+            ReportSchedulingServiceError::persistence_unavailable(error.message)
+        }
+        _ => ReportSchedulingServiceError::dependency_unavailable(format!(
+            "weekly export dispatch failed: {}",
+            error.message
+        )),
     }
 }
 
@@ -1418,6 +1474,11 @@ impl ReportScheduleAlertPort for InMemoryAlertPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exports::workflows::{
+        GetExportArtifactInput, ListExportArtifactsInput, QueryExportJobInput,
+        ReportExportJobEvidence, ReportExportOrchestrator, ReportExportWorkflowError,
+        TriggerIncidentExportInput, TriggerOnDemandExportInput,
+    };
     use domain::reporting_schedule::{build_reporting_window_for_boundary, parse_utc_timestamp};
 
     fn service_with_stub_summary(
@@ -1427,7 +1488,116 @@ mod tests {
             Arc::new(InMemoryReportScheduleRepository::default()),
             Arc::new(StubSummaryPort { fail_with }),
             Arc::new(InMemoryAlertPort::default()),
+            Arc::new(ReportExportWorkflowService::in_memory()),
         )
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingWeeklyExportOrchestrator {
+        dispatched: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl CapturingWeeklyExportOrchestrator {
+        fn snapshot(&self) -> Vec<(String, String, String)> {
+            self.dispatched
+                .lock()
+                .expect("dispatch capture lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl ReportExportOrchestrator for CapturingWeeklyExportOrchestrator {
+        fn warmup_status(&self) -> &'static str {
+            "weekly-export-capture-ready"
+        }
+
+        fn trigger_on_demand_export(
+            &self,
+            _input: TriggerOnDemandExportInput,
+        ) -> Result<ReportExportJobEvidence, ReportExportWorkflowError> {
+            Err(ReportExportWorkflowError {
+                code: ReportingExportReasonCode::DependencyUnavailable.code(),
+                message: "on-demand dispatch not used in scheduling tests".to_string(),
+                field_errors: Vec::new(),
+            })
+        }
+
+        fn trigger_incident_export(
+            &self,
+            _input: TriggerIncidentExportInput,
+        ) -> Result<ReportExportJobEvidence, ReportExportWorkflowError> {
+            Err(ReportExportWorkflowError {
+                code: ReportingExportReasonCode::DependencyUnavailable.code(),
+                message: "incident dispatch not used in scheduling tests".to_string(),
+                field_errors: Vec::new(),
+            })
+        }
+
+        fn dispatch_weekly_export(
+            &self,
+            input: DispatchWeeklyExportInput,
+        ) -> Result<ReportExportJobEvidence, ReportExportWorkflowError> {
+            self.dispatched
+                .lock()
+                .expect("dispatch capture lock should not be poisoned")
+                .push((
+                    input.schedule_id.clone(),
+                    input.schedule_window_key.clone(),
+                    input.report_run_id.clone(),
+                ));
+            Ok(ReportExportJobEvidence {
+                job_id: "report-export::capture".to_string(),
+                trigger_source: "scheduled_weekly".to_string(),
+                status: "succeeded".to_string(),
+                reason_code: "reporting_export_job_succeeded".to_string(),
+                artifact_count: 5,
+                missing_artifact_types: Vec::new(),
+                package_reference: Some(
+                    "s3://reporting-exports/report-export-capture/manifest.json".to_string(),
+                ),
+                package_checksum: Some("a".repeat(64)),
+                correlation_id: input.correlation_id,
+                requested_at_utc: input.requested_at_utc.clone(),
+                started_at_utc: Some(input.requested_at_utc.clone()),
+                finished_at_utc: Some(input.requested_at_utc.clone()),
+                updated_at_utc: input.requested_at_utc,
+            })
+        }
+
+        fn query_export_job(
+            &self,
+            _input: QueryExportJobInput,
+        ) -> Result<domain::reporting_export::ExportJobRecord, ReportExportWorkflowError> {
+            Err(ReportExportWorkflowError {
+                code: ReportingExportReasonCode::DependencyUnavailable.code(),
+                message: "query not used in scheduling tests".to_string(),
+                field_errors: Vec::new(),
+            })
+        }
+
+        fn list_export_artifacts(
+            &self,
+            _input: ListExportArtifactsInput,
+        ) -> Result<Vec<domain::reporting_export::ExportArtifactRecord>, ReportExportWorkflowError>
+        {
+            Err(ReportExportWorkflowError {
+                code: ReportingExportReasonCode::DependencyUnavailable.code(),
+                message: "artifact listing not used in scheduling tests".to_string(),
+                field_errors: Vec::new(),
+            })
+        }
+
+        fn get_export_artifact(
+            &self,
+            _input: GetExportArtifactInput,
+        ) -> Result<domain::reporting_export::ExportArtifactRecord, ReportExportWorkflowError>
+        {
+            Err(ReportExportWorkflowError {
+                code: ReportingExportReasonCode::DependencyUnavailable.code(),
+                message: "artifact retrieval not used in scheduling tests".to_string(),
+                field_errors: Vec::new(),
+            })
+        }
     }
 
     fn sample_upsert(
@@ -1517,6 +1687,32 @@ mod tests {
             .expect("schedule lookup should succeed")
             .expect("schedule must exist");
         assert_eq!(schedule.next_run_at_utc, "2026-04-20T00:00:00Z");
+    }
+
+    #[test]
+    fn scheduler_dispatches_weekly_export_from_run_evidence() {
+        let export_capture = Arc::new(CapturingWeeklyExportOrchestrator::default());
+        let service =
+            service_with_stub_summary(None).with_export_orchestrator(export_capture.clone());
+        service
+            .upsert_schedule(sample_upsert(
+                "report-schedule-weekly",
+                "weekly",
+                "2026-04-13T00:00:00Z",
+            ))
+            .expect("schedule should upsert");
+
+        let runs = service
+            .process_due_schedules("2026-04-13T00:00:05Z")
+            .expect("due processing should succeed");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, ReportingRunState::Succeeded);
+
+        let dispatched = export_capture.snapshot();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].0, "report-schedule-weekly");
+        assert_eq!(dispatched[0].1, runs[0].window_key);
+        assert_eq!(dispatched[0].2, runs[0].run_id);
     }
 
     #[test]

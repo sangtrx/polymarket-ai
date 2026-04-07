@@ -15,6 +15,7 @@ use governance_service::risk_limits::RiskLimitService;
 use governance_service::safety_controls::SafetyControlService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
 use reporting_service::exports::scheduling::ReportSchedulingService;
+use reporting_service::exports::workflows::ReportExportWorkflowService;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
@@ -45,6 +46,9 @@ async fn main() {
         Arc::new(ReportSchedulingService::postgres(pool.clone())),
         Arc::new(RecoveryService::postgres(pool.clone())),
     )
+    .with_report_export_orchestrator(Arc::new(ReportExportWorkflowService::postgres(
+        pool.clone(),
+    )))
     .with_attribution_pool(pool);
     let _app: Router = routes::app_router(state);
     println!("control-api bootstrap ready at {}", timestamp_utc());

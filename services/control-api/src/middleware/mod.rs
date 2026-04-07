@@ -20,6 +20,9 @@ use governance_service::recovery::{RecoveryOrchestrator, RecoveryService};
 use governance_service::risk_limits::{RiskLimitOrchestrator, RiskLimitService};
 use governance_service::safety_controls::{SafetyControlOrchestrator, SafetyControlService};
 use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportSchedulingService};
+use reporting_service::exports::workflows::{
+    ReportExportOrchestrator, ReportExportWorkflowService,
+};
 use serde::Serialize;
 use serde_json::json;
 use sqlx::PgPool;
@@ -222,6 +225,7 @@ pub struct ControlApiState {
     pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
     pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
     pub report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
+    pub report_export_orchestrator: Arc<dyn ReportExportOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
@@ -330,6 +334,7 @@ impl ControlApiState {
             risk_limit_orchestrator,
             safety_control_orchestrator,
             report_schedule_orchestrator,
+            report_export_orchestrator: Arc::new(ReportExportWorkflowService::default()),
             recovery_orchestrator,
             attribution_pool: None,
         }
@@ -341,6 +346,15 @@ impl ControlApiState {
         report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
     ) -> Self {
         self.report_schedule_orchestrator = report_schedule_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_report_export_orchestrator(
+        mut self,
+        report_export_orchestrator: Arc<dyn ReportExportOrchestrator>,
+    ) -> Self {
+        self.report_export_orchestrator = report_export_orchestrator;
         self
     }
 

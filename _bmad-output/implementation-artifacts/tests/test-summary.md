@@ -582,3 +582,33 @@
 
 - `npm run --silent qa:test:story-4-3` ✅
 - `node --test tests/contract/story-4-3*.test.mjs tests/api/story-4-3*.test.mjs tests/e2e/story-4-3*.test.mjs` ✅
+
+---
+
+## Story 4.4 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/reporting_export.rs` (`reporting_export::tests::`) — validates canonical export trigger/state/artifact contracts, reason-code roundtrips, UTC validation, transition fail-closed behavior, and RBAC boundary reuse.
+- [x] `crates/persistence/src/postgres/export_jobs.rs` (`postgres::export_jobs::tests::`) — validates Story 4.4 migration scope (`export_jobs`, `export_artifacts` only), deterministic ordering, canonicalization, limit boundaries, and constraint/failure taxonomy.
+- [x] `services/reporting-service/src/exports/workflows.rs` (`exports::workflows::tests::`) — validates weekly idempotent dispatch linkage, on-demand and incident triggers, FR36 artifact coverage completeness, fail-closed unavailable-artifact behavior, and retrieval integrity failures.
+- [x] `services/reporting-service/src/exports/scheduling.rs` (`exports::scheduling::tests::`) — validates weekly scheduler integration dispatching export jobs from schedule/run evidence while preserving Story 4.3 lifecycle behavior.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::report_export_`) — validates authenticated export trigger/retrieval endpoints, read-role authorization, machine-readable failure contracts, and export audit/security-signal envelopes.
+- [x] `tests/contract/story-4-4-report-export-workflows.test.mjs` — validates route discoverability, migration boundaries, weekly idempotency index contract, and root QA script publication.
+- [x] `tests/api/story-4-4-report-export-workflows-api.test.mjs` — validates export orchestration/read API wiring, authorization boundary enforcement, deterministic error/status mapping contracts, and read-correlation precedence handling.
+- [x] `tests/e2e/story-4-4-report-export-workflows.e2e.test.mjs` — validates scheduler-to-export linkage, runbook operator workflow coverage, incident-alert SLA evidence emission, and retrieval fail-closed integrity/missing-job behavior.
+
+### Coverage
+
+- Story 4.4 now has deterministic automated coverage for:
+  - FR36 export workflow coverage across `scheduled_weekly`, `on_demand`, and `incident_triggered` orchestration paths,
+  - export job lifecycle determinism and weekly idempotent replay behavior linked to schedule/run evidence,
+  - required artifact coverage completeness with explicit fail-closed unavailable-category handling,
+  - control-plane mutation/read authorization boundaries with canonical machine-readable envelope/error behavior,
+  - runbook and story-level contract/API/E2E regression checks for stable operator-facing export workflows.
+- Automated Story 4.4 regression inventory in this QA refresh: **56 Story-4.4 tests passing** (`rust: 44`, `contract/api/e2e: 12`).
+
+### Execution Result
+
+- `node --test tests/api/story-4-4-report-export-workflows-api.test.mjs tests/e2e/story-4-4-report-export-workflows.e2e.test.mjs` ✅
+- `npm run --silent qa:test:story-4-4` ✅

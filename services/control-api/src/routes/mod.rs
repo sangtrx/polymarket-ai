@@ -37,6 +37,10 @@ use domain::recovery::RecoveryReasonCode;
 use domain::recovery_rehearsal::{
     BackupIntegrityCheckItem, RestoreRehearsalRunEvidence, RestoreRehearsalStatus,
 };
+use domain::reporting_export::{
+    ExportArtifactRecord, ExportJobRecord, ReportingExportReasonCode,
+    ReportingExportValidationIssue, parse_utc_timestamp as parse_export_utc_timestamp,
+};
 use domain::reporting_schedule::{
     ReportRunRecord, ReportingScheduleReasonCode, ReportingScheduleValidationIssue,
     parse_utc_timestamp,
@@ -78,6 +82,10 @@ use persistence::postgres::incident_query_views::load_incident_forensics_timelin
 use reporting_service::exports::scheduling::{
     PauseReportScheduleInput, QueryReportRunHistoryInput, ReportScheduleMutationEvidence,
     ResumeReportScheduleInput, UpsertReportScheduleInput,
+};
+use reporting_service::exports::workflows::{
+    GetExportArtifactInput, ListExportArtifactsInput, QueryExportJobInput, ReportExportJobEvidence,
+    TriggerIncidentExportInput, TriggerOnDemandExportInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -247,6 +255,31 @@ pub fn app_router(state: ControlApiState) -> Router {
             state.clone(),
             require_authenticated_actor,
         ));
+    let report_export_routes = Router::new()
+        .route(
+            "/control/report-exports/on-demand",
+            post(trigger_on_demand_report_export),
+        )
+        .route(
+            "/control/report-exports/incidents/{incident_id}",
+            post(trigger_incident_report_export),
+        )
+        .route(
+            "/control/report-exports/{job_id}",
+            get(query_report_export_job),
+        )
+        .route(
+            "/control/report-exports/{job_id}/artifacts",
+            get(list_report_export_artifacts),
+        )
+        .route(
+            "/control/report-exports/{job_id}/artifacts/{artifact_id}",
+            get(read_report_export_artifact),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -261,6 +294,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(emergency_control_routes)
         .merge(recovery_routes)
         .merge(report_schedule_routes)
+        .merge(report_export_routes)
         .with_state(state)
 }
 
@@ -2989,6 +3023,789 @@ pub async fn query_report_schedule_runs(
         endpoint,
         authorization.timestamp_utc,
     )
+}
+
+pub async fn trigger_on_demand_report_export(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    maybe_payload: Option<axum::Json<ReportExportTriggerPayload>>,
+) -> Response {
+    let endpoint = "/control/report-exports/on-demand".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = maybe_payload
+        .map(|axum::Json(payload)| payload)
+        .unwrap_or_default();
+
+    let requested_at_utc = authorization.timestamp_utc.clone();
+    let as_of_utc = payload
+        .as_of_utc
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| requested_at_utc.clone());
+    if let Err(error) = parse_export_utc_timestamp("as_of_utc", &as_of_utc) {
+        return report_export_service_error_response(
+            error.code,
+            error.message,
+            error.field_errors,
+            "report_export_on_demand_trigger",
+            &actor,
+            requested_at_utc,
+            endpoint,
+        );
+    }
+
+    let evidence = match state.report_export_orchestrator.trigger_on_demand_export(
+        TriggerOnDemandExportInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            correlation_id: payload
+                .correlation_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| actor.correlation_id.clone()),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+            as_of_utc,
+            reason_code: payload.reason_code,
+            unavailable_artifact_types: payload.unavailable_artifact_types,
+        },
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return report_export_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "report_export_on_demand_trigger",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    report_export_trigger_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "report_export_on_demand_trigger",
+        "POST",
+    )
+}
+
+pub async fn trigger_incident_report_export(
+    State(state): State<ControlApiState>,
+    Path(incident_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    maybe_payload: Option<axum::Json<ReportExportIncidentTriggerPayload>>,
+) -> Response {
+    let endpoint = format!("/control/report-exports/incidents/{incident_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = maybe_payload
+        .map(|axum::Json(payload)| payload)
+        .unwrap_or_default();
+
+    let incident_severity = payload
+        .incident_severity
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default();
+    if incident_severity.is_empty() {
+        return report_export_service_error_response(
+            ReportingExportReasonCode::MissingIncidentContext.code(),
+            "incident_severity is required for incident-triggered exports".to_string(),
+            vec![ReportingExportValidationIssue {
+                field: "incident_severity",
+                code: ReportingExportReasonCode::MissingIncidentContext.code(),
+                message: "incident_severity is required for incident-triggered exports".to_string(),
+            }],
+            "report_export_incident_trigger",
+            &actor,
+            authorization.timestamp_utc,
+            endpoint,
+        );
+    }
+
+    let as_of_utc = payload
+        .as_of_utc
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    if let Err(error) = parse_export_utc_timestamp("as_of_utc", &as_of_utc) {
+        return report_export_service_error_response(
+            error.code,
+            error.message,
+            error.field_errors,
+            "report_export_incident_trigger",
+            &actor,
+            authorization.timestamp_utc,
+            endpoint,
+        );
+    }
+
+    let evidence =
+        match state
+            .report_export_orchestrator
+            .trigger_incident_export(TriggerIncidentExportInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                incident_id,
+                incident_severity,
+                correlation_id: payload
+                    .correlation_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| actor.correlation_id.clone()),
+                requested_at_utc: authorization.timestamp_utc.clone(),
+                as_of_utc,
+                reason_code: payload.reason_code,
+                unavailable_artifact_types: payload.unavailable_artifact_types,
+                impacted_system: payload.impacted_system,
+                runbook_url: payload.runbook_url,
+            }) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return report_export_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "report_export_incident_trigger",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    report_export_trigger_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "report_export_incident_trigger",
+        "POST",
+    )
+}
+
+pub async fn query_report_export_job(
+    State(state): State<ControlApiState>,
+    Path(job_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/report-exports/{job_id}");
+    let authorization = match authorize_report_export_read(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let job = match state
+        .report_export_orchestrator
+        .query_export_job(QueryExportJobInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            job_id: job_id.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(job) => job,
+        Err(error) => {
+            return report_export_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "report_export_job_query",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    report_export_job_response(
+        &state,
+        &actor,
+        job,
+        endpoint,
+        "report_export_job_query",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn list_report_export_artifacts(
+    State(state): State<ControlApiState>,
+    Path(job_id): Path<String>,
+    Query(query): Query<ReportExportArtifactsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/report-exports/{job_id}/artifacts");
+    let authorization = match authorize_report_export_read(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let artifacts =
+        match state
+            .report_export_orchestrator
+            .list_export_artifacts(ListExportArtifactsInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                job_id: job_id.clone(),
+                correlation_id: effective_correlation_id.clone(),
+                queried_at_utc: authorization.timestamp_utc.clone(),
+                limit: query.limit,
+            }) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                return report_export_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "report_export_artifact_list",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    report_export_artifact_list_response(
+        &state,
+        &actor,
+        job_id,
+        artifacts,
+        endpoint,
+        "report_export_artifact_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_report_export_artifact(
+    State(state): State<ControlApiState>,
+    Path((job_id, artifact_id)): Path<(String, String)>,
+    Query(query): Query<ReportExportArtifactQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/report-exports/{job_id}/artifacts/{artifact_id}");
+    let authorization = match authorize_report_export_read(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let artifact =
+        match state
+            .report_export_orchestrator
+            .get_export_artifact(GetExportArtifactInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                job_id: job_id.clone(),
+                artifact_id: artifact_id.clone(),
+                correlation_id: effective_correlation_id.clone(),
+                queried_at_utc: authorization.timestamp_utc.clone(),
+            }) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                return report_export_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "report_export_artifact_read",
+                    &actor,
+                    authorization.timestamp_utc,
+                    endpoint,
+                );
+            }
+        };
+
+    report_export_artifact_response(
+        &state,
+        &actor,
+        artifact,
+        endpoint,
+        "report_export_artifact_read",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
+fn report_export_trigger_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: ReportExportJobEvidence,
+    endpoint: String,
+    action: &'static str,
+    http_method: &'static str,
+) -> Response {
+    let trigger_source = evidence.trigger_source.clone();
+    let status = evidence.status.clone();
+    let reason_code = evidence.reason_code.clone();
+    let correlation_id = evidence.correlation_id.clone();
+    let timestamp_utc = evidence.updated_at_utc.clone();
+    let job_id = evidence.job_id.clone();
+    let response_data = ReportExportTriggerData {
+        job: ReportExportJobItem {
+            job_id: job_id.clone(),
+            trigger_source: evidence.trigger_source,
+            status: evidence.status,
+            reason_code: evidence.reason_code,
+            package_reference: evidence.package_reference,
+            package_checksum: evidence.package_checksum,
+            requested_at_utc: evidence.requested_at_utc,
+            started_at_utc: evidence.started_at_utc,
+            finished_at_utc: evidence.finished_at_utc,
+            schedule_id: None,
+            schedule_window_key: None,
+            report_run_id: None,
+            incident_id: None,
+            incident_severity: None,
+            failure_metadata: None,
+        },
+        artifact_count: evidence.artifact_count,
+        missing_artifact_types: evidence.missing_artifact_types,
+    };
+
+    report_export_success_response(
+        state,
+        actor,
+        response_data,
+        ReportExportSuccessContext {
+            endpoint,
+            action,
+            http_method,
+            status: StatusCode::ACCEPTED,
+            reason_code,
+            correlation_id,
+            timestamp_utc,
+            signal_name: "report_export_trigger_applied_v1",
+            job_id,
+            trigger_source,
+            lifecycle_status: status,
+        },
+    )
+}
+
+fn report_export_job_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    job: ExportJobRecord,
+    endpoint: String,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let reason_code = ReportingExportReasonCode::Ready.code().to_string();
+    let correlation_id = actor.correlation_id.clone();
+    let job_id = job.job_id.clone();
+    let trigger_source = job.trigger_source.as_str().to_string();
+    let lifecycle_status = job.status.as_str().to_string();
+    report_export_success_response(
+        state,
+        actor,
+        ReportExportJobData {
+            job: to_report_export_job_item(job),
+        },
+        ReportExportSuccessContext {
+            endpoint,
+            action,
+            http_method: "GET",
+            status: StatusCode::OK,
+            reason_code,
+            correlation_id,
+            timestamp_utc,
+            signal_name: "report_export_job_query_v1",
+            job_id,
+            trigger_source,
+            lifecycle_status,
+        },
+    )
+}
+
+fn report_export_artifact_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    job_id: String,
+    artifacts: Vec<ExportArtifactRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let response_artifacts = artifacts
+        .into_iter()
+        .map(to_report_export_artifact_item)
+        .collect::<Vec<_>>();
+    report_export_success_response(
+        state,
+        actor,
+        ReportExportArtifactsData {
+            job_id: job_id.clone(),
+            artifacts: response_artifacts,
+        },
+        ReportExportSuccessContext {
+            endpoint,
+            action,
+            http_method: "GET",
+            status: StatusCode::OK,
+            reason_code: ReportingExportReasonCode::Ready.code().to_string(),
+            correlation_id,
+            timestamp_utc,
+            signal_name: "report_export_artifact_list_v1",
+            job_id,
+            trigger_source: "mixed".to_string(),
+            lifecycle_status: "query".to_string(),
+        },
+    )
+}
+
+fn report_export_artifact_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    artifact: ExportArtifactRecord,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    report_export_success_response(
+        state,
+        actor,
+        ReportExportArtifactData {
+            artifact: to_report_export_artifact_item(artifact.clone()),
+        },
+        ReportExportSuccessContext {
+            endpoint,
+            action,
+            http_method: "GET",
+            status: StatusCode::OK,
+            reason_code: ReportingExportReasonCode::Ready.code().to_string(),
+            correlation_id,
+            timestamp_utc,
+            signal_name: "report_export_artifact_read_v1",
+            job_id: artifact.job_id,
+            trigger_source: "artifact".to_string(),
+            lifecycle_status: "query".to_string(),
+        },
+    )
+}
+
+fn report_export_success_response<T: Serialize>(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    data: T,
+    context: ReportExportSuccessContext,
+) -> Response {
+    let ReportExportSuccessContext {
+        endpoint,
+        action,
+        http_method,
+        status,
+        reason_code,
+        correlation_id,
+        timestamp_utc,
+        signal_name,
+        job_id,
+        trigger_source,
+        lifecycle_status,
+    } = context;
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "job_id": job_id.clone(),
+            "trigger_source": trigger_source.clone(),
+            "status": lifecycle_status.clone(),
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    emit_report_export_route_telemetry(ReportExportRouteTelemetryEvent {
+        event_name: "control_api_report_export_transition_v1",
+        signal_name,
+        alert_compatible: false,
+        alert_target_seconds: 30,
+        action,
+        actor_id: &actor.actor_id,
+        role: &actor.role,
+        correlation_id: &correlation_id,
+        job_id: &job_id,
+        trigger_source: &trigger_source,
+        status: &lifecycle_status,
+        reason_code: &reason_code,
+        timestamp_utc: &timestamp_utc,
+    });
+
+    (
+        status,
+        axum::Json(ReportExportEnvelope {
+            data: Some(data),
+            meta: ReportExportMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn authorize_report_export_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(report_export_service_error_response(
+        ReportingExportReasonCode::Unauthorized.code(),
+        machine_error.message,
+        Vec::new(),
+        "report_export_read",
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
+}
+
+fn report_export_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<ReportingExportValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let is_unauthorized = error_code == ReportingExportReasonCode::Unauthorized.code();
+    let security_signal = if is_unauthorized {
+        Some(ReportExportSecuritySignal {
+            name: if action.contains("trigger") {
+                "unauthorized_report_export_mutation_attempt_v1"
+            } else {
+                "unauthorized_report_export_read_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    emit_report_export_route_telemetry(ReportExportRouteTelemetryEvent {
+        event_name: "control_api_report_export_transition_v1",
+        signal_name: if is_unauthorized {
+            "report_export_transition_rejected_v1"
+        } else {
+            "report_export_transition_failed_v1"
+        },
+        alert_compatible: is_unauthorized,
+        alert_target_seconds: 30,
+        action,
+        actor_id: &actor.actor_id,
+        role: &actor.role,
+        correlation_id: &actor.correlation_id,
+        job_id: "n/a",
+        trigger_source: "n/a",
+        status: "error",
+        reason_code: error_code,
+        timestamp_utc: &timestamp_utc,
+    });
+
+    (
+        report_export_service_error_status(error_code),
+        axum::Json(ReportExportEnvelope::<serde_json::Value> {
+            data: None,
+            meta: ReportExportMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(ReportExportEnvelopeError {
+                error_code: error_code.to_string(),
+                message,
+                field_errors: field_errors
+                    .into_iter()
+                    .map(|issue| ReportExportFieldError {
+                        field: issue.field.to_string(),
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn report_export_service_error_status(code: &str) -> StatusCode {
+    match code {
+        value if value == ReportingExportReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        value if value == ReportingExportReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
+        value if value == ReportingExportReasonCode::NotFound.code() => StatusCode::NOT_FOUND,
+        value if value == ReportingExportReasonCode::MissingIncidentContext.code() => StatusCode::BAD_REQUEST,
+        value
+            if value == ReportingExportReasonCode::DependencyUnavailable.code()
+                || value == ReportingExportReasonCode::StaleEvidence.code()
+                || value == ReportingExportReasonCode::IntegrityMismatch.code()
+                || value == ReportingExportReasonCode::ArtifactUnavailable.code()
+                || value == "report_export_constraint_violation" =>
+        {
+            StatusCode::CONFLICT
+        }
+        value
+            if value == ReportingExportReasonCode::PersistenceUnavailable.code()
+                || value == "report_export_query_failed"
+                || value == "report_export_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn emit_report_export_route_telemetry(event: ReportExportRouteTelemetryEvent<'_>) {
+    println!(
+        "{}",
+        serde_json::to_string(&event)
+            .expect("report export route telemetry should always serialize")
+    );
+}
+
+fn to_report_export_job_item(job: ExportJobRecord) -> ReportExportJobItem {
+    ReportExportJobItem {
+        job_id: job.job_id,
+        trigger_source: job.trigger_source.as_str().to_string(),
+        status: job.status.as_str().to_string(),
+        reason_code: job.reason_code,
+        package_reference: job.package_reference,
+        package_checksum: job.package_checksum,
+        requested_at_utc: job.requested_at_utc,
+        started_at_utc: job.started_at_utc,
+        finished_at_utc: job.finished_at_utc,
+        schedule_id: job.schedule_id,
+        schedule_window_key: job.schedule_window_key,
+        report_run_id: job.report_run_id,
+        incident_id: job.incident_id,
+        incident_severity: job.incident_severity,
+        failure_metadata: job.failure_metadata,
+    }
+}
+
+fn to_report_export_artifact_item(artifact: ExportArtifactRecord) -> ReportExportArtifactItem {
+    ReportExportArtifactItem {
+        artifact_id: artifact.artifact_id,
+        job_id: artifact.job_id,
+        artifact_type: artifact.artifact_type.as_str().to_string(),
+        source: artifact.source,
+        as_of_utc: artifact.as_of_utc,
+        reason_code: artifact.reason_code,
+        correlation_id: artifact.correlation_id,
+        checksum: artifact.checksum,
+        retrieval_reference: artifact.retrieval_reference,
+        is_available: artifact.is_available,
+        updated_at_utc: artifact.updated_at_utc,
+    }
+}
+
+struct ReportExportSuccessContext {
+    endpoint: String,
+    action: &'static str,
+    http_method: &'static str,
+    status: StatusCode,
+    reason_code: String,
+    correlation_id: String,
+    timestamp_utc: String,
+    signal_name: &'static str,
+    job_id: String,
+    trigger_source: String,
+    lifecycle_status: String,
 }
 
 fn report_schedule_mutation_response(
@@ -7616,6 +8433,167 @@ struct ReportScheduleRouteTelemetryEvent<'a> {
     timestamp_utc: &'a str,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ReportExportTriggerPayload {
+    pub reason_code: Option<String>,
+    pub correlation_id: Option<String>,
+    pub as_of_utc: Option<String>,
+    #[serde(default)]
+    pub unavailable_artifact_types: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReportExportIncidentTriggerPayload {
+    pub reason_code: Option<String>,
+    pub correlation_id: Option<String>,
+    pub as_of_utc: Option<String>,
+    pub incident_severity: Option<String>,
+    pub impacted_system: Option<String>,
+    pub runbook_url: Option<String>,
+    #[serde(default)]
+    pub unavailable_artifact_types: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReportExportArtifactsQuery {
+    pub correlation_id: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReportExportArtifactQuery {
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: ReportExportMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ReportExportEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<ReportExportFieldError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<ReportExportSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportTriggerData {
+    pub job: ReportExportJobItem,
+    pub artifact_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_artifact_types: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportJobData {
+    pub job: ReportExportJobItem,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportArtifactsData {
+    pub job_id: String,
+    pub artifacts: Vec<ReportExportArtifactItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportArtifactData {
+    pub artifact: ReportExportArtifactItem,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportJobItem {
+    pub job_id: String,
+    pub trigger_source: String,
+    pub status: String,
+    pub reason_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_checksum: Option<String>,
+    pub requested_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_window_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_severity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_metadata: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportExportArtifactItem {
+    pub artifact_id: String,
+    pub job_id: String,
+    pub artifact_type: String,
+    pub source: String,
+    pub as_of_utc: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub checksum: String,
+    pub retrieval_reference: String,
+    pub is_available: bool,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportExportRouteTelemetryEvent<'a> {
+    event_name: &'a str,
+    signal_name: &'a str,
+    alert_compatible: bool,
+    alert_target_seconds: u32,
+    action: &'a str,
+    actor_id: &'a str,
+    role: &'a str,
+    correlation_id: &'a str,
+    job_id: &'a str,
+    trigger_source: &'a str,
+    status: &'a str,
+    reason_code: &'a str,
+    timestamp_utc: &'a str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7639,6 +8617,10 @@ mod tests {
     use domain::recovery_rehearsal::{
         BackupIntegrityCheckItem, DeterministicReplaySignatureEvidence,
         RestoreRehearsalRunEvidence, RestoreRehearsalStatus,
+    };
+    use domain::reporting_export::{
+        ExportArtifactRecord, ExportJobRecord, ReportingExportArtifactType,
+        ReportingExportJobState, ReportingExportReasonCode, ReportingExportTriggerSource,
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::risk::{
@@ -7679,6 +8661,11 @@ mod tests {
         PauseReportScheduleInput, QueryReportRunHistoryInput, ReportScheduleMutationEvidence,
         ReportScheduleOrchestrator, ReportSchedulingServiceError, ResumeReportScheduleInput,
         UpsertReportScheduleInput,
+    };
+    use reporting_service::exports::workflows::{
+        DispatchWeeklyExportInput, GetExportArtifactInput, ListExportArtifactsInput,
+        QueryExportJobInput, ReportExportJobEvidence, ReportExportOrchestrator,
+        ReportExportWorkflowError, TriggerIncidentExportInput, TriggerOnDemandExportInput,
     };
     use std::sync::{Arc, Mutex};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -7918,6 +8905,231 @@ mod tests {
                 Arc::new(CapturingAuditAppender::default()),
             )
             .with_report_schedule_orchestrator(report_schedule_orchestrator),
+        )
+    }
+
+    #[derive(Debug, Default)]
+    struct StubReportExportOrchestrator {
+        on_demand_error: Option<(&'static str, &'static str)>,
+        incident_error: Option<(&'static str, &'static str)>,
+        query_error: Option<(&'static str, &'static str)>,
+        list_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl StubReportExportOrchestrator {
+        fn sample_job(job_id: String) -> ExportJobRecord {
+            ExportJobRecord {
+                job_id,
+                trigger_source: ReportingExportTriggerSource::OnDemand,
+                status: ReportingExportJobState::Succeeded,
+                reason_code: ReportingExportReasonCode::JobSucceeded.code().to_string(),
+                actor_id: "ops-1".to_string(),
+                actor_role: "operational_control".to_string(),
+                correlation_id: "corr-export-001".to_string(),
+                schedule_id: None,
+                schedule_window_key: None,
+                report_run_id: None,
+                incident_id: None,
+                incident_severity: None,
+                requested_at_utc: "2026-04-07T00:00:00Z".to_string(),
+                started_at_utc: Some("2026-04-07T00:00:01Z".to_string()),
+                finished_at_utc: Some("2026-04-07T00:00:02Z".to_string()),
+                package_reference: Some(
+                    "s3://reporting-exports/export-job-001/manifest.json".to_string(),
+                ),
+                package_checksum: Some("a".repeat(64)),
+                failure_metadata: None,
+                created_at_utc: "2026-04-07T00:00:00Z".to_string(),
+                updated_at_utc: "2026-04-07T00:00:02Z".to_string(),
+            }
+        }
+
+        fn sample_artifact(
+            job_id: String,
+            artifact_id: String,
+            is_available: bool,
+        ) -> ExportArtifactRecord {
+            ExportArtifactRecord {
+                artifact_id,
+                job_id,
+                artifact_type: ReportingExportArtifactType::PromotionDecisions,
+                source: "governance_promotion_decisions".to_string(),
+                as_of_utc: "2026-04-07T00:00:00Z".to_string(),
+                reason_code: if is_available {
+                    ReportingExportReasonCode::Ready.code().to_string()
+                } else {
+                    ReportingExportReasonCode::ArtifactUnavailable
+                        .code()
+                        .to_string()
+                },
+                correlation_id: "corr-export-001".to_string(),
+                checksum: if is_available {
+                    "b".repeat(64)
+                } else {
+                    "unavailable".to_string()
+                },
+                retrieval_reference: "s3://reporting-exports/export-job-001/promotion.json"
+                    .to_string(),
+                is_available,
+                created_at_utc: "2026-04-07T00:00:00Z".to_string(),
+                updated_at_utc: "2026-04-07T00:00:02Z".to_string(),
+            }
+        }
+    }
+
+    impl ReportExportOrchestrator for StubReportExportOrchestrator {
+        fn warmup_status(&self) -> &'static str {
+            "report-export-stub-ready"
+        }
+
+        fn trigger_on_demand_export(
+            &self,
+            _input: TriggerOnDemandExportInput,
+        ) -> Result<ReportExportJobEvidence, ReportExportWorkflowError> {
+            if let Some((code, message)) = self.on_demand_error {
+                return Err(ReportExportWorkflowError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(ReportExportJobEvidence {
+                job_id: "export-job-001".to_string(),
+                trigger_source: "on_demand".to_string(),
+                status: "succeeded".to_string(),
+                reason_code: ReportingExportReasonCode::JobSucceeded.code().to_string(),
+                artifact_count: 5,
+                missing_artifact_types: Vec::new(),
+                package_reference: Some(
+                    "s3://reporting-exports/export-job-001/manifest.json".to_string(),
+                ),
+                package_checksum: Some("a".repeat(64)),
+                correlation_id: "corr-export-001".to_string(),
+                requested_at_utc: "2026-04-07T00:00:00Z".to_string(),
+                started_at_utc: Some("2026-04-07T00:00:01Z".to_string()),
+                finished_at_utc: Some("2026-04-07T00:00:02Z".to_string()),
+                updated_at_utc: "2026-04-07T00:00:02Z".to_string(),
+            })
+        }
+
+        fn trigger_incident_export(
+            &self,
+            _input: TriggerIncidentExportInput,
+        ) -> Result<ReportExportJobEvidence, ReportExportWorkflowError> {
+            if let Some((code, message)) = self.incident_error {
+                return Err(ReportExportWorkflowError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(ReportExportJobEvidence {
+                job_id: "export-job-incident-001".to_string(),
+                trigger_source: "incident_triggered".to_string(),
+                status: "failed".to_string(),
+                reason_code: ReportingExportReasonCode::DependencyUnavailable
+                    .code()
+                    .to_string(),
+                artifact_count: 5,
+                missing_artifact_types: vec!["incident_postmortems".to_string()],
+                package_reference: Some(
+                    "s3://reporting-exports/export-job-incident-001/manifest.json".to_string(),
+                ),
+                package_checksum: Some("c".repeat(64)),
+                correlation_id: "corr-export-incident-001".to_string(),
+                requested_at_utc: "2026-04-07T00:00:00Z".to_string(),
+                started_at_utc: Some("2026-04-07T00:00:01Z".to_string()),
+                finished_at_utc: Some("2026-04-07T00:00:02Z".to_string()),
+                updated_at_utc: "2026-04-07T00:00:02Z".to_string(),
+            })
+        }
+
+        fn dispatch_weekly_export(
+            &self,
+            _input: DispatchWeeklyExportInput,
+        ) -> Result<ReportExportJobEvidence, ReportExportWorkflowError> {
+            Ok(ReportExportJobEvidence {
+                job_id: "export-job-weekly-001".to_string(),
+                trigger_source: "scheduled_weekly".to_string(),
+                status: "succeeded".to_string(),
+                reason_code: ReportingExportReasonCode::JobSucceeded.code().to_string(),
+                artifact_count: 5,
+                missing_artifact_types: Vec::new(),
+                package_reference: Some(
+                    "s3://reporting-exports/export-job-weekly-001/manifest.json".to_string(),
+                ),
+                package_checksum: Some("d".repeat(64)),
+                correlation_id: "corr-export-weekly-001".to_string(),
+                requested_at_utc: "2026-04-07T00:00:00Z".to_string(),
+                started_at_utc: Some("2026-04-07T00:00:01Z".to_string()),
+                finished_at_utc: Some("2026-04-07T00:00:02Z".to_string()),
+                updated_at_utc: "2026-04-07T00:00:02Z".to_string(),
+            })
+        }
+
+        fn query_export_job(
+            &self,
+            input: QueryExportJobInput,
+        ) -> Result<ExportJobRecord, ReportExportWorkflowError> {
+            if let Some((code, message)) = self.query_error {
+                return Err(ReportExportWorkflowError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(Self::sample_job(input.job_id))
+        }
+
+        fn list_export_artifacts(
+            &self,
+            input: ListExportArtifactsInput,
+        ) -> Result<Vec<ExportArtifactRecord>, ReportExportWorkflowError> {
+            if let Some((code, message)) = self.list_error {
+                return Err(ReportExportWorkflowError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(vec![
+                Self::sample_artifact(
+                    input.job_id.clone(),
+                    "export-artifact-001".to_string(),
+                    true,
+                ),
+                Self::sample_artifact(input.job_id, "export-artifact-002".to_string(), true),
+            ])
+        }
+
+        fn get_export_artifact(
+            &self,
+            input: GetExportArtifactInput,
+        ) -> Result<ExportArtifactRecord, ReportExportWorkflowError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(ReportExportWorkflowError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            Ok(Self::sample_artifact(input.job_id, input.artifact_id, true))
+        }
+    }
+
+    fn test_app_with_report_export_orchestrator(
+        report_export_orchestrator: Arc<dyn ReportExportOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::new(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+            )
+            .with_report_export_orchestrator(report_export_orchestrator),
         )
     }
 
@@ -9076,6 +10288,208 @@ mod tests {
             ReportingScheduleReasonCode::InvalidPayload.code()
         );
         assert_eq!(payload["field_errors"][0]["field"], "observed_at_utc");
+    }
+
+    #[tokio::test]
+    async fn report_export_on_demand_endpoint_returns_enveloped_job_evidence() {
+        let response = test_app_with_report_export_orchestrator(Arc::new(
+            StubReportExportOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-exports/on-demand")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-report-export-on-demand-001")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "as_of_utc": "2026-04-07T00:00:00Z",
+                        "reason_code": "ready"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["meta"]["action"], "report_export_on_demand_trigger");
+        assert_eq!(payload["data"]["job"]["job_id"], "export-job-001");
+        assert_eq!(payload["data"]["job"]["trigger_source"], "on_demand");
+        assert_eq!(payload["data"]["artifact_count"], 5);
+        assert!(payload.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn report_export_incident_endpoint_rejects_missing_severity() {
+        let response = test_app_with_report_export_orchestrator(Arc::new(
+            StubReportExportOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-exports/incidents/incident-001")
+                .method("POST")
+                .header(
+                    "authorization",
+                    bearer_token("ops-1", "operational_control", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-report-export-incident-001")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "as_of_utc": "2026-04-07T00:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["meta"]["action"], "report_export_incident_trigger");
+        assert_eq!(
+            payload["error"]["error_code"],
+            ReportingExportReasonCode::MissingIncidentContext.code()
+        );
+        assert_eq!(
+            payload["error"]["field_errors"][0]["field"],
+            "incident_severity"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_export_job_query_endpoint_allows_read_only_analytics_roles() {
+        let response = test_app_with_report_export_orchestrator(Arc::new(
+            StubReportExportOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-exports/export-job-001")
+                .method("GET")
+                .header(
+                    "authorization",
+                    bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-report-export-query-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["meta"]["role"], "read_only_analytics");
+        assert_eq!(payload["data"]["job"]["job_id"], "export-job-001");
+        assert_eq!(payload["data"]["job"]["status"], "succeeded");
+        assert!(payload.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn report_export_artifact_list_endpoint_maps_unauthorized_errors() {
+        let response =
+            test_app_with_report_export_orchestrator(Arc::new(StubReportExportOrchestrator {
+                list_error: Some((ReportingExportReasonCode::Unauthorized.code(), "forbidden")),
+                ..StubReportExportOrchestrator::default()
+            }))
+            .oneshot(
+                Request::builder()
+                    .uri("/control/report-exports/export-job-001/artifacts?limit=1")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-report-export-artifact-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(
+            payload["error"]["error_code"],
+            ReportingExportReasonCode::Unauthorized.code()
+        );
+        assert_eq!(
+            payload["error"]["security_signal"]["name"],
+            "unauthorized_report_export_read_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_export_artifact_read_endpoint_returns_retrievable_metadata() {
+        let response = test_app_with_report_export_orchestrator(Arc::new(
+            StubReportExportOrchestrator::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/control/report-exports/export-job-001/artifacts/export-artifact-001")
+                .method("GET")
+                .header(
+                    "authorization",
+                    bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                )
+                .header("x-correlation-id", "corr-report-export-artifact-read-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+
+        assert_eq!(payload["meta"]["action"], "report_export_artifact_read");
+        assert_eq!(
+            payload["data"]["artifact"]["artifact_id"],
+            "export-artifact-001"
+        );
+        assert_eq!(
+            payload["data"]["artifact"]["artifact_type"],
+            "promotion_decisions"
+        );
+        assert_eq!(payload["data"]["artifact"]["is_available"], true);
+        assert!(payload.get("error").is_none());
     }
 
     #[tokio::test]
@@ -10757,6 +12171,10 @@ mod tests {
 
     #[tokio::test]
     async fn scheduled_rotation_route_denies_not_due_boundary_with_machine_code() {
+        let last_rotated_at_utc = (OffsetDateTime::now_utc() - Duration::days(89))
+            .to_offset(UtcOffset::UTC)
+            .format(&Rfc3339)
+            .expect("rotation timestamp should format");
         let response = test_app()
             .oneshot(
                 Request::builder()
@@ -10769,16 +12187,17 @@ mod tests {
                     .header("x-correlation-id", "corr-rotation-scheduled-002")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{
-                            "credential_scope":"control_api",
-                            "credential_reference":"vault://control-api/prod",
-                            "last_rotated_at_utc":"2026-01-07T00:00:01Z",
-                            "metadata":{
-                                "crypto_posture_verified":true,
-                                "runtime_injection_mode":"runtime_only",
-                                "provider_ref":"vault://control-api/prod"
+                        serde_json::json!({
+                            "credential_scope": "control_api",
+                            "credential_reference": "vault://control-api/prod",
+                            "last_rotated_at_utc": last_rotated_at_utc,
+                            "metadata": {
+                                "crypto_posture_verified": true,
+                                "runtime_injection_mode": "runtime_only",
+                                "provider_ref": "vault://control-api/prod"
                             }
-                        }"#,
+                        })
+                        .to_string(),
                     ))
                     .expect("request should build"),
             )

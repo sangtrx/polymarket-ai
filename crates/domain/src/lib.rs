@@ -9,5 +9,6 @@ pub mod reconciliation;
 pub mod recovery;
 pub mod recovery_rehearsal;
 pub mod reporting;
+pub mod reporting_export;
 pub mod reporting_schedule;
 pub mod risk;

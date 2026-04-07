@@ -4,6 +4,7 @@ pub mod approvals;
 pub mod attribution_snapshots;
 pub mod audit;
 pub mod credential_rotation;
+pub mod export_jobs;
 pub mod freshness_gate;
 pub mod incident_alerts;
 pub mod incident_query_views;
