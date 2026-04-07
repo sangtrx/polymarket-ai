@@ -1038,6 +1038,480 @@ pub struct ValidationStageComparison {
     pub metric_deltas: Vec<ValidationMetricDelta>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowEvaluationState {
+    Running,
+    Completed,
+    Denied,
+    Failed,
+}
+
+impl ShadowEvaluationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Denied => "denied",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ShadowEvaluationContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "denied" => Ok(Self::Denied),
+            "failed" => Ok(Self::Failed),
+            _ => Err(ShadowEvaluationContractError::invalid_payload(format!(
+                "unknown shadow evaluation state `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowSimulationDecisionSide {
+    Buy,
+    Sell,
+    Hold,
+}
+
+impl ShadowSimulationDecisionSide {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+            Self::Hold => "hold",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ShadowEvaluationContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "buy" => Ok(Self::Buy),
+            "sell" => Ok(Self::Sell),
+            "hold" => Ok(Self::Hold),
+            _ => Err(ShadowEvaluationContractError::invalid_payload(format!(
+                "unknown shadow simulation decision side `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowSimulationReasonCode {
+    ReadOnlyEnforced,
+    DependencyUnavailable,
+    StateUnavailable,
+}
+
+impl ShadowSimulationReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ReadOnlyEnforced => "shadow_simulation_read_only_enforced",
+            Self::DependencyUnavailable => "shadow_simulation_dependency_unavailable",
+            Self::StateUnavailable => "shadow_simulation_state_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ShadowEvaluationContractError> {
+        match value {
+            "shadow_simulation_read_only_enforced" => Ok(Self::ReadOnlyEnforced),
+            "shadow_simulation_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "shadow_simulation_state_unavailable" => Ok(Self::StateUnavailable),
+            _ => Err(ShadowEvaluationContractError::invalid_payload(format!(
+                "unknown shadow simulation reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowEvaluationReasonCode {
+    EvaluationStarted,
+    EvaluationCompleted,
+    EvaluationRead,
+    EvaluationListed,
+    InvalidPayload,
+    UnauthorizedRole,
+    EvaluationNotFound,
+    ValidationRunIneligible,
+    DependencyUnavailable,
+    StateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl ShadowEvaluationReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::EvaluationStarted => "shadow_evaluation_started",
+            Self::EvaluationCompleted => "shadow_evaluation_completed",
+            Self::EvaluationRead => "shadow_evaluation_read",
+            Self::EvaluationListed => "shadow_evaluation_listed",
+            Self::InvalidPayload => "shadow_evaluation_invalid_payload",
+            Self::UnauthorizedRole => "shadow_evaluation_unauthorized_role",
+            Self::EvaluationNotFound => "shadow_evaluation_not_found",
+            Self::ValidationRunIneligible => "shadow_evaluation_validation_run_ineligible",
+            Self::DependencyUnavailable => "shadow_evaluation_dependency_unavailable",
+            Self::StateUnavailable => "shadow_evaluation_state_unavailable",
+            Self::PersistenceUnavailable => "shadow_evaluation_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ShadowEvaluationContractError> {
+        match value {
+            "shadow_evaluation_started" => Ok(Self::EvaluationStarted),
+            "shadow_evaluation_completed" => Ok(Self::EvaluationCompleted),
+            "shadow_evaluation_read" => Ok(Self::EvaluationRead),
+            "shadow_evaluation_listed" => Ok(Self::EvaluationListed),
+            "shadow_evaluation_invalid_payload" => Ok(Self::InvalidPayload),
+            "shadow_evaluation_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "shadow_evaluation_not_found" => Ok(Self::EvaluationNotFound),
+            "shadow_evaluation_validation_run_ineligible" => Ok(Self::ValidationRunIneligible),
+            "shadow_evaluation_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "shadow_evaluation_state_unavailable" => Ok(Self::StateUnavailable),
+            "shadow_evaluation_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(ShadowEvaluationContractError::invalid_payload(format!(
+                "unknown shadow evaluation reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowEvaluationValidationIssue {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowEvaluationContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<ShadowEvaluationValidationIssue>,
+}
+
+impl ShadowEvaluationContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<ShadowEvaluationValidationIssue>,
+    ) -> Self {
+        Self {
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShadowSimulationOutcome {
+    pub decision_side: ShadowSimulationDecisionSide,
+    pub intended_size: f64,
+    pub simulated_fill_size: f64,
+    pub simulated_fill_price: f64,
+    pub simulated_slippage_bps: f64,
+    pub simulation_reason_code: String,
+    pub decision_timestamp_utc: String,
+    pub simulated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShadowEvaluationRecord {
+    pub evaluation_id: String,
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub evaluation_state: ShadowEvaluationState,
+    pub reason_code: String,
+    pub market_context: Value,
+    pub signal_decisions: Value,
+    pub simulation_outcomes: Vec<ShadowSimulationOutcome>,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub started_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_utc: Option<String>,
+}
+
+pub fn parse_shadow_utc_timestamp(
+    value: &str,
+) -> Result<OffsetDateTime, ShadowEvaluationContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        ShadowEvaluationContractError::invalid_payload(format!(
+            "timestamp `{value}` must be RFC3339 UTC"
+        ))
+    })?;
+    if parsed.offset() != UtcOffset::UTC {
+        return Err(ShadowEvaluationContractError::invalid_payload(
+            "timestamps must use UTC `Z` offset",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn compose_shadow_evaluation_id(
+    candidate_id: &str,
+    started_at_utc: &str,
+) -> Result<String, ShadowEvaluationContractError> {
+    let normalized_candidate_id = normalize_research_identifier(candidate_id);
+    if normalized_candidate_id.is_empty() {
+        return Err(ShadowEvaluationContractError::invalid_payload_with_issues(
+            "candidate_id cannot be blank",
+            vec![ShadowEvaluationValidationIssue {
+                field: "candidate_id".to_string(),
+                code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+                message: "candidate_id cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let started_at = parse_shadow_utc_timestamp(started_at_utc)?;
+    Ok(format!(
+        "{}::{}",
+        normalized_candidate_id,
+        started_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn canonicalize_shadow_evaluation_record(
+    record: &ShadowEvaluationRecord,
+) -> Result<ShadowEvaluationRecord, ShadowEvaluationContractError> {
+    let mut canonical = ShadowEvaluationRecord {
+        evaluation_id: normalize_research_identifier(&record.evaluation_id),
+        candidate_id: normalize_research_identifier(&record.candidate_id),
+        validation_run_id: normalize_research_identifier(&record.validation_run_id),
+        evaluation_state: record.evaluation_state,
+        reason_code: normalize_research_identifier(&record.reason_code),
+        market_context: record.market_context.clone(),
+        signal_decisions: record.signal_decisions.clone(),
+        simulation_outcomes: record.simulation_outcomes.clone(),
+        actor_id: record.actor_id.trim().to_string(),
+        correlation_id: record.correlation_id.trim().to_string(),
+        started_at_utc: record.started_at_utc.trim().to_string(),
+        completed_at_utc: record
+            .completed_at_utc
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+    };
+    canonical.simulation_outcomes.sort_by(|left, right| {
+        left.decision_timestamp_utc
+            .cmp(&right.decision_timestamp_utc)
+            .then_with(|| left.decision_side.cmp(&right.decision_side))
+            .then_with(|| left.simulated_at_utc.cmp(&right.simulated_at_utc))
+    });
+    validate_shadow_evaluation_record(&canonical)?;
+    Ok(canonical)
+}
+
+pub fn validate_shadow_evaluation_record(
+    record: &ShadowEvaluationRecord,
+) -> Result<(), ShadowEvaluationContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_shadow_field(&mut field_errors, "evaluation_id", &record.evaluation_id);
+    validate_non_empty_shadow_field(&mut field_errors, "candidate_id", &record.candidate_id);
+    validate_non_empty_shadow_field(
+        &mut field_errors,
+        "validation_run_id",
+        &record.validation_run_id,
+    );
+    validate_non_empty_shadow_field(&mut field_errors, "reason_code", &record.reason_code);
+    validate_non_empty_shadow_field(&mut field_errors, "actor_id", &record.actor_id);
+    validate_non_empty_shadow_field(&mut field_errors, "correlation_id", &record.correlation_id);
+    validate_non_empty_shadow_field(&mut field_errors, "started_at_utc", &record.started_at_utc);
+
+    if parse_shadow_utc_timestamp(&record.started_at_utc).is_err() {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "started_at_utc".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "started_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    if let Some(completed_at_utc) = record.completed_at_utc.as_deref() {
+        if parse_shadow_utc_timestamp(completed_at_utc).is_err() {
+            field_errors.push(ShadowEvaluationValidationIssue {
+                field: "completed_at_utc".to_string(),
+                code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+                message: "completed_at_utc must be RFC3339 UTC".to_string(),
+            });
+        } else if let (Ok(started), Ok(completed)) = (
+            parse_shadow_utc_timestamp(&record.started_at_utc),
+            parse_shadow_utc_timestamp(completed_at_utc),
+        ) && completed < started
+        {
+            field_errors.push(ShadowEvaluationValidationIssue {
+                field: "completed_at_utc".to_string(),
+                code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+                message: "completed_at_utc must be >= started_at_utc".to_string(),
+            });
+        }
+    }
+    if ShadowEvaluationReasonCode::parse(&record.reason_code).is_err() {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "reason_code".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "reason_code is not a recognized shadow evaluation code".to_string(),
+        });
+    }
+    match &record.market_context {
+        Value::Object(map) if !map.is_empty() => {}
+        _ => field_errors.push(ShadowEvaluationValidationIssue {
+            field: "market_context".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "market_context must be a non-empty JSON object".to_string(),
+        }),
+    }
+    match &record.signal_decisions {
+        Value::Object(map) if !map.is_empty() => {}
+        _ => field_errors.push(ShadowEvaluationValidationIssue {
+            field: "signal_decisions".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "signal_decisions must be a non-empty JSON object".to_string(),
+        }),
+    }
+    if record.evaluation_state == ShadowEvaluationState::Completed
+        && record.simulation_outcomes.is_empty()
+    {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "simulation_outcomes".to_string(),
+            code: ShadowEvaluationReasonCode::StateUnavailable.code(),
+            message: "completed evaluations must include at least one simulation outcome"
+                .to_string(),
+        });
+    }
+    for (index, outcome) in record.simulation_outcomes.iter().enumerate() {
+        validate_shadow_simulation_outcome(outcome).map_err(|error| {
+            let prefixed = error
+                .field_errors
+                .into_iter()
+                .map(|issue| ShadowEvaluationValidationIssue {
+                    field: format!("simulation_outcomes[{index}].{}", issue.field),
+                    code: issue.code,
+                    message: issue.message,
+                })
+                .collect::<Vec<_>>();
+            ShadowEvaluationContractError::invalid_payload_with_issues(error.message, prefixed)
+        })?;
+    }
+    if !field_errors.is_empty() {
+        return Err(ShadowEvaluationContractError::invalid_payload_with_issues(
+            "shadow evaluation payload failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_shadow_simulation_outcome(
+    outcome: &ShadowSimulationOutcome,
+) -> Result<(), ShadowEvaluationContractError> {
+    let mut field_errors = Vec::new();
+    validate_finite_non_negative_shadow_metric(
+        outcome.intended_size,
+        "intended_size",
+        &mut field_errors,
+    );
+    validate_finite_non_negative_shadow_metric(
+        outcome.simulated_fill_size,
+        "simulated_fill_size",
+        &mut field_errors,
+    );
+    validate_finite_non_negative_shadow_metric(
+        outcome.simulated_fill_price,
+        "simulated_fill_price",
+        &mut field_errors,
+    );
+    validate_finite_non_negative_shadow_metric(
+        outcome.simulated_slippage_bps,
+        "simulated_slippage_bps",
+        &mut field_errors,
+    );
+    if outcome.simulated_fill_size > outcome.intended_size {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "simulated_fill_size".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "simulated_fill_size cannot exceed intended_size".to_string(),
+        });
+    }
+    if ShadowSimulationReasonCode::parse(&outcome.simulation_reason_code).is_err() {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "simulation_reason_code".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "simulation_reason_code is not recognized".to_string(),
+        });
+    }
+    let decision_ts = parse_shadow_utc_timestamp(&outcome.decision_timestamp_utc);
+    if decision_ts.is_err() {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "decision_timestamp_utc".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "decision_timestamp_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    let simulated_ts = parse_shadow_utc_timestamp(&outcome.simulated_at_utc);
+    if simulated_ts.is_err() {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "simulated_at_utc".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "simulated_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    if let (Ok(decision), Ok(simulated)) = (decision_ts, simulated_ts)
+        && simulated < decision
+    {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: "simulated_at_utc".to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: "simulated_at_utc must be >= decision_timestamp_utc".to_string(),
+        });
+    }
+    if !field_errors.is_empty() {
+        return Err(ShadowEvaluationContractError::invalid_payload_with_issues(
+            "shadow simulation outcome failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_empty_shadow_field(
+    field_errors: &mut Vec<ShadowEvaluationValidationIssue>,
+    field: &str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: field.to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: format!("{field} is required"),
+        });
+    }
+}
+
+fn validate_finite_non_negative_shadow_metric(
+    value: f64,
+    field: &str,
+    field_errors: &mut Vec<ShadowEvaluationValidationIssue>,
+) {
+    if !value.is_finite() || value < 0.0 {
+        field_errors.push(ShadowEvaluationValidationIssue {
+            field: field.to_string(),
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite and >= 0"),
+        });
+    }
+}
+
 pub fn parse_validation_utc_timestamp(
     value: &str,
 ) -> Result<OffsetDateTime, ValidationWorkflowContractError> {
@@ -1548,5 +2022,142 @@ mod tests {
         assert_eq!(deltas[1].metric_key, "max_drawdown");
         assert_eq!(deltas[2].metric_key, "brier_score");
         assert_eq!(deltas[3].metric_key, "overfit_indicator");
+    }
+
+    fn sample_shadow_evaluation_record() -> ShadowEvaluationRecord {
+        ShadowEvaluationRecord {
+            evaluation_id: "candidate::alpha-1::1712448000".to_string(),
+            candidate_id: "candidate::alpha-1".to_string(),
+            validation_run_id: "candidate::alpha-1::1712447000".to_string(),
+            evaluation_state: ShadowEvaluationState::Completed,
+            reason_code: ShadowEvaluationReasonCode::EvaluationCompleted
+                .code()
+                .to_string(),
+            market_context: json!({
+                "best_bid": 0.42,
+                "best_ask": 0.44
+            }),
+            signal_decisions: json!({
+                "signals": [
+                    {
+                        "decision_side": "buy",
+                        "intended_size": 10.0,
+                        "decision_timestamp_utc": "2026-04-07T00:00:01Z"
+                    }
+                ]
+            }),
+            simulation_outcomes: vec![ShadowSimulationOutcome {
+                decision_side: ShadowSimulationDecisionSide::Buy,
+                intended_size: 10.0,
+                simulated_fill_size: 10.0,
+                simulated_fill_price: 0.43,
+                simulated_slippage_bps: 5.0,
+                simulation_reason_code: ShadowSimulationReasonCode::ReadOnlyEnforced
+                    .code()
+                    .to_string(),
+                decision_timestamp_utc: "2026-04-07T00:00:01Z".to_string(),
+                simulated_at_utc: "2026-04-07T00:00:02Z".to_string(),
+            }],
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-shadow-001".to_string(),
+            started_at_utc: "2026-04-07T00:00:00Z".to_string(),
+            completed_at_utc: Some("2026-04-07T00:00:03Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn shadow_evaluation_reason_code_parse_accepts_known_values() {
+        let code = ShadowEvaluationReasonCode::parse("shadow_evaluation_dependency_unavailable")
+            .expect("known reason should parse");
+        assert_eq!(code, ShadowEvaluationReasonCode::DependencyUnavailable);
+    }
+
+    #[test]
+    fn shadow_evaluation_compose_id_normalizes_identifier_and_uses_utc_timestamp() {
+        let evaluation_id =
+            compose_shadow_evaluation_id(" Candidate::Alpha-1 ", "2026-04-07T00:00:00Z")
+                .expect("shadow evaluation id composition should succeed");
+        assert!(evaluation_id.starts_with("candidate::alpha-1::"));
+    }
+
+    #[test]
+    fn shadow_evaluation_validation_rejects_non_object_market_context() {
+        let mut record = sample_shadow_evaluation_record();
+        record.market_context = json!(["not", "object"]);
+
+        let error = validate_shadow_evaluation_record(&record)
+            .expect_err("non-object market_context must fail validation");
+        assert_eq!(
+            error.code,
+            ShadowEvaluationReasonCode::InvalidPayload.code()
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "market_context")
+        );
+    }
+
+    #[test]
+    fn shadow_evaluation_canonicalization_orders_outcomes_deterministically() {
+        let mut record = sample_shadow_evaluation_record();
+        record.simulation_outcomes = vec![
+            ShadowSimulationOutcome {
+                decision_side: ShadowSimulationDecisionSide::Sell,
+                intended_size: 4.0,
+                simulated_fill_size: 4.0,
+                simulated_fill_price: 0.47,
+                simulated_slippage_bps: 8.0,
+                simulation_reason_code: ShadowSimulationReasonCode::ReadOnlyEnforced
+                    .code()
+                    .to_string(),
+                decision_timestamp_utc: "2026-04-07T00:00:03Z".to_string(),
+                simulated_at_utc: "2026-04-07T00:00:04Z".to_string(),
+            },
+            ShadowSimulationOutcome {
+                decision_side: ShadowSimulationDecisionSide::Buy,
+                intended_size: 6.0,
+                simulated_fill_size: 6.0,
+                simulated_fill_price: 0.41,
+                simulated_slippage_bps: 6.0,
+                simulation_reason_code: ShadowSimulationReasonCode::ReadOnlyEnforced
+                    .code()
+                    .to_string(),
+                decision_timestamp_utc: "2026-04-07T00:00:02Z".to_string(),
+                simulated_at_utc: "2026-04-07T00:00:03Z".to_string(),
+            },
+        ];
+
+        let canonical = canonicalize_shadow_evaluation_record(&record)
+            .expect("canonical shadow evaluation record should validate");
+        assert_eq!(
+            canonical.simulation_outcomes[0].decision_timestamp_utc,
+            "2026-04-07T00:00:02Z"
+        );
+        assert_eq!(
+            canonical.simulation_outcomes[1].decision_timestamp_utc,
+            "2026-04-07T00:00:03Z"
+        );
+    }
+
+    #[test]
+    fn shadow_evaluation_outcome_validation_requires_known_read_only_reason_code() {
+        let mut record = sample_shadow_evaluation_record();
+        record.simulation_outcomes[0].simulation_reason_code =
+            "shadow_simulation_unknown".to_string();
+
+        let error = validate_shadow_evaluation_record(&record)
+            .expect_err("unknown simulation_reason_code must fail validation");
+        assert_eq!(
+            error.code,
+            ShadowEvaluationReasonCode::InvalidPayload.code()
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field.contains("simulation_reason_code"))
+        );
     }
 }

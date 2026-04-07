@@ -1,5 +1,6 @@
 pub mod gate_policies;
 pub mod hypothesis_registry;
+pub mod shadow_mode;
 pub mod workflow_runs;
 
 use crate::validation::gate_policies::{

@@ -46,7 +46,8 @@ use domain::reporting_schedule::{
     parse_utc_timestamp,
 };
 use domain::research::{
-    AlphaHypothesisReasonCode, ValidationGateReasonCode, ValidationWorkflowReasonCode,
+    AlphaHypothesisReasonCode, ShadowEvaluationReasonCode, ValidationGateReasonCode,
+    ValidationWorkflowReasonCode, normalize_research_identifier,
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
@@ -112,6 +113,10 @@ use research_gateway::validation::gate_policies::{
 use research_gateway::validation::hypothesis_registry::{
     AlphaHypothesisEvidence, HypothesisRegistryServiceError, ReadAlphaHypothesisInput,
     UpsertAlphaHypothesisInput,
+};
+use research_gateway::validation::shadow_mode::{
+    ListShadowEvaluationsInput, ReadShadowEvaluationInput, ShadowEvaluationEvidence,
+    ShadowModeServiceError, StartShadowEvaluationInput,
 };
 use research_gateway::validation::workflow_runs::{
     ListValidationRunsInput, ReadValidationArtifactInput, ReadValidationRunInput,
@@ -228,6 +233,14 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/research/validation-runs/{run_id}/artifacts/{stage}",
             get(read_validation_artifact),
+        )
+        .route(
+            "/control/research/shadow-evaluations",
+            post(start_shadow_evaluation).get(list_shadow_evaluations),
+        )
+        .route(
+            "/control/research/shadow-evaluations/{evaluation_id}",
+            get(read_shadow_evaluation),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -1692,6 +1705,197 @@ pub async fn read_validation_artifact(
         evidence,
         endpoint,
         "validation_artifact_read",
+    )
+}
+
+pub async fn start_shadow_evaluation(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<ShadowEvaluationStartPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = "/control/research/shadow-evaluations".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return shadow_evaluation_payload_rejection_response(
+                &state,
+                &actor,
+                "shadow_evaluation_start",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_shadow_mode_orchestrator
+        .start_shadow_evaluation(StartShadowEvaluationInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: payload.candidate_id,
+            validation_run_id: payload.validation_run_id,
+            market_context: payload.market_context,
+            signal_decisions: payload.signal_decisions,
+            correlation_id: effective_correlation_id.clone(),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return shadow_evaluation_service_error_response(
+                &state,
+                error,
+                "shadow_evaluation_start",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    shadow_evaluation_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "shadow_evaluation_start",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_shadow_evaluation(
+    State(state): State<ControlApiState>,
+    Path(evaluation_id): Path<String>,
+    Query(query): Query<ShadowEvaluationReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/shadow-evaluations/{evaluation_id}");
+    let authorization = match authorize_shadow_evaluation_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "shadow_evaluation_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_shadow_mode_orchestrator
+        .read_shadow_evaluation(ReadShadowEvaluationInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            evaluation_id,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return shadow_evaluation_service_error_response(
+                &state,
+                error,
+                "shadow_evaluation_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    shadow_evaluation_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "shadow_evaluation_read",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn list_shadow_evaluations(
+    State(state): State<ControlApiState>,
+    Query(query): Query<ShadowEvaluationsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/shadow-evaluations".to_string();
+    let authorization = match authorize_shadow_evaluation_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "shadow_evaluation_list",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let candidate_id = query.candidate_id.clone();
+    let canonical_candidate_id = normalize_research_identifier(&candidate_id);
+
+    let evaluations = match state
+        .research_shadow_mode_orchestrator
+        .list_shadow_evaluations(ListShadowEvaluationsInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: candidate_id.clone(),
+            limit: query.limit,
+            started_after_utc: query.started_after_utc,
+            started_before_utc: query.started_before_utc,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evaluations) => evaluations,
+        Err(error) => {
+            return shadow_evaluation_service_error_response(
+                &state,
+                error,
+                "shadow_evaluation_list",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id.clone(),
+            );
+        }
+    };
+
+    shadow_evaluation_list_response(
+        &state,
+        &actor,
+        canonical_candidate_id,
+        evaluations,
+        endpoint,
+        "shadow_evaluation_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
     )
 }
 
@@ -6076,6 +6280,60 @@ fn authorize_validation_run_read(
     )))
 }
 
+fn authorize_shadow_evaluation_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(shadow_evaluation_service_error_response(
+        state,
+        ShadowModeServiceError {
+            code: ShadowEvaluationReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
 fn authorize_attribution_read(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -8122,6 +8380,327 @@ fn validation_run_service_error_status(code: &str) -> StatusCode {
             StatusCode::SERVICE_UNAVAILABLE
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn shadow_evaluation_detail_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: ShadowEvaluationEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let correlation_id = evidence.evaluation.correlation_id.clone();
+    let reason_code = evidence.reason_code.clone();
+    let evaluation = evidence.evaluation;
+    let evaluation_id = evaluation.evaluation_id.clone();
+    let candidate_id = evaluation.candidate_id.clone();
+    let validation_run_id = evaluation.validation_run_id.clone();
+    let evaluation_state = evaluation.evaluation_state.as_str().to_string();
+    let simulation_outcomes_count = evaluation.simulation_outcomes.len();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "evaluation_id": evaluation_id,
+            "candidate_id": candidate_id,
+            "validation_run_id": validation_run_id,
+            "evaluation_state": evaluation_state,
+            "simulation_outcomes_count": simulation_outcomes_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    let status = if http_method == "POST" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        axum::Json(ShadowEvaluationEnvelope {
+            data: Some(ShadowEvaluationData::Evaluation {
+                evaluation: shadow_evaluation_to_item(evaluation),
+                reason_code: evidence.reason_code,
+            }),
+            meta: ShadowEvaluationMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn shadow_evaluation_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    candidate_id: String,
+    evaluations: Vec<domain::research::ShadowEvaluationRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let evaluation_count = evaluations.len();
+    let reason_code = ShadowEvaluationReasonCode::EvaluationListed
+        .code()
+        .to_string();
+    let evaluation_items = evaluations
+        .into_iter()
+        .map(shadow_evaluation_to_item)
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "candidate_id": candidate_id,
+            "evaluation_count": evaluation_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(ShadowEvaluationEnvelope {
+            data: Some(ShadowEvaluationData::Evaluations {
+                candidate_id,
+                evaluations: evaluation_items,
+            }),
+            meta: ShadowEvaluationMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn shadow_evaluation_payload_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: JsonRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    shadow_evaluation_service_error_response(
+        state,
+        ShadowModeServiceError {
+            code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+            message: format!("invalid shadow evaluation payload: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn shadow_evaluation_service_error_response(
+    state: &ControlApiState,
+    error: ShadowModeServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+    correlation_id: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") || action.ends_with("_list") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "error_code": error.code,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == ShadowEvaluationReasonCode::UnauthorizedRole.code() {
+        Some(ShadowEvaluationSecuritySignal {
+            name: if action.ends_with("_read") || action.ends_with("_list") {
+                "unauthorized_shadow_evaluation_read_attempt_v1"
+            } else {
+                "unauthorized_shadow_evaluation_mutation_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        shadow_evaluation_service_error_status(error.code),
+        axum::Json(ShadowEvaluationEnvelope::<ShadowEvaluationData> {
+            data: None,
+            meta: ShadowEvaluationMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(ShadowEvaluationEnvelopeError {
+                error_code: error.code.to_string(),
+                message: error.message,
+                field_errors: error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| ShadowEvaluationFieldError {
+                        field: issue.field,
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn shadow_evaluation_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == ShadowEvaluationReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == ShadowEvaluationReasonCode::UnauthorizedRole.code() => {
+            StatusCode::FORBIDDEN
+        }
+        "shadow_evaluation_constraint_violation" => StatusCode::CONFLICT,
+        code if code == ShadowEvaluationReasonCode::ValidationRunIneligible.code()
+            || code == ShadowEvaluationReasonCode::EvaluationNotFound.code() =>
+        {
+            StatusCode::CONFLICT
+        }
+        code if code == ShadowEvaluationReasonCode::DependencyUnavailable.code()
+            || code == ShadowEvaluationReasonCode::StateUnavailable.code()
+            || code == ShadowEvaluationReasonCode::PersistenceUnavailable.code()
+            || code == "shadow_evaluation_query_failed"
+            || code == "shadow_evaluation_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn shadow_evaluation_to_item(
+    evaluation: domain::research::ShadowEvaluationRecord,
+) -> ShadowEvaluationItem {
+    ShadowEvaluationItem {
+        evaluation_id: evaluation.evaluation_id,
+        candidate_id: evaluation.candidate_id,
+        validation_run_id: evaluation.validation_run_id,
+        evaluation_state: evaluation.evaluation_state.as_str().to_string(),
+        reason_code: evaluation.reason_code,
+        market_context: evaluation.market_context,
+        signal_decisions: evaluation.signal_decisions,
+        simulation_outcomes: evaluation
+            .simulation_outcomes
+            .into_iter()
+            .map(shadow_simulation_outcome_to_item)
+            .collect(),
+        actor_id: evaluation.actor_id,
+        correlation_id: evaluation.correlation_id,
+        started_at_utc: evaluation.started_at_utc,
+        completed_at_utc: evaluation.completed_at_utc,
+    }
+}
+
+fn shadow_simulation_outcome_to_item(
+    outcome: domain::research::ShadowSimulationOutcome,
+) -> ShadowSimulationOutcomeItem {
+    ShadowSimulationOutcomeItem {
+        decision_side: outcome.decision_side.as_str().to_string(),
+        intended_size: outcome.intended_size,
+        simulated_fill_size: outcome.simulated_fill_size,
+        simulated_fill_price: outcome.simulated_fill_price,
+        simulated_slippage_bps: outcome.simulated_slippage_bps,
+        simulation_reason_code: outcome.simulation_reason_code,
+        decision_timestamp_utc: outcome.decision_timestamp_utc,
+        simulated_at_utc: outcome.simulated_at_utc,
     }
 }
 
@@ -10990,6 +11569,35 @@ pub struct ValidationArtifactReadQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ShadowEvaluationStartPayload {
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub market_context: serde_json::Value,
+    pub signal_decisions: serde_json::Value,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShadowEvaluationsQuery {
+    pub candidate_id: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub started_after_utc: Option<String>,
+    #[serde(default)]
+    pub started_before_utc: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ShadowEvaluationReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
@@ -12052,6 +12660,92 @@ pub struct ValidationMetricDeltaItem {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ShadowEvaluationEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: ShadowEvaluationMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ShadowEvaluationEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShadowEvaluationData {
+    Evaluation {
+        evaluation: ShadowEvaluationItem,
+        reason_code: String,
+    },
+    Evaluations {
+        candidate_id: String,
+        evaluations: Vec<ShadowEvaluationItem>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShadowEvaluationMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShadowEvaluationEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<ShadowEvaluationFieldError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<ShadowEvaluationSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShadowEvaluationFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShadowEvaluationSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShadowEvaluationItem {
+    pub evaluation_id: String,
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub evaluation_state: String,
+    pub reason_code: String,
+    pub market_context: serde_json::Value,
+    pub signal_decisions: serde_json::Value,
+    pub simulation_outcomes: Vec<ShadowSimulationOutcomeItem>,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub started_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShadowSimulationOutcomeItem {
+    pub decision_side: String,
+    pub intended_size: f64,
+    pub simulated_fill_size: f64,
+    pub simulated_fill_price: f64,
+    pub simulated_slippage_bps: f64,
+    pub simulation_reason_code: String,
+    pub decision_timestamp_utc: String,
+    pub simulated_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct EmergencyControlDecisionResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12573,7 +13267,9 @@ mod tests {
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::research::{
-        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, ValidationDiagnosticsPayload,
+        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, ShadowEvaluationReasonCode,
+        ShadowEvaluationRecord, ShadowEvaluationState, ShadowSimulationDecisionSide,
+        ShadowSimulationOutcome, ShadowSimulationReasonCode, ValidationDiagnosticsPayload,
         ValidationGateReasonCode, ValidationGateValidationIssue, ValidationMetricDelta,
         ValidationStageComparison, ValidationWorkflowArtifactRecord, ValidationWorkflowReasonCode,
         ValidationWorkflowRunRecord, ValidationWorkflowRunState, ValidationWorkflowStage,
@@ -12640,6 +13336,10 @@ mod tests {
     use research_gateway::validation::hypothesis_registry::{
         AlphaHypothesisEvidence, HypothesisRegistryOrchestrator, HypothesisRegistryServiceError,
         ReadAlphaHypothesisInput, UpsertAlphaHypothesisInput,
+    };
+    use research_gateway::validation::shadow_mode::{
+        ListShadowEvaluationsInput, ReadShadowEvaluationInput, ShadowEvaluationEvidence,
+        ShadowModeOrchestrator, ShadowModeServiceError, StartShadowEvaluationInput,
     };
     use research_gateway::validation::workflow_runs::{
         ListValidationRunsInput, ReadValidationArtifactInput, ReadValidationRunInput,
@@ -13896,6 +14596,151 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct StubShadowModeOrchestrator {
+        start_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        list_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl StubShadowModeOrchestrator {
+        fn service_error(code: &'static str, message: &'static str) -> ShadowModeServiceError {
+            ShadowModeServiceError {
+                code,
+                message: message.to_string(),
+                field_errors: if code == ShadowEvaluationReasonCode::InvalidPayload.code() {
+                    vec![domain::research::ShadowEvaluationValidationIssue {
+                        field: "candidate_id".to_string(),
+                        code: ShadowEvaluationReasonCode::InvalidPayload.code(),
+                        message: "candidate_id cannot be blank".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+
+        fn sample_evaluation(
+            evaluation_id: String,
+            candidate_id: String,
+            validation_run_id: String,
+            reason_code: String,
+            correlation_id: String,
+            timestamp_utc: String,
+        ) -> ShadowEvaluationRecord {
+            ShadowEvaluationRecord {
+                evaluation_id,
+                candidate_id,
+                validation_run_id,
+                evaluation_state: ShadowEvaluationState::Completed,
+                reason_code,
+                market_context: serde_json::json!({
+                    "best_bid": 0.42,
+                    "best_ask": 0.44
+                }),
+                signal_decisions: serde_json::json!({
+                    "decisions": [
+                        {
+                            "decision_side": "buy",
+                            "intended_size": 10.0,
+                            "decision_timestamp_utc": "2026-04-07T00:00:00Z"
+                        }
+                    ]
+                }),
+                simulation_outcomes: vec![ShadowSimulationOutcome {
+                    decision_side: ShadowSimulationDecisionSide::Buy,
+                    intended_size: 10.0,
+                    simulated_fill_size: 10.0,
+                    simulated_fill_price: 0.43,
+                    simulated_slippage_bps: 5.0,
+                    simulation_reason_code: ShadowSimulationReasonCode::ReadOnlyEnforced
+                        .code()
+                        .to_string(),
+                    decision_timestamp_utc: "2026-04-07T00:00:00Z".to_string(),
+                    simulated_at_utc: "2026-04-07T00:00:01Z".to_string(),
+                }],
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                started_at_utc: timestamp_utc.clone(),
+                completed_at_utc: Some(timestamp_utc),
+            }
+        }
+    }
+
+    impl ShadowModeOrchestrator for StubShadowModeOrchestrator {
+        fn start_shadow_evaluation(
+            &self,
+            input: StartShadowEvaluationInput,
+        ) -> Result<ShadowEvaluationEvidence, ShadowModeServiceError> {
+            if let Some((code, message)) = self.start_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            let evaluation = Self::sample_evaluation(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                input.validation_run_id,
+                ShadowEvaluationReasonCode::EvaluationCompleted
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.requested_at_utc,
+            );
+            Ok(ShadowEvaluationEvidence {
+                evaluation,
+                reason_code: ShadowEvaluationReasonCode::EvaluationStarted
+                    .code()
+                    .to_string(),
+            })
+        }
+
+        fn read_shadow_evaluation(
+            &self,
+            input: ReadShadowEvaluationInput,
+        ) -> Result<ShadowEvaluationEvidence, ShadowModeServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            let evaluation = Self::sample_evaluation(
+                input.evaluation_id,
+                "candidate::alpha-1".to_string(),
+                "candidate::alpha-1::1712447000".to_string(),
+                ShadowEvaluationReasonCode::EvaluationRead
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            );
+            Ok(ShadowEvaluationEvidence {
+                evaluation,
+                reason_code: ShadowEvaluationReasonCode::EvaluationRead
+                    .code()
+                    .to_string(),
+            })
+        }
+
+        fn list_shadow_evaluations(
+            &self,
+            input: ListShadowEvaluationsInput,
+        ) -> Result<Vec<ShadowEvaluationRecord>, ShadowModeServiceError> {
+            if let Some((code, message)) = self.list_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            Ok(vec![Self::sample_evaluation(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                "candidate::alpha-1::1712447000".to_string(),
+                ShadowEvaluationReasonCode::EvaluationListed
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            )])
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct StubAllocationPolicyOrchestrator {
         upsert_error: Option<(&'static str, &'static str)>,
         evaluate_error: Option<(&'static str, &'static str)>,
@@ -14755,6 +15600,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_research_validation_workflow_orchestrator(validation_run_orchestrator),
+        )
+    }
+
+    fn test_app_with_shadow_mode_orchestrator(
+        shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_shadow_mode_orchestrator(shadow_mode_orchestrator),
         )
     }
 
@@ -18908,6 +19775,330 @@ mod tests {
         );
         assert_eq!(payload["meta"]["action"], "validation_run_start");
         assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn shadow_evaluation_start_route_returns_data_meta_error_envelope() {
+        let app =
+            test_app_with_shadow_mode_orchestrator(Arc::new(StubShadowModeOrchestrator::default()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-start-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "market_context":{"best_bid":0.42,"best_ask":0.44},
+                            "signal_decisions":{"decisions":[{"decision_side":"buy","intended_size":10.0}]}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "evaluation");
+        assert_eq!(
+            payload["data"]["evaluation"]["evaluation_id"],
+            "candidate::alpha-1::1712457600000000000"
+        );
+        assert_eq!(payload["meta"]["action"], "shadow_evaluation_start");
+        assert!(payload["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn shadow_evaluation_read_list_routes_return_envelope_shapes() {
+        let app =
+            test_app_with_shadow_mode_orchestrator(Arc::new(StubShadowModeOrchestrator::default()));
+
+        let read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations/candidate::alpha-1::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(read_payload["data"]["kind"], "evaluation");
+        assert_eq!(read_payload["meta"]["action"], "shadow_evaluation_read");
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations?candidate_id=%20Candidate::Alpha-1%20&limit=1")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(list_payload["data"]["kind"], "evaluations");
+        assert_eq!(
+            list_payload["data"]["evaluations"][0]["reason_code"],
+            "shadow_evaluation_listed"
+        );
+        assert_eq!(list_payload["data"]["candidate_id"], "candidate::alpha-1");
+        assert_eq!(list_payload["meta"]["action"], "shadow_evaluation_list");
+    }
+
+    #[tokio::test]
+    async fn shadow_evaluation_start_route_maps_validation_run_ineligible_to_conflict() {
+        let app = test_app_with_shadow_mode_orchestrator(Arc::new(StubShadowModeOrchestrator {
+            start_error: Some((
+                ShadowEvaluationReasonCode::ValidationRunIneligible.code(),
+                "validation run is ineligible for shadow evaluation",
+            )),
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-start-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "market_context":{"best_bid":0.42,"best_ask":0.44},
+                            "signal_decisions":{"decisions":[{"decision_side":"buy","intended_size":10.0}]}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "shadow_evaluation_validation_run_ineligible"
+        );
+        assert_eq!(payload["meta"]["action"], "shadow_evaluation_start");
+    }
+
+    #[tokio::test]
+    async fn shadow_evaluation_start_route_error_response_preserves_payload_correlation_id() {
+        let app = test_app_with_shadow_mode_orchestrator(Arc::new(StubShadowModeOrchestrator {
+            start_error: Some((
+                ShadowEvaluationReasonCode::ValidationRunIneligible.code(),
+                "validation run is ineligible for shadow evaluation",
+            )),
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-header-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "market_context":{"best_bid":0.42,"best_ask":0.44},
+                            "signal_decisions":{"decisions":[{"decision_side":"buy","intended_size":10.0}]},
+                            "correlation_id":"corr-shadow-evaluation-payload-001"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["meta"]["correlation_id"],
+            "corr-shadow-evaluation-payload-001"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_evaluation_start_route_maps_json_rejection_to_bad_request_envelope() {
+        let app =
+            test_app_with_shadow_mode_orchestrator(Arc::new(StubShadowModeOrchestrator::default()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-start-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":123,
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "market_context":{"best_bid":0.42,"best_ask":0.44},
+                            "signal_decisions":{"decisions":[{"decision_side":"buy","intended_size":10.0}]}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "shadow_evaluation_invalid_payload"
+        );
+        assert_eq!(payload["meta"]["action"], "shadow_evaluation_start");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn shadow_evaluation_service_errors_emit_unauthorized_security_signals() {
+        let mutation_app =
+            test_app_with_shadow_mode_orchestrator(Arc::new(StubShadowModeOrchestrator {
+                start_error: Some((
+                    ShadowEvaluationReasonCode::UnauthorizedRole.code(),
+                    "forbidden shadow evaluation mutation",
+                )),
+                ..Default::default()
+            }));
+        let mutation_response = mutation_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-start-004")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000",
+                            "market_context":{"best_bid":0.42,"best_ask":0.44},
+                            "signal_decisions":{"decisions":[{"decision_side":"buy","intended_size":10.0}]}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        let mutation_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(mutation_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            mutation_payload["error"]["security_signal"]["name"],
+            "unauthorized_shadow_evaluation_mutation_attempt_v1"
+        );
+
+        let read_app =
+            test_app_with_shadow_mode_orchestrator(Arc::new(StubShadowModeOrchestrator {
+                read_error: Some((
+                    ShadowEvaluationReasonCode::UnauthorizedRole.code(),
+                    "forbidden shadow evaluation read",
+                )),
+                ..Default::default()
+            }));
+        let read_response = read_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/shadow-evaluations/candidate::alpha-1::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-shadow-evaluation-read-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::FORBIDDEN);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            read_payload["error"]["security_signal"]["name"],
+            "unauthorized_shadow_evaluation_read_attempt_v1"
+        );
     }
 
     #[tokio::test]

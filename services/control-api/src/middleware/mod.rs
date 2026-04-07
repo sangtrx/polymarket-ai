@@ -30,6 +30,7 @@ use research_gateway::validation::gate_policies::{
 use research_gateway::validation::hypothesis_registry::{
     HypothesisRegistryOrchestrator, HypothesisRegistryService,
 };
+use research_gateway::validation::shadow_mode::{ShadowModeOrchestrator, ShadowModeService};
 use research_gateway::validation::workflow_runs::{
     ValidationWorkflowRunOrchestrator, ValidationWorkflowRunService,
 };
@@ -240,6 +241,7 @@ pub struct ControlApiState {
     pub research_hypothesis_orchestrator: Arc<dyn HypothesisRegistryOrchestrator>,
     pub research_validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
     pub research_validation_workflow_orchestrator: Arc<dyn ValidationWorkflowRunOrchestrator>,
+    pub research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
@@ -355,6 +357,7 @@ impl ControlApiState {
             research_validation_workflow_orchestrator: Arc::new(
                 ValidationWorkflowRunService::default(),
             ),
+            research_shadow_mode_orchestrator: Arc::new(ShadowModeService::default()),
             recovery_orchestrator,
             attribution_pool: None,
         }
@@ -411,6 +414,15 @@ impl ControlApiState {
         research_validation_workflow_orchestrator: Arc<dyn ValidationWorkflowRunOrchestrator>,
     ) -> Self {
         self.research_validation_workflow_orchestrator = research_validation_workflow_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_research_shadow_mode_orchestrator(
+        mut self,
+        research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
+    ) -> Self {
+        self.research_shadow_mode_orchestrator = research_shadow_mode_orchestrator;
         self
     }
 

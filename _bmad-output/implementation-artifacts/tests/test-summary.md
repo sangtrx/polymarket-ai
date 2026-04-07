@@ -832,3 +832,31 @@
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-3` ✅
 - `source "$HOME/.cargo/env" && npm test` ✅
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-3` ✅ (2026-04-07 19:46:14 QA automation refresh rerun)
+
+---
+
+## Story 6.4 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::shadow_evaluation_`) — validates shadow reason-code parsing, canonical evaluation-id composition, deterministic simulation outcome ordering, and payload-shape boundary validation.
+- [x] `crates/persistence/src/postgres/shadow_evaluations.rs` (`postgres::shadow_evaluations::tests::`) — validates schema-scope isolation (`shadow_evaluations` only), canonical constraints/indexes, deterministic candidate list ordering, and machine-readable persistence validation behavior.
+- [x] `services/research-gateway/src/validation/shadow_mode.rs` (`validation::shadow_mode::tests::`) — validates Story 6.3 evidence prechecks, read-only simulation guarantees, deterministic list boundaries, and dependency/state fail-closed behavior.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::shadow_evaluation_`) — validates authenticated start/read/list route behavior, canonical `data/meta/error` envelopes, deterministic `400/403/409/503/500` status mapping, and unauthorized security-signal emission.
+- [x] `tests/api/story-6-4-shadow-mode-evaluation-api.test.mjs` — validates route wiring, payload/query/envelope contracts, startup/state orchestration wiring, shadow seam exports, unauthorized signal token continuity, list-route canonical candidate normalization, and effective-correlation-id continuity in deny envelopes/audit records.
+- [x] `tests/e2e/story-6-4-shadow-mode-evaluation.e2e.test.mjs` — validates migration scope boundaries, FR9 runbook contract coverage, read-only orchestration guarantees, deterministic persistence ordering semantics, deny telemetry on malformed list-window boundaries, deterministic list limit/repository call contracts, and Story 6.4 QA command wiring.
+
+### Coverage
+
+- Story 6.4 now has deterministic automated coverage for:
+  - FR9 read-only shadow-evaluation start/read/list workflows with canonical envelope + status contracts,
+  - Story 6.3 validation-run evidence prechecks and fail-closed ineligible/dependency/state/persistence behavior,
+  - deterministic identifier/timestamp boundary handling with explicit malformed time-window deny telemetry evidence,
+  - candidate-scoped list canonicalization and correlation-id continuity across orchestrator input, audit records, and envelope metadata.
+- Automated Story 6.4 regression inventory in this QA refresh: **37 Story-6.4 tests passing** (`domain: 5`, `persistence: 5`, `research-gateway: 6`, `control-api: 6`, `api/e2e: 15`).
+
+### Execution Result
+
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-4` ✅
+- `source "$HOME/.cargo/env" && npm test` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-4` ✅ (2026-04-07 21:15:05 QA automation rerun with expanded API/E2E critical-flow coverage)

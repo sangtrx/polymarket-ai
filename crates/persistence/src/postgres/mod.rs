@@ -25,6 +25,7 @@ pub mod restore_rehearsals;
 pub mod reward_risk;
 pub mod risk_limits;
 pub mod safety_controls;
+pub mod shadow_evaluations;
 pub mod user_stream;
 pub mod validation_artifacts;
 pub mod validation_gate_policies;

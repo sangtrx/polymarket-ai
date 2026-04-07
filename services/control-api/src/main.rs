@@ -21,6 +21,7 @@ use research_gateway::validation::gate_policies::{
     ValidationGatePolicyOrchestrator, ValidationGatePolicyService,
 };
 use research_gateway::validation::hypothesis_registry::HypothesisRegistryService;
+use research_gateway::validation::shadow_mode::ShadowModeService;
 use research_gateway::validation::workflow_runs::ValidationWorkflowRunService;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ async fn main() {
             pool.clone(),
             Arc::clone(&research_validation_gate_orchestrator),
         ));
+    let research_shadow_mode_orchestrator = Arc::new(ShadowModeService::postgres(pool.clone()));
 
     let state = ControlApiState::with_all_orchestrators_and_reporting(
         Arc::new(GovernanceAuthorizationGuard::new(
@@ -68,6 +70,7 @@ async fn main() {
     )))
     .with_research_validation_gate_orchestrator(research_validation_gate_orchestrator)
     .with_research_validation_workflow_orchestrator(research_validation_workflow_orchestrator)
+    .with_research_shadow_mode_orchestrator(research_shadow_mode_orchestrator)
     .with_attribution_pool(pool);
     let _app: Router = routes::app_router(state);
     println!("control-api bootstrap ready at {}", timestamp_utc());
