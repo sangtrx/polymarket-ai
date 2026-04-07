@@ -743,6 +743,502 @@ fn validate_non_empty_validation_gate_field(
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationWorkflowStage {
+    Quality,
+    Labeling,
+    PurgedCv,
+    Cpcv,
+    OverfitDiagnostics,
+}
+
+impl ValidationWorkflowStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quality => "quality",
+            Self::Labeling => "labeling",
+            Self::PurgedCv => "purged_cv",
+            Self::Cpcv => "cpcv",
+            Self::OverfitDiagnostics => "overfit_diagnostics",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationWorkflowContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "quality" => Ok(Self::Quality),
+            "labeling" => Ok(Self::Labeling),
+            "purged_cv" => Ok(Self::PurgedCv),
+            "cpcv" => Ok(Self::Cpcv),
+            "overfit_diagnostics" => Ok(Self::OverfitDiagnostics),
+            _ => Err(ValidationWorkflowContractError::invalid_payload(format!(
+                "unknown validation workflow stage `{value}`"
+            ))),
+        }
+    }
+
+    pub const fn stage_index(self) -> i16 {
+        match self {
+            Self::Quality => 1,
+            Self::Labeling => 2,
+            Self::PurgedCv => 3,
+            Self::Cpcv => 4,
+            Self::OverfitDiagnostics => 5,
+        }
+    }
+
+    pub fn from_stage_index(stage_index: i16) -> Result<Self, ValidationWorkflowContractError> {
+        match stage_index {
+            1 => Ok(Self::Quality),
+            2 => Ok(Self::Labeling),
+            3 => Ok(Self::PurgedCv),
+            4 => Ok(Self::Cpcv),
+            5 => Ok(Self::OverfitDiagnostics),
+            _ => Err(ValidationWorkflowContractError::invalid_payload(format!(
+                "unknown validation workflow stage index `{stage_index}`"
+            ))),
+        }
+    }
+
+    pub const fn ordered() -> [Self; 5] {
+        [
+            Self::Quality,
+            Self::Labeling,
+            Self::PurgedCv,
+            Self::Cpcv,
+            Self::OverfitDiagnostics,
+        ]
+    }
+}
+
+pub const FR7_VALIDATION_WORKFLOW_STAGES: [ValidationWorkflowStage; 5] =
+    ValidationWorkflowStage::ordered();
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationWorkflowStageOutcome {
+    Passed,
+    Failed,
+    Blocked,
+}
+
+impl ValidationWorkflowStageOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationWorkflowContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "blocked" => Ok(Self::Blocked),
+            _ => Err(ValidationWorkflowContractError::invalid_payload(format!(
+                "unknown validation stage outcome `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationWorkflowRunState {
+    Running,
+    Completed,
+    Blocked,
+    Failed,
+}
+
+impl ValidationWorkflowRunState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationWorkflowContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "blocked" => Ok(Self::Blocked),
+            "failed" => Ok(Self::Failed),
+            _ => Err(ValidationWorkflowContractError::invalid_payload(format!(
+                "unknown validation run state `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationWorkflowReasonCode {
+    RunStarted,
+    RunCompleted,
+    RunRead,
+    RunListed,
+    ArtifactRead,
+    ComparisonReady,
+    InvalidPayload,
+    UnauthorizedRole,
+    RunNotFound,
+    ArtifactNotFound,
+    GateDenied,
+    StagePassed,
+    StageFailed,
+    DependencyUnavailable,
+    StateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl ValidationWorkflowReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RunStarted => "validation_run_started",
+            Self::RunCompleted => "validation_run_completed",
+            Self::RunRead => "validation_run_read",
+            Self::RunListed => "validation_run_listed",
+            Self::ArtifactRead => "validation_artifact_read",
+            Self::ComparisonReady => "validation_comparison_ready",
+            Self::InvalidPayload => "validation_run_invalid_payload",
+            Self::UnauthorizedRole => "validation_run_unauthorized_role",
+            Self::RunNotFound => "validation_run_not_found",
+            Self::ArtifactNotFound => "validation_artifact_not_found",
+            Self::GateDenied => "validation_run_gate_denied",
+            Self::StagePassed => "validation_run_stage_passed",
+            Self::StageFailed => "validation_run_stage_failed",
+            Self::DependencyUnavailable => "validation_run_dependency_unavailable",
+            Self::StateUnavailable => "validation_run_state_unavailable",
+            Self::PersistenceUnavailable => "validation_run_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ValidationWorkflowContractError> {
+        match value {
+            "validation_run_started" => Ok(Self::RunStarted),
+            "validation_run_completed" => Ok(Self::RunCompleted),
+            "validation_run_read" => Ok(Self::RunRead),
+            "validation_run_listed" => Ok(Self::RunListed),
+            "validation_artifact_read" => Ok(Self::ArtifactRead),
+            "validation_comparison_ready" => Ok(Self::ComparisonReady),
+            "validation_run_invalid_payload" => Ok(Self::InvalidPayload),
+            "validation_run_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "validation_run_not_found" => Ok(Self::RunNotFound),
+            "validation_artifact_not_found" => Ok(Self::ArtifactNotFound),
+            "validation_run_gate_denied" => Ok(Self::GateDenied),
+            "validation_run_stage_passed" => Ok(Self::StagePassed),
+            "validation_run_stage_failed" => Ok(Self::StageFailed),
+            "validation_run_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "validation_run_state_unavailable" => Ok(Self::StateUnavailable),
+            "validation_run_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(ValidationWorkflowContractError::invalid_payload(format!(
+                "unknown validation workflow reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidationWorkflowValidationIssue {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidationWorkflowContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<ValidationWorkflowValidationIssue>,
+}
+
+impl ValidationWorkflowContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<ValidationWorkflowValidationIssue>,
+    ) -> Self {
+        Self {
+            code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationDiagnosticsPayload {
+    pub out_of_sample_sharpe: f64,
+    pub max_drawdown: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brier_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_calibration_error: Option<f64>,
+    pub overfit_indicator: f64,
+    pub overfit_flag: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationWorkflowRunRecord {
+    pub run_id: String,
+    pub candidate_id: String,
+    pub run_state: ValidationWorkflowRunState,
+    pub reason_code: String,
+    pub gate_evaluation: Value,
+    pub comparison_ready: bool,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub started_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationWorkflowArtifactRecord {
+    pub artifact_id: String,
+    pub run_id: String,
+    pub candidate_id: String,
+    pub stage: ValidationWorkflowStage,
+    pub stage_index: i16,
+    pub stage_outcome: ValidationWorkflowStageOutcome,
+    pub reason_code: String,
+    pub diagnostics: ValidationDiagnosticsPayload,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub stage_started_at_utc: String,
+    pub stage_completed_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationMetricDelta {
+    pub metric_key: String,
+    pub current_value: f64,
+    pub prior_value: f64,
+    pub delta: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationStageComparison {
+    pub stage: ValidationWorkflowStage,
+    pub current_run_id: String,
+    pub previous_run_id: String,
+    pub reason_code: String,
+    pub metric_deltas: Vec<ValidationMetricDelta>,
+}
+
+pub fn parse_validation_utc_timestamp(
+    value: &str,
+) -> Result<OffsetDateTime, ValidationWorkflowContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        ValidationWorkflowContractError::invalid_payload(format!(
+            "timestamp `{value}` must be RFC3339 UTC"
+        ))
+    })?;
+    if parsed.offset() != UtcOffset::UTC {
+        return Err(ValidationWorkflowContractError::invalid_payload(
+            "timestamps must use UTC `Z` offset",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn compose_validation_run_id(
+    candidate_id: &str,
+    started_at_utc: &str,
+) -> Result<String, ValidationWorkflowContractError> {
+    let normalized_candidate_id = normalize_research_identifier(candidate_id);
+    if normalized_candidate_id.is_empty() {
+        return Err(
+            ValidationWorkflowContractError::invalid_payload_with_issues(
+                "candidate_id cannot be blank",
+                vec![ValidationWorkflowValidationIssue {
+                    field: "candidate_id".to_string(),
+                    code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+                    message: "candidate_id cannot be blank".to_string(),
+                }],
+            ),
+        );
+    }
+    let started_at = parse_validation_utc_timestamp(started_at_utc)?;
+    Ok(format!(
+        "{}::{}",
+        normalized_candidate_id,
+        started_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn canonical_validation_stage_sequence(
+    stages: &[ValidationWorkflowStage],
+) -> Result<Vec<ValidationWorkflowStage>, ValidationWorkflowContractError> {
+    let expected = ValidationWorkflowStage::ordered();
+    let expected_vec = expected.to_vec();
+    if stages != expected_vec.as_slice() {
+        return Err(ValidationWorkflowContractError::invalid_payload_with_issues(
+            "validation workflow stage sequence must follow FR7 deterministic ordering",
+            vec![ValidationWorkflowValidationIssue {
+                field: "stages".to_string(),
+                code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+                message:
+                    "expected sequence: quality -> labeling -> purged_cv -> cpcv -> overfit_diagnostics"
+                        .to_string(),
+            }],
+        ));
+    }
+    Ok(expected_vec)
+}
+
+pub fn validate_validation_diagnostics_payload(
+    payload: &ValidationDiagnosticsPayload,
+) -> Result<(), ValidationWorkflowContractError> {
+    let mut field_errors = Vec::new();
+    validate_finite_validation_metric(
+        payload.out_of_sample_sharpe,
+        "out_of_sample_sharpe",
+        &mut field_errors,
+    );
+    validate_finite_validation_metric(payload.max_drawdown, "max_drawdown", &mut field_errors);
+    validate_finite_validation_metric(
+        payload.overfit_indicator,
+        "overfit_indicator",
+        &mut field_errors,
+    );
+    if let Some(brier_score) = payload.brier_score {
+        validate_finite_validation_metric(brier_score, "brier_score", &mut field_errors);
+    }
+    if let Some(expected_calibration_error) = payload.expected_calibration_error {
+        validate_finite_validation_metric(
+            expected_calibration_error,
+            "expected_calibration_error",
+            &mut field_errors,
+        );
+    }
+    if payload.brier_score.is_none() && payload.expected_calibration_error.is_none() {
+        field_errors.push(ValidationWorkflowValidationIssue {
+            field: "calibration_metric".to_string(),
+            code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+            message: "either brier_score or expected_calibration_error is required".to_string(),
+        });
+    }
+    if !field_errors.is_empty() {
+        return Err(
+            ValidationWorkflowContractError::invalid_payload_with_issues(
+                "validation diagnostics payload failed validation",
+                field_errors,
+            ),
+        );
+    }
+    Ok(())
+}
+
+pub fn build_validation_metric_deltas(
+    current: &ValidationDiagnosticsPayload,
+    previous: &ValidationDiagnosticsPayload,
+) -> Result<Vec<ValidationMetricDelta>, ValidationWorkflowContractError> {
+    validate_validation_diagnostics_payload(current)?;
+    validate_validation_diagnostics_payload(previous)?;
+
+    let mut deltas = vec![
+        ValidationMetricDelta {
+            metric_key: "out_of_sample_sharpe".to_string(),
+            current_value: current.out_of_sample_sharpe,
+            prior_value: previous.out_of_sample_sharpe,
+            delta: current.out_of_sample_sharpe - previous.out_of_sample_sharpe,
+        },
+        ValidationMetricDelta {
+            metric_key: "max_drawdown".to_string(),
+            current_value: current.max_drawdown,
+            prior_value: previous.max_drawdown,
+            delta: current.max_drawdown - previous.max_drawdown,
+        },
+    ];
+
+    match (
+        current.brier_score,
+        previous.brier_score,
+        current.expected_calibration_error,
+        previous.expected_calibration_error,
+    ) {
+        (Some(current_brier), Some(previous_brier), _, _) => deltas.push(ValidationMetricDelta {
+            metric_key: "brier_score".to_string(),
+            current_value: current_brier,
+            prior_value: previous_brier,
+            delta: current_brier - previous_brier,
+        }),
+        (_, _, Some(current_ece), Some(previous_ece)) => deltas.push(ValidationMetricDelta {
+            metric_key: "expected_calibration_error".to_string(),
+            current_value: current_ece,
+            prior_value: previous_ece,
+            delta: current_ece - previous_ece,
+        }),
+        _ => {
+            return Err(
+                ValidationWorkflowContractError::invalid_payload_with_issues(
+                    "diagnostics comparison requires a shared calibration metric",
+                    vec![ValidationWorkflowValidationIssue {
+                        field: "calibration_metric".to_string(),
+                        code: ValidationWorkflowReasonCode::StateUnavailable.code(),
+                        message:
+                            "runs must include matching brier_score or expected_calibration_error"
+                                .to_string(),
+                    }],
+                ),
+            );
+        }
+    }
+
+    deltas.push(ValidationMetricDelta {
+        metric_key: "overfit_indicator".to_string(),
+        current_value: current.overfit_indicator,
+        prior_value: previous.overfit_indicator,
+        delta: current.overfit_indicator - previous.overfit_indicator,
+    });
+    Ok(deltas)
+}
+
+pub fn build_validation_stage_comparison(
+    stage: ValidationWorkflowStage,
+    current_run_id: impl Into<String>,
+    previous_run_id: impl Into<String>,
+    current: &ValidationDiagnosticsPayload,
+    previous: &ValidationDiagnosticsPayload,
+) -> Result<ValidationStageComparison, ValidationWorkflowContractError> {
+    Ok(ValidationStageComparison {
+        stage,
+        current_run_id: current_run_id.into(),
+        previous_run_id: previous_run_id.into(),
+        reason_code: ValidationWorkflowReasonCode::ComparisonReady
+            .code()
+            .to_string(),
+        metric_deltas: build_validation_metric_deltas(current, previous)?,
+    })
+}
+
+fn validate_finite_validation_metric(
+    value: f64,
+    field: &str,
+    field_errors: &mut Vec<ValidationWorkflowValidationIssue>,
+) {
+    if !value.is_finite() {
+        field_errors.push(ValidationWorkflowValidationIssue {
+            field: field.to_string(),
+            code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite"),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,5 +1451,102 @@ mod tests {
         let code = ValidationGateReasonCode::parse("validation_gate_dependency_unavailable")
             .expect("known reason should parse");
         assert_eq!(code, ValidationGateReasonCode::DependencyUnavailable);
+    }
+
+    fn sample_validation_diagnostics() -> ValidationDiagnosticsPayload {
+        ValidationDiagnosticsPayload {
+            out_of_sample_sharpe: 1.42,
+            max_drawdown: -0.18,
+            brier_score: Some(0.11),
+            expected_calibration_error: None,
+            overfit_indicator: 0.23,
+            overfit_flag: false,
+        }
+    }
+
+    #[test]
+    fn validation_run_stage_sequence_is_deterministic() {
+        let expected = vec![
+            ValidationWorkflowStage::Quality,
+            ValidationWorkflowStage::Labeling,
+            ValidationWorkflowStage::PurgedCv,
+            ValidationWorkflowStage::Cpcv,
+            ValidationWorkflowStage::OverfitDiagnostics,
+        ];
+        let canonical = canonical_validation_stage_sequence(&expected)
+            .expect("ordered stage sequence should be accepted");
+        assert_eq!(canonical, expected);
+    }
+
+    #[test]
+    fn validation_run_stage_sequence_rejects_misordered_stages() {
+        let error = canonical_validation_stage_sequence(&[
+            ValidationWorkflowStage::Labeling,
+            ValidationWorkflowStage::Quality,
+            ValidationWorkflowStage::PurgedCv,
+            ValidationWorkflowStage::Cpcv,
+            ValidationWorkflowStage::OverfitDiagnostics,
+        ])
+        .expect_err("misordered stages must be rejected");
+        assert_eq!(
+            error.code,
+            ValidationWorkflowReasonCode::InvalidPayload.code()
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "stages")
+        );
+    }
+
+    #[test]
+    fn validation_run_reason_code_parse_accepts_known_values() {
+        let code = ValidationWorkflowReasonCode::parse("validation_run_dependency_unavailable")
+            .expect("known reason should parse");
+        assert_eq!(code, ValidationWorkflowReasonCode::DependencyUnavailable);
+    }
+
+    #[test]
+    fn validation_run_compose_id_normalizes_identifier_and_uses_utc_timestamp() {
+        let run_id = compose_validation_run_id(" Candidate::Alpha-1 ", "2026-04-07T00:00:00Z")
+            .expect("run id composition should succeed");
+        assert!(run_id.starts_with("candidate::alpha-1::"));
+    }
+
+    #[test]
+    fn validation_run_diagnostics_require_shared_calibration_metric() {
+        let mut diagnostics = sample_validation_diagnostics();
+        diagnostics.brier_score = None;
+
+        let error = validate_validation_diagnostics_payload(&diagnostics)
+            .expect_err("missing calibration metric should fail");
+        assert_eq!(
+            error.code,
+            ValidationWorkflowReasonCode::InvalidPayload.code()
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "calibration_metric")
+        );
+    }
+
+    #[test]
+    fn validation_run_metric_delta_ordering_is_deterministic() {
+        let current = sample_validation_diagnostics();
+        let mut previous = sample_validation_diagnostics();
+        previous.out_of_sample_sharpe = 1.12;
+        previous.max_drawdown = -0.22;
+        previous.brier_score = Some(0.14);
+        previous.overfit_indicator = 0.31;
+
+        let deltas = build_validation_metric_deltas(&current, &previous)
+            .expect("comparable diagnostics should build deltas");
+        assert_eq!(deltas[0].metric_key, "out_of_sample_sharpe");
+        assert_eq!(deltas[1].metric_key, "max_drawdown");
+        assert_eq!(deltas[2].metric_key, "brier_score");
+        assert_eq!(deltas[3].metric_key, "overfit_indicator");
     }
 }

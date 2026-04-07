@@ -45,7 +45,9 @@ use domain::reporting_schedule::{
     ReportRunRecord, ReportingScheduleReasonCode, ReportingScheduleValidationIssue,
     parse_utc_timestamp,
 };
-use domain::research::{AlphaHypothesisReasonCode, ValidationGateReasonCode};
+use domain::research::{
+    AlphaHypothesisReasonCode, ValidationGateReasonCode, ValidationWorkflowReasonCode,
+};
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
     MarketPolicyReasonCode, MarketPolicyValidationIssue, MarketSnapshot,
@@ -110,6 +112,11 @@ use research_gateway::validation::gate_policies::{
 use research_gateway::validation::hypothesis_registry::{
     AlphaHypothesisEvidence, HypothesisRegistryServiceError, ReadAlphaHypothesisInput,
     UpsertAlphaHypothesisInput,
+};
+use research_gateway::validation::workflow_runs::{
+    ListValidationRunsInput, ReadValidationArtifactInput, ReadValidationRunInput,
+    StartValidationRunInput, ValidationArtifactEvidence, ValidationRunDetailEvidence,
+    ValidationWorkflowServiceError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -209,6 +216,18 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/research/validation-gate-policies/evaluate/{stage}",
             post(evaluate_validation_gates),
+        )
+        .route(
+            "/control/research/validation-runs",
+            post(start_validation_run).get(list_validation_runs),
+        )
+        .route(
+            "/control/research/validation-runs/{run_id}",
+            get(read_validation_run),
+        )
+        .route(
+            "/control/research/validation-runs/{run_id}/artifacts/{stage}",
+            get(read_validation_artifact),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -1435,6 +1454,244 @@ pub async fn evaluate_validation_gates(
         evidence,
         endpoint,
         "validation_gate_evaluate",
+    )
+}
+
+pub async fn start_validation_run(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<ValidationRunStartPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = "/control/research/validation-runs".to_string();
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return validation_run_payload_rejection_response(
+                &state,
+                &actor,
+                "validation_run_start",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_validation_workflow_orchestrator
+        .start_validation_run(StartValidationRunInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: payload.candidate_id,
+            training_entry_observed_metrics: payload.training_entry_observed_metrics,
+            stage_inputs: payload.stage_inputs,
+            correlation_id: effective_correlation_id,
+            requested_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return validation_run_service_error_response(
+                &state,
+                error,
+                "validation_run_start",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    validation_run_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "validation_run_start",
+    )
+}
+
+pub async fn read_validation_run(
+    State(state): State<ControlApiState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<ValidationRunReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/validation-runs/{run_id}");
+    let authorization = match authorize_validation_run_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "validation_run_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_validation_workflow_orchestrator
+        .read_validation_run(ReadValidationRunInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            run_id,
+            correlation_id: effective_correlation_id,
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return validation_run_service_error_response(
+                &state,
+                error,
+                "validation_run_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    validation_run_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "validation_run_read",
+    )
+}
+
+pub async fn list_validation_runs(
+    State(state): State<ControlApiState>,
+    Query(query): Query<ValidationRunsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/validation-runs".to_string();
+    let authorization = match authorize_validation_run_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "validation_run_list",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let runs = match state
+        .research_validation_workflow_orchestrator
+        .list_validation_runs(ListValidationRunsInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: query.candidate_id.clone(),
+            limit: query.limit,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(runs) => runs,
+        Err(error) => {
+            return validation_run_service_error_response(
+                &state,
+                error,
+                "validation_run_list",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    validation_run_list_response(
+        &state,
+        &actor,
+        query.candidate_id,
+        runs,
+        endpoint,
+        "validation_run_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_validation_artifact(
+    State(state): State<ControlApiState>,
+    Path((run_id, stage)): Path<(String, String)>,
+    Query(query): Query<ValidationArtifactReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/validation-runs/{run_id}/artifacts/{stage}");
+    let authorization = match authorize_validation_run_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "validation_artifact_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_validation_workflow_orchestrator
+        .read_validation_artifact(ReadValidationArtifactInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            run_id,
+            stage,
+            correlation_id: effective_correlation_id,
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return validation_run_service_error_response(
+                &state,
+                error,
+                "validation_artifact_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+            );
+        }
+    };
+
+    validation_artifact_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "validation_artifact_read",
     )
 }
 
@@ -5765,6 +6022,60 @@ fn authorize_validation_gate_read(
     )))
 }
 
+fn authorize_validation_run_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(validation_run_service_error_response(
+        state,
+        ValidationWorkflowServiceError {
+            code: ValidationWorkflowReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+            failed_stages: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
+}
+
 fn authorize_attribution_read(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -7448,6 +7759,431 @@ fn validation_gate_service_error_status(code: &str) -> StatusCode {
             StatusCode::SERVICE_UNAVAILABLE
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn validation_run_detail_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: ValidationRunDetailEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+) -> Response {
+    let run_id = evidence.run.run_id.clone();
+    let candidate_id = evidence.run.candidate_id.clone();
+    let run_state = evidence.run.run_state.as_str().to_string();
+    let reason_code = evidence.reason_code.clone();
+    let correlation_id = evidence.run.correlation_id.clone();
+    let timestamp_utc = evidence
+        .run
+        .completed_at_utc
+        .clone()
+        .unwrap_or_else(|| evidence.run.started_at_utc.clone());
+    let artifact_count = evidence.artifacts.len();
+    let comparison_count = evidence.comparisons.len();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "run_id": run_id,
+            "candidate_id": candidate_id,
+            "run_state": run_state,
+            "artifact_count": artifact_count,
+            "comparison_count": comparison_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        if http_method == "GET" {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        axum::Json(ValidationRunEnvelope {
+            data: Some(ValidationRunData::RunDetail {
+                run: validation_run_to_item(evidence.run),
+                artifacts: evidence
+                    .artifacts
+                    .into_iter()
+                    .map(validation_artifact_to_item)
+                    .collect(),
+                comparisons: evidence
+                    .comparisons
+                    .into_iter()
+                    .map(validation_stage_comparison_to_item)
+                    .collect(),
+            }),
+            meta: ValidationRunMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn validation_run_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    candidate_id: String,
+    runs: Vec<domain::research::ValidationWorkflowRunRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let reason_code = ValidationWorkflowReasonCode::RunListed.code().to_string();
+    let run_count = runs.len();
+    let run_items = runs
+        .into_iter()
+        .map(validation_run_to_item)
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "candidate_id": candidate_id,
+            "run_count": run_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(ValidationRunEnvelope {
+            data: Some(ValidationRunData::Runs {
+                candidate_id,
+                runs: run_items,
+            }),
+            meta: ValidationRunMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn validation_artifact_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: ValidationArtifactEvidence,
+    endpoint: String,
+    action: &'static str,
+) -> Response {
+    let run_id = evidence.artifact.run_id.clone();
+    let stage = evidence.artifact.stage.as_str().to_string();
+    let stage_outcome = evidence.artifact.stage_outcome.as_str().to_string();
+    let correlation_id = evidence.correlation_id.clone();
+    let timestamp_utc = evidence.queried_at_utc.clone();
+    let reason_code = evidence.reason_code.clone();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "run_id": run_id,
+            "stage": stage,
+            "stage_outcome": stage_outcome,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(ValidationRunEnvelope {
+            data: Some(ValidationRunData::Artifact {
+                artifact: validation_artifact_to_item(evidence.artifact),
+            }),
+            meta: ValidationRunMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id: evidence.correlation_id,
+                timestamp_utc: evidence.queried_at_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn validation_run_payload_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: JsonRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    validation_run_service_error_response(
+        state,
+        ValidationWorkflowServiceError {
+            code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+            message: format!("invalid validation run payload: {rejection_message}"),
+            field_errors: Vec::new(),
+            failed_stages: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+    )
+}
+
+fn validation_run_service_error_response(
+    state: &ControlApiState,
+    error: ValidationWorkflowServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") || action.ends_with("_list") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "error_code": error.code,
+            "failed_stages": error.failed_stages,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == ValidationWorkflowReasonCode::UnauthorizedRole.code() {
+        Some(ValidationRunSecuritySignal {
+            name: if action.ends_with("_read") || action.ends_with("_list") {
+                "unauthorized_validation_run_read_attempt_v1"
+            } else {
+                "unauthorized_validation_run_mutation_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        validation_run_service_error_status(error.code),
+        axum::Json(ValidationRunEnvelope::<ValidationRunData> {
+            data: None,
+            meta: ValidationRunMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id: actor.correlation_id.clone(),
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(ValidationRunEnvelopeError {
+                error_code: error.code.to_string(),
+                message: error.message,
+                field_errors: error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| ValidationRunFieldError {
+                        field: issue.field,
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                failed_stages: error.failed_stages,
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn validation_run_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == ValidationWorkflowReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == ValidationWorkflowReasonCode::UnauthorizedRole.code() => {
+            StatusCode::FORBIDDEN
+        }
+        "validation_run_constraint_violation" | "validation_artifact_constraint_violation" => {
+            StatusCode::CONFLICT
+        }
+        code if code == ValidationWorkflowReasonCode::RunNotFound.code()
+            || code == ValidationWorkflowReasonCode::ArtifactNotFound.code()
+            || code == ValidationWorkflowReasonCode::GateDenied.code()
+            || code == ValidationWorkflowReasonCode::StageFailed.code() =>
+        {
+            StatusCode::CONFLICT
+        }
+        code if code == ValidationWorkflowReasonCode::DependencyUnavailable.code()
+            || code == ValidationWorkflowReasonCode::StateUnavailable.code()
+            || code == ValidationWorkflowReasonCode::PersistenceUnavailable.code()
+            || code == "validation_run_query_failed"
+            || code == "validation_run_row_decode_failed"
+            || code == "validation_artifact_query_failed"
+            || code == "validation_artifact_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn validation_run_to_item(run: domain::research::ValidationWorkflowRunRecord) -> ValidationRunItem {
+    ValidationRunItem {
+        run_id: run.run_id,
+        candidate_id: run.candidate_id,
+        run_state: run.run_state.as_str().to_string(),
+        reason_code: run.reason_code,
+        gate_evaluation: run.gate_evaluation,
+        comparison_ready: run.comparison_ready,
+        actor_id: run.actor_id,
+        correlation_id: run.correlation_id,
+        started_at_utc: run.started_at_utc,
+        completed_at_utc: run.completed_at_utc,
+    }
+}
+
+fn validation_artifact_to_item(
+    artifact: domain::research::ValidationWorkflowArtifactRecord,
+) -> ValidationArtifactItem {
+    ValidationArtifactItem {
+        artifact_id: artifact.artifact_id,
+        run_id: artifact.run_id,
+        candidate_id: artifact.candidate_id,
+        stage: artifact.stage.as_str().to_string(),
+        stage_index: artifact.stage_index,
+        stage_outcome: artifact.stage_outcome.as_str().to_string(),
+        reason_code: artifact.reason_code,
+        diagnostics: ValidationDiagnosticsItem {
+            out_of_sample_sharpe: artifact.diagnostics.out_of_sample_sharpe,
+            max_drawdown: artifact.diagnostics.max_drawdown,
+            brier_score: artifact.diagnostics.brier_score,
+            expected_calibration_error: artifact.diagnostics.expected_calibration_error,
+            overfit_indicator: artifact.diagnostics.overfit_indicator,
+            overfit_flag: artifact.diagnostics.overfit_flag,
+        },
+        actor_id: artifact.actor_id,
+        correlation_id: artifact.correlation_id,
+        stage_started_at_utc: artifact.stage_started_at_utc,
+        stage_completed_at_utc: artifact.stage_completed_at_utc,
+    }
+}
+
+fn validation_stage_comparison_to_item(
+    comparison: domain::research::ValidationStageComparison,
+) -> ValidationStageComparisonItem {
+    ValidationStageComparisonItem {
+        stage: comparison.stage.as_str().to_string(),
+        current_run_id: comparison.current_run_id,
+        previous_run_id: comparison.previous_run_id,
+        reason_code: comparison.reason_code,
+        metric_deltas: comparison
+            .metric_deltas
+            .into_iter()
+            .map(|delta| ValidationMetricDeltaItem {
+                metric_key: delta.metric_key,
+                current_value: delta.current_value,
+                prior_value: delta.prior_value,
+                delta: delta.delta,
+            })
+            .collect(),
     }
 }
 
@@ -10224,6 +10960,36 @@ pub struct ValidationGatePoliciesQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ValidationRunStartPayload {
+    pub candidate_id: String,
+    pub training_entry_observed_metrics: serde_json::Value,
+    pub stage_inputs: serde_json::Value,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ValidationRunsQuery {
+    pub candidate_id: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ValidationRunReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ValidationArtifactReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
@@ -11162,6 +11928,130 @@ pub struct ValidationGateEvaluationResultItem {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ValidationRunEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: ValidationRunMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ValidationRunEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValidationRunData {
+    RunDetail {
+        run: ValidationRunItem,
+        artifacts: Vec<ValidationArtifactItem>,
+        comparisons: Vec<ValidationStageComparisonItem>,
+    },
+    Runs {
+        candidate_id: String,
+        runs: Vec<ValidationRunItem>,
+    },
+    Artifact {
+        artifact: ValidationArtifactItem,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationRunMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationRunEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<ValidationRunFieldError>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_stages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<ValidationRunSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationRunFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationRunSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationRunItem {
+    pub run_id: String,
+    pub candidate_id: String,
+    pub run_state: String,
+    pub reason_code: String,
+    pub gate_evaluation: serde_json::Value,
+    pub comparison_ready: bool,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub started_at_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationArtifactItem {
+    pub artifact_id: String,
+    pub run_id: String,
+    pub candidate_id: String,
+    pub stage: String,
+    pub stage_index: i16,
+    pub stage_outcome: String,
+    pub reason_code: String,
+    pub diagnostics: ValidationDiagnosticsItem,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub stage_started_at_utc: String,
+    pub stage_completed_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationDiagnosticsItem {
+    pub out_of_sample_sharpe: f64,
+    pub max_drawdown: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brier_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_calibration_error: Option<f64>,
+    pub overfit_indicator: f64,
+    pub overfit_flag: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationStageComparisonItem {
+    pub stage: String,
+    pub current_run_id: String,
+    pub previous_run_id: String,
+    pub reason_code: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_deltas: Vec<ValidationMetricDeltaItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationMetricDeltaItem {
+    pub metric_key: String,
+    pub current_value: f64,
+    pub prior_value: f64,
+    pub delta: f64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct EmergencyControlDecisionResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11683,8 +12573,11 @@ mod tests {
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::research::{
-        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, ValidationGateReasonCode,
-        ValidationGateValidationIssue,
+        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, ValidationDiagnosticsPayload,
+        ValidationGateReasonCode, ValidationGateValidationIssue, ValidationMetricDelta,
+        ValidationStageComparison, ValidationWorkflowArtifactRecord, ValidationWorkflowReasonCode,
+        ValidationWorkflowRunRecord, ValidationWorkflowRunState, ValidationWorkflowStage,
+        ValidationWorkflowStageOutcome, ValidationWorkflowValidationIssue,
     };
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
@@ -11747,6 +12640,11 @@ mod tests {
     use research_gateway::validation::hypothesis_registry::{
         AlphaHypothesisEvidence, HypothesisRegistryOrchestrator, HypothesisRegistryServiceError,
         ReadAlphaHypothesisInput, UpsertAlphaHypothesisInput,
+    };
+    use research_gateway::validation::workflow_runs::{
+        ListValidationRunsInput, ReadValidationArtifactInput, ReadValidationRunInput,
+        StartValidationRunInput, ValidationArtifactEvidence, ValidationRunDetailEvidence,
+        ValidationWorkflowRunOrchestrator, ValidationWorkflowServiceError,
     };
     use std::sync::{Arc, Mutex};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -12775,6 +13673,229 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct StubValidationWorkflowOrchestrator {
+        start_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        list_error: Option<(&'static str, &'static str)>,
+        artifact_error: Option<(&'static str, &'static str)>,
+        gate_denied_on_start: bool,
+    }
+
+    impl StubValidationWorkflowOrchestrator {
+        fn service_error(
+            code: &'static str,
+            message: &'static str,
+        ) -> ValidationWorkflowServiceError {
+            ValidationWorkflowServiceError {
+                code,
+                message: message.to_string(),
+                field_errors: if code == ValidationWorkflowReasonCode::InvalidPayload.code() {
+                    vec![ValidationWorkflowValidationIssue {
+                        field: "candidate_id".to_string(),
+                        code: ValidationWorkflowReasonCode::InvalidPayload.code(),
+                        message: "candidate_id cannot be blank".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                failed_stages: if code == ValidationWorkflowReasonCode::GateDenied.code() {
+                    vec!["gate_precheck".to_string()]
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+
+        fn sample_run(
+            run_id: String,
+            candidate_id: String,
+            run_state: ValidationWorkflowRunState,
+            reason_code: String,
+            correlation_id: String,
+            timestamp_utc: String,
+        ) -> ValidationWorkflowRunRecord {
+            ValidationWorkflowRunRecord {
+                run_id,
+                candidate_id,
+                run_state,
+                reason_code,
+                gate_evaluation: serde_json::json!({
+                    "outcome": "allow",
+                    "reason_code": "validation_gate_evaluation_allowed",
+                    "failed_gate_ids": []
+                }),
+                comparison_ready: true,
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                started_at_utc: timestamp_utc.clone(),
+                completed_at_utc: Some(timestamp_utc),
+            }
+        }
+
+        fn sample_artifact(
+            run_id: String,
+            candidate_id: String,
+            stage: ValidationWorkflowStage,
+            reason_code: String,
+            correlation_id: String,
+        ) -> ValidationWorkflowArtifactRecord {
+            ValidationWorkflowArtifactRecord {
+                artifact_id: format!("{run_id}::{}", stage.as_str()),
+                run_id,
+                candidate_id,
+                stage,
+                stage_index: stage.stage_index(),
+                stage_outcome: ValidationWorkflowStageOutcome::Passed,
+                reason_code,
+                diagnostics: ValidationDiagnosticsPayload {
+                    out_of_sample_sharpe: 1.32,
+                    max_drawdown: 0.11,
+                    brier_score: Some(0.21),
+                    expected_calibration_error: None,
+                    overfit_indicator: 0.18,
+                    overfit_flag: false,
+                },
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                stage_started_at_utc: "2026-04-07T00:00:01Z".to_string(),
+                stage_completed_at_utc: "2026-04-07T00:00:02Z".to_string(),
+            }
+        }
+    }
+
+    impl ValidationWorkflowRunOrchestrator for StubValidationWorkflowOrchestrator {
+        fn start_validation_run(
+            &self,
+            input: StartValidationRunInput,
+        ) -> Result<ValidationRunDetailEvidence, ValidationWorkflowServiceError> {
+            if let Some((code, message)) = self.start_error {
+                return Err(Self::service_error(code, message));
+            }
+            if self.gate_denied_on_start {
+                return Err(Self::service_error(
+                    ValidationWorkflowReasonCode::GateDenied.code(),
+                    "mandatory FR43 gate denied validation workflow entry",
+                ));
+            }
+            let run = Self::sample_run(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                ValidationWorkflowRunState::Completed,
+                ValidationWorkflowReasonCode::RunCompleted
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.requested_at_utc,
+            );
+            let artifact = Self::sample_artifact(
+                run.run_id.clone(),
+                run.candidate_id.clone(),
+                ValidationWorkflowStage::Quality,
+                ValidationWorkflowReasonCode::StagePassed.code().to_string(),
+                run.correlation_id.clone(),
+            );
+            Ok(ValidationRunDetailEvidence {
+                run,
+                artifacts: vec![artifact],
+                comparisons: vec![ValidationStageComparison {
+                    stage: ValidationWorkflowStage::Quality,
+                    current_run_id: "candidate::alpha-1::1712457600000000000".to_string(),
+                    previous_run_id: "candidate::alpha-1::1712371200000000000".to_string(),
+                    reason_code: ValidationWorkflowReasonCode::ComparisonReady
+                        .code()
+                        .to_string(),
+                    metric_deltas: vec![ValidationMetricDelta {
+                        metric_key: "out_of_sample_sharpe".to_string(),
+                        current_value: 1.32,
+                        prior_value: 1.21,
+                        delta: 0.11,
+                    }],
+                }],
+                reason_code: ValidationWorkflowReasonCode::RunStarted.code().to_string(),
+            })
+        }
+
+        fn read_validation_run(
+            &self,
+            input: ReadValidationRunInput,
+        ) -> Result<ValidationRunDetailEvidence, ValidationWorkflowServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(Self::service_error(code, message));
+            }
+            let run = Self::sample_run(
+                input.run_id.clone(),
+                "candidate::alpha-1".to_string(),
+                ValidationWorkflowRunState::Completed,
+                ValidationWorkflowReasonCode::RunRead.code().to_string(),
+                input.correlation_id.clone(),
+                input.queried_at_utc.clone(),
+            );
+            let artifact = Self::sample_artifact(
+                run.run_id.clone(),
+                run.candidate_id.clone(),
+                ValidationWorkflowStage::OverfitDiagnostics,
+                ValidationWorkflowReasonCode::StagePassed.code().to_string(),
+                input.correlation_id,
+            );
+            Ok(ValidationRunDetailEvidence {
+                run,
+                artifacts: vec![artifact],
+                comparisons: vec![],
+                reason_code: ValidationWorkflowReasonCode::RunRead.code().to_string(),
+            })
+        }
+
+        fn list_validation_runs(
+            &self,
+            input: ListValidationRunsInput,
+        ) -> Result<Vec<ValidationWorkflowRunRecord>, ValidationWorkflowServiceError> {
+            if let Some((code, message)) = self.list_error {
+                return Err(Self::service_error(code, message));
+            }
+            Ok(vec![Self::sample_run(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                ValidationWorkflowRunState::Completed,
+                ValidationWorkflowReasonCode::RunListed.code().to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            )])
+        }
+
+        fn read_validation_artifact(
+            &self,
+            input: ReadValidationArtifactInput,
+        ) -> Result<ValidationArtifactEvidence, ValidationWorkflowServiceError> {
+            if let Some((code, message)) = self.artifact_error {
+                return Err(Self::service_error(code, message));
+            }
+            let stage = ValidationWorkflowStage::parse(&input.stage).map_err(|_| {
+                Self::service_error(
+                    ValidationWorkflowReasonCode::InvalidPayload.code(),
+                    "unknown validation workflow stage",
+                )
+            })?;
+            Ok(ValidationArtifactEvidence {
+                artifact: Self::sample_artifact(
+                    input.run_id,
+                    "candidate::alpha-1".to_string(),
+                    stage,
+                    ValidationWorkflowReasonCode::ArtifactRead
+                        .code()
+                        .to_string(),
+                    input.correlation_id.clone(),
+                ),
+                reason_code: ValidationWorkflowReasonCode::ArtifactRead
+                    .code()
+                    .to_string(),
+                actor_id: input.actor_id,
+                correlation_id: input.correlation_id,
+                queried_at_utc: input.queried_at_utc,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct StubAllocationPolicyOrchestrator {
         upsert_error: Option<(&'static str, &'static str)>,
         evaluate_error: Option<(&'static str, &'static str)>,
@@ -13612,6 +14733,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_research_validation_gate_orchestrator(validation_gate_policy_orchestrator),
+        )
+    }
+
+    fn test_app_with_validation_run_orchestrator(
+        validation_run_orchestrator: Arc<dyn ValidationWorkflowRunOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_validation_workflow_orchestrator(validation_run_orchestrator),
         )
     }
 
@@ -17483,6 +18626,287 @@ mod tests {
             "validation_gate_invalid_payload"
         );
         assert_eq!(payload["meta"]["action"], "validation_gate_evaluate");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn validation_run_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-run-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "training_entry_observed_metrics":{"forward_bias_score":0.08},
+                            "stage_inputs":{
+                                "quality":{"source":"gate_result"},
+                                "labeling":{"source":"labels"},
+                                "purged_cv":{"source":"window"},
+                                "cpcv":{"source":"cpcv"},
+                                "overfit_diagnostics":{"source":"oos"}
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn validation_run_start_route_returns_data_meta_error_envelope() {
+        let app = test_app_with_validation_run_orchestrator(Arc::new(
+            StubValidationWorkflowOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-run-start-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "training_entry_observed_metrics":{"forward_bias_score":0.08},
+                            "stage_inputs":{
+                                "quality":{"source":"gate_result"},
+                                "labeling":{"source":"labels"},
+                                "purged_cv":{"source":"window"},
+                                "cpcv":{"source":"cpcv"},
+                                "overfit_diagnostics":{"source":"oos"}
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "run_detail");
+        assert_eq!(
+            payload["data"]["run"]["run_id"],
+            "candidate::alpha-1::1712457600000000000"
+        );
+        assert_eq!(payload["data"]["run"]["run_state"], "completed");
+        assert_eq!(payload["meta"]["action"], "validation_run_start");
+        assert!(payload["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn validation_run_read_list_artifact_routes_return_envelope_shapes() {
+        let app = test_app_with_validation_run_orchestrator(Arc::new(
+            StubValidationWorkflowOrchestrator::default(),
+        ));
+
+        let read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/research/validation-runs/candidate::alpha-1::1712457600000000000",
+                    )
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-run-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(read_payload["data"]["kind"], "run_detail");
+        assert_eq!(read_payload["meta"]["action"], "validation_run_read");
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/control/research/validation-runs?candidate_id=candidate::alpha-1&limit=1",
+                    )
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-run-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(list_payload["data"]["kind"], "runs");
+        assert_eq!(
+            list_payload["data"]["runs"][0]["reason_code"],
+            "validation_run_listed"
+        );
+        assert_eq!(list_payload["meta"]["action"], "validation_run_list");
+
+        let artifact_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-runs/candidate::alpha-1::1712457600000000000/artifacts/quality")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-run-artifact-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(artifact_response.status(), StatusCode::OK);
+        let artifact_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(artifact_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(artifact_payload["data"]["kind"], "artifact");
+        assert_eq!(artifact_payload["data"]["artifact"]["stage"], "quality");
+        assert_eq!(
+            artifact_payload["meta"]["action"],
+            "validation_artifact_read"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_run_start_route_maps_gate_denied_to_conflict_with_failed_stages() {
+        let app = test_app_with_validation_run_orchestrator(Arc::new(
+            StubValidationWorkflowOrchestrator {
+                gate_denied_on_start: true,
+                ..Default::default()
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-run-start-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "training_entry_observed_metrics":{"forward_bias_score":0.08},
+                            "stage_inputs":{
+                                "quality":{"source":"gate_result"},
+                                "labeling":{"source":"labels"},
+                                "purged_cv":{"source":"window"},
+                                "cpcv":{"source":"cpcv"},
+                                "overfit_diagnostics":{"source":"oos"}
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error"]["error_code"], "validation_run_gate_denied");
+        assert_eq!(payload["meta"]["action"], "validation_run_start");
+        assert_eq!(payload["error"]["failed_stages"][0], "gate_precheck");
+    }
+
+    #[tokio::test]
+    async fn validation_run_start_route_maps_json_rejection_to_bad_request_envelope() {
+        let app = test_app_with_validation_run_orchestrator(Arc::new(
+            StubValidationWorkflowOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/validation-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-validation-run-start-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":123,
+                            "training_entry_observed_metrics":{"forward_bias_score":0.08},
+                            "stage_inputs":{"quality":{"source":"gate_result"}}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "validation_run_invalid_payload"
+        );
+        assert_eq!(payload["meta"]["action"], "validation_run_start");
         assert!(payload["data"].is_null());
     }
 

@@ -802,3 +802,33 @@
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-2` ✅
 - `source "$HOME/.cargo/env" && npm test` ✅
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-2` ✅ (2026-04-07 18:16:21 QA automation rerun)
+
+---
+
+## Story 6.3 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::validation_run_`) — validates deterministic FR7 stage ordering, run reason-code parsing, canonical run-id composition, FR44 diagnostics calibration boundary rules, and deterministic metric-delta ordering.
+- [x] `crates/persistence/src/postgres/validation_runs.rs` (`postgres::validation_runs::tests::`) — validates `validation_runs` schema constraints/indexes, canonical identifier handling, deterministic candidate-scoped ordering, and machine-readable persistence classification.
+- [x] `crates/persistence/src/postgres/validation_artifacts.rs` (`postgres::validation_artifacts::tests::`) — validates `validation_artifacts` schema constraints/indexes, stage-index consistency, FR44 diagnostics payload validation, and deterministic run-scoped ordering.
+- [x] `services/research-gateway/src/validation/workflow_runs.rs` (`validation::workflow_runs::tests::`) — validates FR43 gate-precheck integration, fail-closed stage blocking semantics, deterministic stage progression, diagnostics artifact persistence, and prior-run comparison readiness.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::validation_run_`) — validates authenticated start/read/list/artifact route behavior, canonical `data/meta/error` envelopes, unauthorized-role denials, gate-denied conflict mapping, and deterministic `400/403/409/503/500` status continuity.
+- [x] `tests/api/story-6-3-validation-workflow-api.test.mjs` — validates route wiring, payload/query/envelope contracts, deterministic run-detail artifact/comparison payload shapes, allow/deny audit evidence continuity contracts, control-api startup/state wiring, research-gateway workflow seam exports, and unauthorized security-signal tokens.
+- [x] `tests/e2e/story-6-3-validation-workflow.e2e.test.mjs` — validates migration scope isolation (`validation_runs` + `validation_artifacts` only), FR7/FR44 runbook contract coverage, FR43 precheck + fail-closed stage progression orchestration contracts, deterministic comparison baseline/timing semantics, cross-runbook continuity links, and Story 6.3 QA command wiring.
+
+### Coverage
+
+- Story 6.3 now has deterministic automated coverage for:
+  - FR7 stage workflow ordering (`quality -> labeling -> purged_cv -> cpcv -> overfit_diagnostics`) with fail-closed downstream blocking,
+  - FR43 training-entry precheck dependency enforcement and gate-denied run-start behavior,
+  - FR44 diagnostics artifact payload requirements plus deterministic comparison baseline and stage-timing contracts,
+  - authenticated control-plane validation-run start/read/list/artifact APIs using canonical envelope/error surfaces with explicit audit allow/deny evidence fields,
+  - deterministic machine-readable status mapping and audit/telemetry continuity semantics.
+- Automated Story 6.3 regression inventory in this QA refresh: **40 Story-6.3 tests passing** (`domain: 6`, `persistence: 9`, `research-gateway: 7`, `control-api: 5`, `api/e2e: 13`).
+
+### Execution Result
+
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-3` ✅
+- `source "$HOME/.cargo/env" && npm test` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-3` ✅ (2026-04-07 19:46:14 QA automation refresh rerun)

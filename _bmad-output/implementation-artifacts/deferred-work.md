@@ -19,3 +19,8 @@
 
 - `.scripts/bmad-auto/copilot/bmad-progress.log` appeared in git status cross-check but is outside Story 6.2 application-source review scope.
 - Repository-wide `TIMESTAMPTZ` timezone-offset CHECK convention appears across migrations; changing only Story 6.2 constraints requires a coordinated platform migration policy update.
+
+## Deferred from: code review of 6-3-implement-validation-workflow-and-diagnostics-artifact-store (2026-04-07T12:38:04Z)
+
+- Repository-wide `rust:lint` currently fails on pre-existing clippy findings in `crates/domain/src/recovery.rs` (`collapsible_if`), outside Story 6.3 scope.
+- `.scripts/bmad-auto/copilot/bmad-progress.log` appeared in git status cross-check but is outside Story 6.3 application-source review scope.

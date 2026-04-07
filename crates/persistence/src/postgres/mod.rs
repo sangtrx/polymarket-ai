@@ -26,7 +26,9 @@ pub mod reward_risk;
 pub mod risk_limits;
 pub mod safety_controls;
 pub mod user_stream;
+pub mod validation_artifacts;
 pub mod validation_gate_policies;
+pub mod validation_runs;
 
 pub fn migration_namespace() -> &'static str {
     "governance_rbac"

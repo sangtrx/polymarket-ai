@@ -17,8 +17,11 @@ use governance_service::safety_controls::SafetyControlService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
 use reporting_service::exports::scheduling::ReportSchedulingService;
 use reporting_service::exports::workflows::ReportExportWorkflowService;
-use research_gateway::validation::gate_policies::ValidationGatePolicyService;
+use research_gateway::validation::gate_policies::{
+    ValidationGatePolicyOrchestrator, ValidationGatePolicyService,
+};
 use research_gateway::validation::hypothesis_registry::HypothesisRegistryService;
+use research_gateway::validation::workflow_runs::ValidationWorkflowRunService;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
@@ -31,6 +34,13 @@ async fn main() {
         .connect(&database_url)
         .await
         .expect("failed to connect to Postgres for approval persistence");
+    let research_validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator> =
+        Arc::new(ValidationGatePolicyService::postgres(pool.clone()));
+    let research_validation_workflow_orchestrator =
+        Arc::new(ValidationWorkflowRunService::postgres(
+            pool.clone(),
+            Arc::clone(&research_validation_gate_orchestrator),
+        ));
 
     let state = ControlApiState::with_all_orchestrators_and_reporting(
         Arc::new(GovernanceAuthorizationGuard::new(
@@ -56,9 +66,8 @@ async fn main() {
     .with_research_hypothesis_orchestrator(Arc::new(HypothesisRegistryService::postgres(
         pool.clone(),
     )))
-    .with_research_validation_gate_orchestrator(Arc::new(ValidationGatePolicyService::postgres(
-        pool.clone(),
-    )))
+    .with_research_validation_gate_orchestrator(research_validation_gate_orchestrator)
+    .with_research_validation_workflow_orchestrator(research_validation_workflow_orchestrator)
     .with_attribution_pool(pool);
     let _app: Router = routes::app_router(state);
     println!("control-api bootstrap ready at {}", timestamp_utc());

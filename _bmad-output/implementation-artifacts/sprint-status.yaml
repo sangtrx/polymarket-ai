@@ -1,5 +1,5 @@
 # generated: 2026-04-04T17:40:16Z
-# last_updated: 2026-04-07T18:21:29Z
+# last_updated: 2026-04-07T19:55:04Z
 # project: polymarket-ai
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-04T17:40:16Z
-last_updated: 2026-04-07T18:21:29Z
+last_updated: 2026-04-07T19:55:04Z
 project: polymarket-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -87,7 +87,7 @@ development_status:
   epic-6: in-progress
   6-1-build-alpha-hypothesis-registry-with-required-metadata: done
   6-2-configure-leakage-and-data-quality-gate-definitions: done
-  6-3-implement-validation-workflow-and-diagnostics-artifact-store: backlog
+  6-3-implement-validation-workflow-and-diagnostics-artifact-store: done
   6-4-add-shadow-mode-evaluation-pipeline: backlog
   6-5-enforce-promotion-thresholds-evidence-criteria-and-lifecycle-actions: backlog
   6-6-integrate-counterfactual-replay-stress-gates: backlog
