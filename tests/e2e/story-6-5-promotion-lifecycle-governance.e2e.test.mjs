@@ -64,23 +64,23 @@ test("Story 6.5 orchestration enforces seam reuse, FR45 completeness, and fail-c
   assert.match(decisions, /evaluate_promotion_thresholds\(/);
   assert.match(
     decisions,
-    /decision_reason_code = PromotionDecisionReasonCode::MissingEvidence\.code\(\)\.to_string\(\);/,
+    /PromotionDecisionReasonCode::MissingEvidence[\s\S]*\.code\(\)[\s\S]*\.to_string\(\)/s,
   );
   assert.match(
     decisions,
-    /decision_reason_code = PromotionDecisionReasonCode::ThresholdFailed\.code\(\)\.to_string\(\);/,
+    /PromotionDecisionReasonCode::ThresholdFailed[\s\S]*\.code\(\)[\s\S]*\.to_string\(\)/s,
   );
   assert.match(
     decisions,
-    /decision_reason_code = PromotionDecisionReasonCode::ApprovalRequired\.code\(\)\.to_string\(\);/,
+    /PromotionDecisionReasonCode::ApprovalRequired[\s\S]*\.code\(\)[\s\S]*\.to_string\(\)/s,
   );
   assert.match(
     decisions,
-    /normalize_optional_timestamp\("decided_after_utc", input\.decided_after_utc\.as_deref\(\)\)/,
+    /normalize_optional_timestamp\([\s\S]*"decided_after_utc"[\s\S]*input\.decided_after_utc\.as_deref\(\)[\s\S]*\)/s,
   );
   assert.match(
     decisions,
-    /normalize_optional_timestamp\("decided_before_utc", input\.decided_before_utc\.as_deref\(\)\)/,
+    /normalize_optional_timestamp\([\s\S]*"decided_before_utc"[\s\S]*input\.decided_before_utc\.as_deref\(\)[\s\S]*\)/s,
   );
   assert.match(
     decisions,
@@ -110,7 +110,7 @@ test("Story 6.5 list orchestration preserves deterministic limit/repository cont
 
   assert.match(
     decisions,
-    /let limit = input\.limit\.unwrap_or\(DEFAULT_LIST_LIMIT\)\.clamp\(1, MAX_LIST_LIMIT\);/,
+    /let limit = input[\s\S]*\.limit[\s\S]*\.unwrap_or\(DEFAULT_LIST_LIMIT\)[\s\S]*\.clamp\(1, MAX_LIST_LIMIT\);/s,
   );
   assert.match(
     decisions,

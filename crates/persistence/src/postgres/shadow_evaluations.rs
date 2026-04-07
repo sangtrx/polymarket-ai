@@ -66,6 +66,30 @@ const LOAD_SHADOW_EVALUATION_SQL: &str = r#"
     LIMIT 1
 "#;
 
+const LOAD_LATEST_SHADOW_EVALUATION_BY_CANDIDATE_AND_RUN_SQL: &str = r#"
+    SELECT
+        evaluation_id,
+        candidate_id,
+        validation_run_id,
+        evaluation_state,
+        reason_code,
+        market_context_json,
+        signal_decisions_json,
+        simulation_outcomes_json,
+        actor_id,
+        correlation_id,
+        to_char(started_at_utc AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS started_at_utc,
+        CASE
+            WHEN completed_at_utc IS NULL THEN NULL
+            ELSE to_char(completed_at_utc AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+        END AS completed_at_utc
+    FROM shadow_evaluations
+    WHERE lower(trim(candidate_id)) = lower(trim($1))
+      AND lower(trim(validation_run_id)) = lower(trim($2))
+    ORDER BY started_at_utc DESC, evaluation_id ASC
+    LIMIT 1
+"#;
+
 const LIST_SHADOW_EVALUATIONS_BY_CANDIDATE_SQL: &str = r#"
     SELECT
         evaluation_id,
@@ -276,6 +300,34 @@ where
         })?;
 
     rows.into_iter().map(decode_shadow_evaluation_row).collect()
+}
+
+pub async fn load_latest_shadow_evaluation_by_candidate_and_run<'e, E>(
+    executor: E,
+    candidate_id: &str,
+    validation_run_id: &str,
+) -> Result<Option<ShadowEvaluationRecord>, ShadowEvaluationPersistenceError>
+where
+    E: PgExecutor<'e>,
+{
+    validate_non_empty("candidate_id", candidate_id)?;
+    validate_non_empty("validation_run_id", validation_run_id)?;
+    let normalized_candidate_id = normalize_research_identifier(candidate_id);
+    let normalized_validation_run_id = normalize_research_identifier(validation_run_id);
+
+    let row = sqlx::query(LOAD_LATEST_SHADOW_EVALUATION_BY_CANDIDATE_AND_RUN_SQL)
+        .bind(&normalized_candidate_id)
+        .bind(&normalized_validation_run_id)
+        .fetch_optional(executor)
+        .await
+        .map_err(|error| {
+            ShadowEvaluationPersistenceError::query_failure(
+                "load_latest_shadow_evaluation_by_candidate_and_run",
+                error,
+            )
+        })?;
+
+    row.map(decode_shadow_evaluation_row).transpose()
 }
 
 fn decode_shadow_evaluation_row(
@@ -573,6 +625,22 @@ mod tests {
     fn list_query_orders_shadow_evaluations_deterministically() {
         assert!(
             LIST_SHADOW_EVALUATIONS_BY_CANDIDATE_SQL
+                .contains("ORDER BY started_at_utc DESC, evaluation_id ASC")
+        );
+    }
+
+    #[test]
+    fn latest_query_filters_by_candidate_and_validation_run() {
+        assert!(
+            LOAD_LATEST_SHADOW_EVALUATION_BY_CANDIDATE_AND_RUN_SQL
+                .contains("lower(trim(candidate_id)) = lower(trim($1))")
+        );
+        assert!(
+            LOAD_LATEST_SHADOW_EVALUATION_BY_CANDIDATE_AND_RUN_SQL
+                .contains("lower(trim(validation_run_id)) = lower(trim($2))")
+        );
+        assert!(
+            LOAD_LATEST_SHADOW_EVALUATION_BY_CANDIDATE_AND_RUN_SQL
                 .contains("ORDER BY started_at_utc DESC, evaluation_id ASC")
         );
     }

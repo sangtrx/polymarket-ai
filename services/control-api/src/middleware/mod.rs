@@ -24,6 +24,9 @@ use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportS
 use reporting_service::exports::workflows::{
     ReportExportOrchestrator, ReportExportWorkflowService,
 };
+use research_gateway::promotion::counterfactual_replay::{
+    CounterfactualReplayOrchestrator, CounterfactualReplayService,
+};
 use research_gateway::promotion::decisions::{
     PromotionDecisionOrchestrator, PromotionDecisionService,
 };
@@ -245,6 +248,7 @@ pub struct ControlApiState {
     pub research_validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
     pub research_validation_workflow_orchestrator: Arc<dyn ValidationWorkflowRunOrchestrator>,
     pub research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
+    pub research_counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
     pub research_promotion_decision_orchestrator: Arc<dyn PromotionDecisionOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
@@ -362,6 +366,9 @@ impl ControlApiState {
                 ValidationWorkflowRunService::default(),
             ),
             research_shadow_mode_orchestrator: Arc::new(ShadowModeService::default()),
+            research_counterfactual_replay_orchestrator: Arc::new(
+                CounterfactualReplayService::default(),
+            ),
             research_promotion_decision_orchestrator: Arc::new(PromotionDecisionService::default()),
             recovery_orchestrator,
             attribution_pool: None,
@@ -428,6 +435,16 @@ impl ControlApiState {
         research_shadow_mode_orchestrator: Arc<dyn ShadowModeOrchestrator>,
     ) -> Self {
         self.research_shadow_mode_orchestrator = research_shadow_mode_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_research_counterfactual_replay_orchestrator(
+        mut self,
+        research_counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
+    ) -> Self {
+        self.research_counterfactual_replay_orchestrator =
+            research_counterfactual_replay_orchestrator;
         self
     }
 

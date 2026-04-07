@@ -9,7 +9,7 @@ This runbook covers governed alpha lifecycle decisions (`promote`, `pause`, `ret
   - Story 6.3 validation run + artifact evidence.
   - Story 6.4 shadow-readiness context (read-only consumption only).
 - Schema scope in Story 6.5 is limited to `promotion_decisions`.
-- Out of scope: Story 6.6 replay execution, Story 6.7 live-health monitors, Story 6.8 governance-card UX, Story 6.9 automatic deallocation.
+- Out of scope for Story 6.5 implementation: Story 6.7 live-health monitors, Story 6.8 governance-card UX, Story 6.9 automatic deallocation. (Story 6.6 replay execution is now covered in `alpha-counterfactual-replay-stress-gating.md`.)
 
 ## Control-plane routes
 
@@ -97,5 +97,6 @@ Unauthorized security-signal names:
 1. Validation gate policies (Story 6.2): `docs/operations/alpha-validation-gate-policies.md`
 2. Validation workflow and diagnostics (Story 6.3): `docs/operations/alpha-validation-workflow-and-diagnostics.md`
 3. Shadow-mode evaluation (Story 6.4): `docs/operations/alpha-shadow-mode-evaluation.md`
-4. Governance approval workflow implementation: `services/governance-service/src/approvals/mod.rs`
-5. Role model and privileged controls: `docs/governance/rbac-role-model.md`
+4. Counterfactual replay stress gating (Story 6.6): `docs/operations/alpha-counterfactual-replay-stress-gating.md`
+5. Governance approval workflow implementation: `services/governance-service/src/approvals/mod.rs`
+6. Role model and privileged controls: `docs/governance/rbac-role-model.md`

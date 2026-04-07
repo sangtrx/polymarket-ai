@@ -1519,6 +1519,907 @@ pub const FR45_REQUIRED_PROMOTION_PACKET_FIELDS: [&str; 4] = [
     "counterfactual_replay_summary",
 ];
 
+pub const FR46_STRESSED_SLIPPAGE_MULTIPLIER: f64 = 2.0;
+pub const FR46_STRESSED_FILL_RATE_MULTIPLIER: f64 = 0.5;
+pub const FR46_DELAYED_EXIT_SECONDS: i64 = 60;
+pub const FR46_DEGRADATION_DENY_THRESHOLD_PCT: f64 = -5.0;
+pub const FR46_REQUIRED_COUNTERFACTUAL_SCENARIOS: [CounterfactualReplayScenarioKind; 3] = [
+    CounterfactualReplayScenarioKind::Baseline,
+    CounterfactualReplayScenarioKind::StressedExecution,
+    CounterfactualReplayScenarioKind::DelayedExit,
+];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterfactualReplayScenarioKind {
+    Baseline,
+    StressedExecution,
+    DelayedExit,
+}
+
+impl CounterfactualReplayScenarioKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::StressedExecution => "stressed_execution",
+            Self::DelayedExit => "delayed_exit",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CounterfactualReplayContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "baseline" => Ok(Self::Baseline),
+            "stressed_execution" => Ok(Self::StressedExecution),
+            "delayed_exit" => Ok(Self::DelayedExit),
+            _ => Err(CounterfactualReplayContractError::invalid_payload(format!(
+                "unknown counterfactual replay scenario `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterfactualReplayGateOutcome {
+    Allow,
+    Deny,
+    Unavailable,
+}
+
+impl CounterfactualReplayGateOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CounterfactualReplayContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            "unavailable" => Ok(Self::Unavailable),
+            _ => Err(CounterfactualReplayContractError::invalid_payload(format!(
+                "unknown counterfactual replay gate outcome `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterfactualReplayRunState {
+    Running,
+    Completed,
+    Denied,
+    Failed,
+}
+
+impl CounterfactualReplayRunState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Denied => "denied",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CounterfactualReplayContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "denied" => Ok(Self::Denied),
+            "failed" => Ok(Self::Failed),
+            _ => Err(CounterfactualReplayContractError::invalid_payload(format!(
+                "unknown counterfactual replay run state `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterfactualReplayReasonCode {
+    RunStarted,
+    RunCompleted,
+    RunRead,
+    RunListed,
+    InvalidPayload,
+    UnauthorizedRole,
+    RunNotFound,
+    ScenarioIncomplete,
+    ToleranceSatisfied,
+    ToleranceBreached,
+    BaselineUnavailable,
+    PlaceholderRejected,
+    DependencyUnavailable,
+    StateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl CounterfactualReplayReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RunStarted => "counterfactual_replay_run_started",
+            Self::RunCompleted => "counterfactual_replay_run_completed",
+            Self::RunRead => "counterfactual_replay_run_read",
+            Self::RunListed => "counterfactual_replay_run_listed",
+            Self::InvalidPayload => "counterfactual_replay_invalid_payload",
+            Self::UnauthorizedRole => "counterfactual_replay_unauthorized_role",
+            Self::RunNotFound => "counterfactual_replay_run_not_found",
+            Self::ScenarioIncomplete => "counterfactual_replay_scenario_incomplete",
+            Self::ToleranceSatisfied => "counterfactual_replay_tolerance_satisfied",
+            Self::ToleranceBreached => "counterfactual_replay_tolerance_breached",
+            Self::BaselineUnavailable => "counterfactual_replay_baseline_unavailable",
+            Self::PlaceholderRejected => "counterfactual_replay_placeholder_rejected",
+            Self::DependencyUnavailable => "counterfactual_replay_dependency_unavailable",
+            Self::StateUnavailable => "counterfactual_replay_state_unavailable",
+            Self::PersistenceUnavailable => "counterfactual_replay_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CounterfactualReplayContractError> {
+        match value {
+            "counterfactual_replay_run_started" => Ok(Self::RunStarted),
+            "counterfactual_replay_run_completed" => Ok(Self::RunCompleted),
+            "counterfactual_replay_run_read" => Ok(Self::RunRead),
+            "counterfactual_replay_run_listed" => Ok(Self::RunListed),
+            "counterfactual_replay_invalid_payload" => Ok(Self::InvalidPayload),
+            "counterfactual_replay_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "counterfactual_replay_run_not_found" => Ok(Self::RunNotFound),
+            "counterfactual_replay_scenario_incomplete" => Ok(Self::ScenarioIncomplete),
+            "counterfactual_replay_tolerance_satisfied" => Ok(Self::ToleranceSatisfied),
+            "counterfactual_replay_tolerance_breached" => Ok(Self::ToleranceBreached),
+            "counterfactual_replay_baseline_unavailable" => Ok(Self::BaselineUnavailable),
+            "counterfactual_replay_placeholder_rejected" => Ok(Self::PlaceholderRejected),
+            "counterfactual_replay_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "counterfactual_replay_state_unavailable" => Ok(Self::StateUnavailable),
+            "counterfactual_replay_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(CounterfactualReplayContractError::invalid_payload(format!(
+                "unknown counterfactual replay reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CounterfactualReplayValidationIssue {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CounterfactualReplayContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<CounterfactualReplayValidationIssue>,
+}
+
+impl CounterfactualReplayContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<CounterfactualReplayValidationIssue>,
+    ) -> Self {
+        Self {
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CounterfactualReplayScenarioParameters {
+    pub slippage_multiplier: f64,
+    pub fill_rate_multiplier: f64,
+    pub exit_delay_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CounterfactualReplayScenarioResult {
+    pub scenario: CounterfactualReplayScenarioKind,
+    pub net_pnl: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_pct: Option<f64>,
+    pub gate_outcome: CounterfactualReplayGateOutcome,
+    pub reason_code: String,
+    pub parameters: CounterfactualReplayScenarioParameters,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CounterfactualReplaySummary {
+    pub run_id: String,
+    pub gate_outcome: CounterfactualReplayGateOutcome,
+    pub reason_code: String,
+    pub baseline_net_pnl: f64,
+    pub stressed_net_pnl: f64,
+    pub delayed_exit_net_pnl: f64,
+    pub degradation_pct: f64,
+    pub tolerance_threshold_pct: f64,
+    pub scenarios: Vec<CounterfactualReplayScenarioResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CounterfactualReplayRunRecord {
+    pub run_id: String,
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub run_state: CounterfactualReplayRunState,
+    pub reason_code: String,
+    pub scenario_results: Vec<CounterfactualReplayScenarioResult>,
+    pub replay_summary: CounterfactualReplaySummary,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub started_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CounterfactualReplayGateEvaluation {
+    pub degradation_pct: f64,
+    pub gate_outcome: CounterfactualReplayGateOutcome,
+    pub reason_code: String,
+}
+
+pub fn fr46_scenario_parameters(
+    scenario: CounterfactualReplayScenarioKind,
+) -> CounterfactualReplayScenarioParameters {
+    match scenario {
+        CounterfactualReplayScenarioKind::Baseline => CounterfactualReplayScenarioParameters {
+            slippage_multiplier: 1.0,
+            fill_rate_multiplier: 1.0,
+            exit_delay_seconds: 0,
+        },
+        CounterfactualReplayScenarioKind::StressedExecution => {
+            CounterfactualReplayScenarioParameters {
+                slippage_multiplier: FR46_STRESSED_SLIPPAGE_MULTIPLIER,
+                fill_rate_multiplier: FR46_STRESSED_FILL_RATE_MULTIPLIER,
+                exit_delay_seconds: 0,
+            }
+        }
+        CounterfactualReplayScenarioKind::DelayedExit => CounterfactualReplayScenarioParameters {
+            slippage_multiplier: 1.0,
+            fill_rate_multiplier: 1.0,
+            exit_delay_seconds: FR46_DELAYED_EXIT_SECONDS,
+        },
+    }
+}
+
+pub fn parse_counterfactual_replay_utc_timestamp(
+    value: &str,
+) -> Result<OffsetDateTime, CounterfactualReplayContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        CounterfactualReplayContractError::invalid_payload(format!(
+            "timestamp `{value}` must be RFC3339 UTC"
+        ))
+    })?;
+    if parsed.offset() != UtcOffset::UTC {
+        return Err(CounterfactualReplayContractError::invalid_payload(
+            "timestamps must use UTC `Z` offset",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn compose_counterfactual_replay_run_id(
+    candidate_id: &str,
+    started_at_utc: &str,
+) -> Result<String, CounterfactualReplayContractError> {
+    let normalized_candidate_id = normalize_research_identifier(candidate_id);
+    if normalized_candidate_id.is_empty() {
+        return Err(
+            CounterfactualReplayContractError::invalid_payload_with_issues(
+                "candidate_id cannot be blank",
+                vec![CounterfactualReplayValidationIssue {
+                    field: "candidate_id".to_string(),
+                    code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                    message: "candidate_id cannot be blank".to_string(),
+                }],
+            ),
+        );
+    }
+    let started_at = parse_counterfactual_replay_utc_timestamp(started_at_utc)?;
+    Ok(format!(
+        "{}::{}",
+        normalized_candidate_id,
+        started_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn evaluate_counterfactual_replay_gate(
+    baseline_net_pnl: f64,
+    stressed_net_pnl: f64,
+) -> Result<CounterfactualReplayGateEvaluation, CounterfactualReplayContractError> {
+    let mut field_errors = Vec::new();
+    if !baseline_net_pnl.is_finite() || baseline_net_pnl <= 0.0 {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "baseline_net_pnl".to_string(),
+            code: CounterfactualReplayReasonCode::BaselineUnavailable.code(),
+            message: "baseline_net_pnl must be finite and > 0".to_string(),
+        });
+    }
+    if !stressed_net_pnl.is_finite() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "stressed_net_pnl".to_string(),
+            code: CounterfactualReplayReasonCode::StateUnavailable.code(),
+            message: "stressed_net_pnl must be finite".to_string(),
+        });
+    }
+    if !field_errors.is_empty() {
+        return Err(
+            CounterfactualReplayContractError::invalid_payload_with_issues(
+                "counterfactual replay gate evaluation failed",
+                field_errors,
+            ),
+        );
+    }
+
+    let raw_degradation_pct = ((stressed_net_pnl - baseline_net_pnl) / baseline_net_pnl) * 100.0;
+    // Normalize to avoid boundary flips from sub-nanopoint floating-point noise.
+    let degradation_pct = (raw_degradation_pct * 1_000_000_000.0).round() / 1_000_000_000.0;
+    let (gate_outcome, reason_code) = if degradation_pct < FR46_DEGRADATION_DENY_THRESHOLD_PCT {
+        (
+            CounterfactualReplayGateOutcome::Deny,
+            CounterfactualReplayReasonCode::ToleranceBreached
+                .code()
+                .to_string(),
+        )
+    } else {
+        (
+            CounterfactualReplayGateOutcome::Allow,
+            CounterfactualReplayReasonCode::ToleranceSatisfied
+                .code()
+                .to_string(),
+        )
+    };
+
+    Ok(CounterfactualReplayGateEvaluation {
+        degradation_pct,
+        gate_outcome,
+        reason_code,
+    })
+}
+
+pub fn validate_counterfactual_replay_summary(
+    summary: &CounterfactualReplaySummary,
+) -> Result<(), CounterfactualReplayContractError> {
+    let mut field_errors = Vec::new();
+    if normalize_research_identifier(&summary.run_id).is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "run_id".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "run_id is required".to_string(),
+        });
+    }
+    if CounterfactualReplayReasonCode::parse(&summary.reason_code).is_err() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "reason_code".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "reason_code is not recognized".to_string(),
+        });
+    }
+    if !summary.delayed_exit_net_pnl.is_finite() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "delayed_exit_net_pnl".to_string(),
+            code: CounterfactualReplayReasonCode::StateUnavailable.code(),
+            message: "delayed_exit_net_pnl must be finite".to_string(),
+        });
+    }
+    if !summary.tolerance_threshold_pct.is_finite() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "tolerance_threshold_pct".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "tolerance_threshold_pct must be finite".to_string(),
+        });
+    }
+    if (summary.tolerance_threshold_pct - FR46_DEGRADATION_DENY_THRESHOLD_PCT).abs() > f64::EPSILON
+    {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "tolerance_threshold_pct".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: format!(
+                "tolerance_threshold_pct must equal {FR46_DEGRADATION_DENY_THRESHOLD_PCT}"
+            ),
+        });
+    }
+
+    let gate_evaluation =
+        evaluate_counterfactual_replay_gate(summary.baseline_net_pnl, summary.stressed_net_pnl)?;
+    if (gate_evaluation.degradation_pct - summary.degradation_pct).abs() > 1e-9 {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "degradation_pct".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "degradation_pct does not match FR46 formula".to_string(),
+        });
+    }
+    if gate_evaluation.gate_outcome != summary.gate_outcome {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "gate_outcome".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "gate_outcome does not match FR46 tolerance evaluation".to_string(),
+        });
+    }
+    if normalize_research_identifier(&gate_evaluation.reason_code)
+        != normalize_research_identifier(&summary.reason_code)
+    {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "reason_code".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "reason_code does not match FR46 tolerance evaluation".to_string(),
+        });
+    }
+
+    let mut scenario_kinds = summary
+        .scenarios
+        .iter()
+        .map(|scenario| scenario.scenario)
+        .collect::<Vec<_>>();
+    scenario_kinds.sort();
+    scenario_kinds.dedup();
+    for required in FR46_REQUIRED_COUNTERFACTUAL_SCENARIOS {
+        if !scenario_kinds.contains(&required) {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "scenarios".to_string(),
+                code: CounterfactualReplayReasonCode::ScenarioIncomplete.code(),
+                message: format!("missing required scenario `{}`", required.as_str()),
+            });
+        }
+        let duplicate_count = summary
+            .scenarios
+            .iter()
+            .filter(|scenario| scenario.scenario == required)
+            .count();
+        if duplicate_count > 1 {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "scenarios".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: format!(
+                    "scenario `{}` must appear exactly once",
+                    required.as_str()
+                ),
+            });
+        }
+    }
+    if summary.scenarios.len() != FR46_REQUIRED_COUNTERFACTUAL_SCENARIOS.len() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "scenarios".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: format!(
+                "scenarios must contain exactly {} entries",
+                FR46_REQUIRED_COUNTERFACTUAL_SCENARIOS.len()
+            ),
+        });
+    }
+
+    if let Some(baseline_scenario) = summary
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.scenario == CounterfactualReplayScenarioKind::Baseline)
+    {
+        if (baseline_scenario.net_pnl - summary.baseline_net_pnl).abs() > 1e-9 {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "baseline_net_pnl".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "baseline_net_pnl must match baseline scenario net_pnl".to_string(),
+            });
+        }
+    }
+    if let Some(stressed_scenario) = summary
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.scenario == CounterfactualReplayScenarioKind::StressedExecution)
+    {
+        if (stressed_scenario.net_pnl - summary.stressed_net_pnl).abs() > 1e-9 {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "stressed_net_pnl".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "stressed_net_pnl must match stressed_execution scenario net_pnl"
+                    .to_string(),
+            });
+        }
+        if stressed_scenario.gate_outcome != summary.gate_outcome {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "scenarios.stressed_execution.gate_outcome".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "stressed_execution scenario gate_outcome must match summary gate_outcome"
+                    .to_string(),
+            });
+        }
+        if normalize_research_identifier(&stressed_scenario.reason_code)
+            != normalize_research_identifier(&summary.reason_code)
+        {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "scenarios.stressed_execution.reason_code".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "stressed_execution scenario reason_code must match summary reason_code"
+                    .to_string(),
+            });
+        }
+    }
+    if let Some(delayed_exit_scenario) = summary
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.scenario == CounterfactualReplayScenarioKind::DelayedExit)
+    {
+        if (delayed_exit_scenario.net_pnl - summary.delayed_exit_net_pnl).abs() > 1e-9 {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "delayed_exit_net_pnl".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "delayed_exit_net_pnl must match delayed_exit scenario net_pnl"
+                    .to_string(),
+            });
+        }
+    }
+
+    for (index, scenario) in summary.scenarios.iter().enumerate() {
+        let expected_parameters = fr46_scenario_parameters(scenario.scenario);
+        if !scenario.net_pnl.is_finite() {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].net_pnl"),
+                code: CounterfactualReplayReasonCode::StateUnavailable.code(),
+                message: "net_pnl must be finite".to_string(),
+            });
+        }
+        if let Some(degradation_pct) = scenario.degradation_pct
+            && !degradation_pct.is_finite()
+        {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].degradation_pct"),
+                code: CounterfactualReplayReasonCode::StateUnavailable.code(),
+                message: "degradation_pct must be finite when present".to_string(),
+            });
+        }
+        if CounterfactualReplayReasonCode::parse(&scenario.reason_code).is_err() {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].reason_code"),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "reason_code is not recognized".to_string(),
+            });
+        }
+        if !scenario.parameters.slippage_multiplier.is_finite()
+            || scenario.parameters.slippage_multiplier <= 0.0
+        {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].parameters.slippage_multiplier"),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "slippage_multiplier must be finite and > 0".to_string(),
+            });
+        } else if (scenario.parameters.slippage_multiplier
+            - expected_parameters.slippage_multiplier)
+            .abs()
+            > f64::EPSILON
+        {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].parameters.slippage_multiplier"),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: format!(
+                    "slippage_multiplier must equal {} for `{}`",
+                    expected_parameters.slippage_multiplier,
+                    scenario.scenario.as_str()
+                ),
+            });
+        }
+        if !scenario.parameters.fill_rate_multiplier.is_finite()
+            || scenario.parameters.fill_rate_multiplier <= 0.0
+            || scenario.parameters.fill_rate_multiplier > 1.0
+        {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].parameters.fill_rate_multiplier"),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "fill_rate_multiplier must be finite and in (0, 1]".to_string(),
+            });
+        } else if (scenario.parameters.fill_rate_multiplier
+            - expected_parameters.fill_rate_multiplier)
+            .abs()
+            > f64::EPSILON
+        {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].parameters.fill_rate_multiplier"),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: format!(
+                    "fill_rate_multiplier must equal {} for `{}`",
+                    expected_parameters.fill_rate_multiplier,
+                    scenario.scenario.as_str()
+                ),
+            });
+        }
+        if scenario.parameters.exit_delay_seconds < 0 {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].parameters.exit_delay_seconds"),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "exit_delay_seconds cannot be negative".to_string(),
+            });
+        } else if scenario.parameters.exit_delay_seconds != expected_parameters.exit_delay_seconds {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: format!("scenarios[{index}].parameters.exit_delay_seconds"),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: format!(
+                    "exit_delay_seconds must equal {} for `{}`",
+                    expected_parameters.exit_delay_seconds,
+                    scenario.scenario.as_str()
+                ),
+            });
+        }
+    }
+
+    if !field_errors.is_empty() {
+        return Err(
+            CounterfactualReplayContractError::invalid_payload_with_issues(
+                "counterfactual replay summary failed validation",
+                field_errors,
+            ),
+        );
+    }
+    Ok(())
+}
+
+pub fn canonicalize_counterfactual_replay_run_record(
+    record: &CounterfactualReplayRunRecord,
+) -> Result<CounterfactualReplayRunRecord, CounterfactualReplayContractError> {
+    let mut canonical = CounterfactualReplayRunRecord {
+        run_id: normalize_research_identifier(&record.run_id),
+        candidate_id: normalize_research_identifier(&record.candidate_id),
+        validation_run_id: normalize_research_identifier(&record.validation_run_id),
+        run_state: record.run_state,
+        reason_code: normalize_research_identifier(&record.reason_code),
+        scenario_results: record.scenario_results.clone(),
+        replay_summary: record.replay_summary.clone(),
+        actor_id: record.actor_id.trim().to_string(),
+        correlation_id: record.correlation_id.trim().to_string(),
+        started_at_utc: record.started_at_utc.trim().to_string(),
+        completed_at_utc: record
+            .completed_at_utc
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    canonical.scenario_results.iter_mut().for_each(|scenario| {
+        scenario.reason_code = normalize_research_identifier(&scenario.reason_code);
+    });
+    canonical
+        .scenario_results
+        .sort_by(|left, right| left.scenario.cmp(&right.scenario));
+    canonical.replay_summary.run_id =
+        normalize_research_identifier(&canonical.replay_summary.run_id);
+    canonical.replay_summary.reason_code =
+        normalize_research_identifier(&canonical.replay_summary.reason_code);
+    canonical
+        .replay_summary
+        .scenarios
+        .iter_mut()
+        .for_each(|scenario| {
+            scenario.reason_code = normalize_research_identifier(&scenario.reason_code);
+        });
+    canonical
+        .replay_summary
+        .scenarios
+        .sort_by(|left, right| left.scenario.cmp(&right.scenario));
+
+    validate_counterfactual_replay_run_record(&canonical)?;
+    Ok(canonical)
+}
+
+pub fn validate_counterfactual_replay_run_record(
+    record: &CounterfactualReplayRunRecord,
+) -> Result<(), CounterfactualReplayContractError> {
+    let mut field_errors = Vec::new();
+    if record.run_id.trim().is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "run_id".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "run_id is required".to_string(),
+        });
+    }
+    if record.candidate_id.trim().is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "candidate_id".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "candidate_id is required".to_string(),
+        });
+    }
+    if record.validation_run_id.trim().is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "validation_run_id".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "validation_run_id is required".to_string(),
+        });
+    }
+    if record.reason_code.trim().is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "reason_code".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "reason_code is required".to_string(),
+        });
+    } else if CounterfactualReplayReasonCode::parse(&record.reason_code).is_err() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "reason_code".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "reason_code is not recognized".to_string(),
+        });
+    }
+    if record.actor_id.trim().is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "actor_id".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "actor_id is required".to_string(),
+        });
+    }
+    if record.correlation_id.trim().is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "correlation_id".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "correlation_id is required".to_string(),
+        });
+    }
+    if parse_counterfactual_replay_utc_timestamp(&record.started_at_utc).is_err() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "started_at_utc".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "started_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    if let Some(completed_at_utc) = record.completed_at_utc.as_deref() {
+        if parse_counterfactual_replay_utc_timestamp(completed_at_utc).is_err() {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "completed_at_utc".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "completed_at_utc must be RFC3339 UTC".to_string(),
+            });
+        } else if let (Ok(started), Ok(completed)) = (
+            parse_counterfactual_replay_utc_timestamp(&record.started_at_utc),
+            parse_counterfactual_replay_utc_timestamp(completed_at_utc),
+        ) && completed < started
+        {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "completed_at_utc".to_string(),
+                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                message: "completed_at_utc must be >= started_at_utc".to_string(),
+            });
+        }
+    }
+    if record.scenario_results.is_empty() {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "scenario_results".to_string(),
+            code: CounterfactualReplayReasonCode::ScenarioIncomplete.code(),
+            message: "scenario_results must contain required FR46 scenarios".to_string(),
+        });
+    }
+
+    if let Err(error) = validate_counterfactual_replay_summary(&record.replay_summary) {
+        field_errors.extend(error.field_errors);
+    }
+
+    let mut scenario_kinds = record
+        .scenario_results
+        .iter()
+        .map(|scenario| scenario.scenario)
+        .collect::<Vec<_>>();
+    scenario_kinds.sort();
+    scenario_kinds.dedup();
+    for required in FR46_REQUIRED_COUNTERFACTUAL_SCENARIOS {
+        if !scenario_kinds.contains(&required) {
+            field_errors.push(CounterfactualReplayValidationIssue {
+                field: "scenario_results".to_string(),
+                code: CounterfactualReplayReasonCode::ScenarioIncomplete.code(),
+                message: format!("scenario_results missing `{}`", required.as_str()),
+            });
+        }
+    }
+
+    if normalize_research_identifier(&record.replay_summary.run_id)
+        != normalize_research_identifier(&record.run_id)
+    {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "replay_summary.run_id".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "replay_summary.run_id must match run_id".to_string(),
+        });
+    }
+    if record.run_state == CounterfactualReplayRunState::Denied
+        && record.replay_summary.gate_outcome != CounterfactualReplayGateOutcome::Deny
+    {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "run_state".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "denied run_state requires deny gate_outcome".to_string(),
+        });
+    }
+    if record.run_state == CounterfactualReplayRunState::Completed
+        && record.replay_summary.gate_outcome == CounterfactualReplayGateOutcome::Deny
+    {
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "run_state".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "completed run_state cannot carry deny gate_outcome".to_string(),
+        });
+    }
+
+    if !field_errors.is_empty() {
+        return Err(
+            CounterfactualReplayContractError::invalid_payload_with_issues(
+                "counterfactual replay run payload failed validation",
+                field_errors,
+            ),
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_counterfactual_replay_summary_for_allow_path(
+    summary: &Value,
+) -> Result<(), PromotionDecisionContractError> {
+    if summary
+        .as_object()
+        .and_then(|map| map.get("status"))
+        .and_then(Value::as_str)
+        .map(normalize_research_identifier)
+        .as_deref()
+        == Some("deferred_to_story_6_6")
+    {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "counterfactual replay summary placeholder is not allowed for promote allow decisions",
+            vec![PromotionDecisionValidationIssue {
+                field: "counterfactual_replay_summary.status".to_string(),
+                code: CounterfactualReplayReasonCode::PlaceholderRejected.code(),
+                message: "counterfactual_replay_summary.status cannot be `deferred_to_story_6_6`"
+                    .to_string(),
+            }],
+        ));
+    }
+    let parsed =
+        serde_json::from_value::<CounterfactualReplaySummary>(summary.clone()).map_err(|_| {
+            PromotionDecisionContractError::invalid_payload_with_issues(
+                "counterfactual_replay_summary must be canonical replay summary payload",
+                vec![PromotionDecisionValidationIssue {
+                    field: "counterfactual_replay_summary".to_string(),
+                    code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                    message:
+                        "counterfactual_replay_summary must be structured replay summary object"
+                            .to_string(),
+                }],
+            )
+        })?;
+
+    if let Err(error) = validate_counterfactual_replay_summary(&parsed) {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            error.message,
+            error
+                .field_errors
+                .into_iter()
+                .map(|issue| PromotionDecisionValidationIssue {
+                    field: format!("counterfactual_replay_summary.{}", issue.field),
+                    code: issue.code,
+                    message: issue.message,
+                })
+                .collect(),
+        ));
+    }
+
+    if parsed.gate_outcome != CounterfactualReplayGateOutcome::Allow {
+        return Err(PromotionDecisionContractError::invalid_payload_with_issues(
+            "counterfactual replay gate outcome must allow before promotion allow-path decisions",
+            vec![PromotionDecisionValidationIssue {
+                field: "counterfactual_replay_summary.gate_outcome".to_string(),
+                code: PromotionDecisionReasonCode::ReplayGateDenied.code(),
+                message: "counterfactual replay gate outcome must be `allow`".to_string(),
+            }],
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionLifecycleAction {
@@ -1596,6 +2497,7 @@ pub enum PromotionDecisionReasonCode {
     MissingEvidence,
     ThresholdFailed,
     GateDenied,
+    ReplayGateDenied,
     ApprovalRequired,
     ApprovalInvalidState,
     DependencyUnavailable,
@@ -1618,6 +2520,7 @@ impl PromotionDecisionReasonCode {
             Self::MissingEvidence => "promotion_decision_missing_evidence",
             Self::ThresholdFailed => "promotion_decision_threshold_failed",
             Self::GateDenied => "promotion_decision_gate_denied",
+            Self::ReplayGateDenied => "promotion_decision_replay_gate_denied",
             Self::ApprovalRequired => "promotion_decision_approval_required",
             Self::ApprovalInvalidState => "promotion_decision_approval_invalid_state",
             Self::DependencyUnavailable => "promotion_decision_dependency_unavailable",
@@ -1640,6 +2543,7 @@ impl PromotionDecisionReasonCode {
             "promotion_decision_missing_evidence" => Ok(Self::MissingEvidence),
             "promotion_decision_threshold_failed" => Ok(Self::ThresholdFailed),
             "promotion_decision_gate_denied" => Ok(Self::GateDenied),
+            "promotion_decision_replay_gate_denied" => Ok(Self::ReplayGateDenied),
             "promotion_decision_approval_required" => Ok(Self::ApprovalRequired),
             "promotion_decision_approval_invalid_state" => Ok(Self::ApprovalInvalidState),
             "promotion_decision_dependency_unavailable" => Ok(Self::DependencyUnavailable),
@@ -2113,6 +3017,17 @@ pub fn validate_promotion_decision_record(
             }
             Err(error) => field_errors.extend(error.field_errors),
         }
+    }
+
+    if record.lifecycle_action == PromotionLifecycleAction::Promote
+        && record.decision_state == PromotionDecisionState::Allowed
+        && let Some(summary) = record
+            .evidence_packet
+            .as_object()
+            .and_then(|map| map.get("counterfactual_replay_summary"))
+        && let Err(error) = validate_counterfactual_replay_summary_for_allow_path(summary)
+    {
+        field_errors.extend(error.field_errors);
     }
 
     if record.decision_state == PromotionDecisionState::Allowed
@@ -2806,6 +3721,220 @@ mod tests {
         );
     }
 
+    fn sample_counterfactual_replay_summary() -> CounterfactualReplaySummary {
+        CounterfactualReplaySummary {
+            run_id: "candidate::alpha-1::1712449000".to_string(),
+            gate_outcome: CounterfactualReplayGateOutcome::Allow,
+            reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                .code()
+                .to_string(),
+            baseline_net_pnl: 100.0,
+            stressed_net_pnl: 95.0,
+            delayed_exit_net_pnl: 97.5,
+            degradation_pct: -5.0,
+            tolerance_threshold_pct: FR46_DEGRADATION_DENY_THRESHOLD_PCT,
+            scenarios: vec![
+                CounterfactualReplayScenarioResult {
+                    scenario: CounterfactualReplayScenarioKind::Baseline,
+                    net_pnl: 100.0,
+                    degradation_pct: Some(0.0),
+                    gate_outcome: CounterfactualReplayGateOutcome::Allow,
+                    reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                        .code()
+                        .to_string(),
+                    parameters: fr46_scenario_parameters(
+                        CounterfactualReplayScenarioKind::Baseline,
+                    ),
+                },
+                CounterfactualReplayScenarioResult {
+                    scenario: CounterfactualReplayScenarioKind::StressedExecution,
+                    net_pnl: 95.0,
+                    degradation_pct: Some(-5.0),
+                    gate_outcome: CounterfactualReplayGateOutcome::Allow,
+                    reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                        .code()
+                        .to_string(),
+                    parameters: fr46_scenario_parameters(
+                        CounterfactualReplayScenarioKind::StressedExecution,
+                    ),
+                },
+                CounterfactualReplayScenarioResult {
+                    scenario: CounterfactualReplayScenarioKind::DelayedExit,
+                    net_pnl: 97.5,
+                    degradation_pct: Some(-2.5),
+                    gate_outcome: CounterfactualReplayGateOutcome::Allow,
+                    reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                        .code()
+                        .to_string(),
+                    parameters: fr46_scenario_parameters(
+                        CounterfactualReplayScenarioKind::DelayedExit,
+                    ),
+                },
+            ],
+        }
+    }
+
+    fn sample_counterfactual_replay_run_record() -> CounterfactualReplayRunRecord {
+        let summary = sample_counterfactual_replay_summary();
+        CounterfactualReplayRunRecord {
+            run_id: summary.run_id.clone(),
+            candidate_id: "candidate::alpha-1".to_string(),
+            validation_run_id: "candidate::alpha-1::1712447000".to_string(),
+            run_state: CounterfactualReplayRunState::Completed,
+            reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                .code()
+                .to_string(),
+            scenario_results: summary.scenarios.clone(),
+            replay_summary: summary,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-replay-001".to_string(),
+            started_at_utc: "2026-04-07T00:15:00Z".to_string(),
+            completed_at_utc: Some("2026-04-07T00:16:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn counterfactual_replay_gate_enforces_fr46_boundary_deterministically() {
+        let boundary = evaluate_counterfactual_replay_gate(100.0, 95.0)
+            .expect("boundary stress gate should evaluate");
+        assert_eq!(boundary.degradation_pct, -5.0);
+        assert_eq!(
+            boundary.gate_outcome,
+            CounterfactualReplayGateOutcome::Allow
+        );
+
+        let deny = evaluate_counterfactual_replay_gate(100.0, 94.99)
+            .expect("below-boundary stress gate should evaluate");
+        assert!(deny.degradation_pct < -5.0);
+        assert_eq!(deny.gate_outcome, CounterfactualReplayGateOutcome::Deny);
+        assert_eq!(
+            deny.reason_code,
+            CounterfactualReplayReasonCode::ToleranceBreached.code()
+        );
+
+        let epsilon_below_boundary = evaluate_counterfactual_replay_gate(100.0, 94.9999999)
+            .expect("any value below -5.0 should deny");
+        assert!(
+            epsilon_below_boundary.degradation_pct < -5.0,
+            "degradation should remain below boundary"
+        );
+        assert_eq!(
+            epsilon_below_boundary.gate_outcome,
+            CounterfactualReplayGateOutcome::Deny
+        );
+    }
+
+    #[test]
+    fn counterfactual_replay_gate_rejects_invalid_baseline_denominator() {
+        let error = evaluate_counterfactual_replay_gate(0.0, 100.0)
+            .expect_err("baseline <= 0 must fail closed");
+        assert_eq!(
+            error.code,
+            CounterfactualReplayReasonCode::InvalidPayload.code()
+        );
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "baseline_net_pnl"
+                && issue.code == CounterfactualReplayReasonCode::BaselineUnavailable.code()
+        }));
+    }
+
+    #[test]
+    fn counterfactual_replay_summary_validation_requires_all_required_scenarios() {
+        let mut summary = sample_counterfactual_replay_summary();
+        summary
+            .scenarios
+            .retain(|scenario| scenario.scenario != CounterfactualReplayScenarioKind::DelayedExit);
+
+        let error = validate_counterfactual_replay_summary(&summary)
+            .expect_err("missing delayed_exit scenario must fail validation");
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "scenarios"
+                && issue.code == CounterfactualReplayReasonCode::ScenarioIncomplete.code()
+        }));
+    }
+
+    #[test]
+    fn counterfactual_replay_summary_validation_rejects_inconsistent_summary_fields() {
+        let mut summary = sample_counterfactual_replay_summary();
+        summary.reason_code = CounterfactualReplayReasonCode::ToleranceBreached
+            .code()
+            .to_string();
+        summary.scenarios.push(summary.scenarios[0].clone());
+        summary.scenarios[1].net_pnl = 94.0;
+
+        let error = validate_counterfactual_replay_summary(&summary)
+            .expect_err("duplicate scenarios and mismatched summary fields must fail validation");
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "scenarios")
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "stressed_net_pnl")
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "reason_code")
+        );
+    }
+
+    #[test]
+    fn counterfactual_replay_allow_path_rejects_deferred_placeholder_summary() {
+        let error = validate_counterfactual_replay_summary_for_allow_path(
+            &json!({ "status": "deferred_to_story_6_6" }),
+        )
+        .expect_err("deferred placeholder must be rejected for allow-path promotions");
+        assert!(error.field_errors.iter().any(|issue| {
+            issue.field == "counterfactual_replay_summary.status"
+                && issue.code == CounterfactualReplayReasonCode::PlaceholderRejected.code()
+        }));
+    }
+
+    #[test]
+    fn counterfactual_replay_run_record_canonicalization_normalizes_identifiers() {
+        let mut record = sample_counterfactual_replay_run_record();
+        record.run_id = " Candidate::Alpha-1::1712449000 ".to_string();
+        record.candidate_id = " Candidate::Alpha-1 ".to_string();
+        record.validation_run_id = " Candidate::Alpha-1::1712447000 ".to_string();
+        record.reason_code = " Counterfactual_Replay_Tolerance_Satisfied ".to_string();
+        record.replay_summary.run_id = " Candidate::Alpha-1::1712449000 ".to_string();
+        record.replay_summary.reason_code =
+            " Counterfactual_Replay_Tolerance_Satisfied ".to_string();
+        record.scenario_results.reverse();
+        record.replay_summary.scenarios.reverse();
+
+        let canonical = canonicalize_counterfactual_replay_run_record(&record)
+            .expect("canonical replay run should validate");
+        assert_eq!(canonical.run_id, "candidate::alpha-1::1712449000");
+        assert_eq!(canonical.candidate_id, "candidate::alpha-1");
+        assert_eq!(
+            canonical.validation_run_id,
+            "candidate::alpha-1::1712447000"
+        );
+        assert_eq!(
+            canonical.reason_code,
+            CounterfactualReplayReasonCode::ToleranceSatisfied.code()
+        );
+        assert_eq!(
+            canonical.replay_summary.scenarios[0].scenario,
+            CounterfactualReplayScenarioKind::Baseline
+        );
+        assert_eq!(
+            canonical.replay_summary.scenarios[1].scenario,
+            CounterfactualReplayScenarioKind::StressedExecution
+        );
+        assert_eq!(
+            canonical.replay_summary.scenarios[2].scenario,
+            CounterfactualReplayScenarioKind::DelayedExit
+        );
+    }
+
     fn sample_promotion_decision_record() -> PromotionDecisionRecord {
         PromotionDecisionRecord {
             decision_id: "candidate::alpha-1::1712448000".to_string(),
@@ -2813,7 +3942,9 @@ mod tests {
             validation_run_id: "candidate::alpha-1::1712447000".to_string(),
             lifecycle_action: PromotionLifecycleAction::Promote,
             decision_state: PromotionDecisionState::Denied,
-            reason_code: PromotionDecisionReasonCode::MissingEvidence.code().to_string(),
+            reason_code: PromotionDecisionReasonCode::MissingEvidence
+                .code()
+                .to_string(),
             observed_metrics: json!({
                 "out_of_sample_sharpe": 1.28,
                 "max_drawdown": -0.17,
@@ -2876,7 +4007,10 @@ mod tests {
 
         let error = PromotionLifecycleAction::parse("deploy")
             .expect_err("unsupported lifecycle action must fail");
-        assert_eq!(error.code, PromotionDecisionReasonCode::InvalidPayload.code());
+        assert_eq!(
+            error.code,
+            PromotionDecisionReasonCode::InvalidPayload.code()
+        );
         assert!(error.field_errors.iter().any(|issue| {
             issue.field == "lifecycle_action"
                 && issue.code == PromotionDecisionReasonCode::UnsupportedAction.code()
@@ -2953,11 +4087,9 @@ mod tests {
             ]
         );
 
-        let non_promote_missing = validate_promotion_evidence_packet(
-            PromotionLifecycleAction::Pause,
-            &json!({}),
-        )
-        .expect("pause packet should be accepted without FR45 requirements");
+        let non_promote_missing =
+            validate_promotion_evidence_packet(PromotionLifecycleAction::Pause, &json!({}))
+                .expect("pause packet should be accepted without FR45 requirements");
         assert!(non_promote_missing.is_empty());
     }
 
@@ -3014,14 +4146,19 @@ mod tests {
             PromotionDecisionReasonCode::MissingEvidence.code()
         );
         assert_eq!(canonical.threshold_results[0].metric_key, "max_drawdown");
-        assert_eq!(canonical.threshold_results[1].metric_key, "out_of_sample_sharpe");
+        assert_eq!(
+            canonical.threshold_results[1].metric_key,
+            "out_of_sample_sharpe"
+        );
     }
 
     #[test]
     fn promotion_decision_allow_validation_requires_signoff_and_no_missing_evidence() {
         let mut record = sample_promotion_decision_record();
         record.decision_state = PromotionDecisionState::Allowed;
-        record.reason_code = PromotionDecisionReasonCode::DecisionAllowed.code().to_string();
+        record.reason_code = PromotionDecisionReasonCode::DecisionAllowed
+            .code()
+            .to_string();
         record.approval_reference = None;
 
         let error = validate_promotion_decision_record(&record)

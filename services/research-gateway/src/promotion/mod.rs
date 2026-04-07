@@ -1,3 +1,4 @@
+pub mod counterfactual_replay;
 pub mod decisions;
 
 use crate::validation::gate_policies::{

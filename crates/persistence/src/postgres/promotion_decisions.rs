@@ -1,8 +1,8 @@
 use domain::research::{
     PromotionDecisionContractError, PromotionDecisionReasonCode, PromotionDecisionRecord,
     PromotionDecisionState, PromotionDecisionValidationIssue, PromotionLifecycleAction,
-    PromotionThresholdOutcome, canonicalize_promotion_decision_record, normalize_research_identifier,
-    parse_promotion_utc_timestamp,
+    PromotionThresholdOutcome, canonicalize_promotion_decision_record,
+    normalize_research_identifier, parse_promotion_utc_timestamp,
 };
 use serde_json::{Value, json};
 use sqlx::{PgExecutor, Row};
@@ -258,7 +258,8 @@ where
         ));
     }
     let normalized_candidate_id = normalize_research_identifier(candidate_id);
-    let normalized_decided_after = normalize_optional_timestamp("decided_after_utc", decided_after_utc)?;
+    let normalized_decided_after =
+        normalize_optional_timestamp("decided_after_utc", decided_after_utc)?;
     let normalized_decided_before =
         normalize_optional_timestamp("decided_before_utc", decided_before_utc)?;
 
@@ -266,7 +267,8 @@ where
         normalized_decided_after.as_deref(),
         normalized_decided_before.as_deref(),
     ) {
-        let decided_after_ts = parse_promotion_utc_timestamp(decided_after).map_err(map_contract_error)?;
+        let decided_after_ts =
+            parse_promotion_utc_timestamp(decided_after).map_err(map_contract_error)?;
         let decided_before_ts =
             parse_promotion_utc_timestamp(decided_before).map_err(map_contract_error)?;
         if decided_before_ts <= decided_after_ts {
@@ -275,7 +277,8 @@ where
                 vec![PromotionDecisionValidationIssue {
                     field: "decided_before_utc".to_string(),
                     code: PromotionDecisionReasonCode::InvalidPayload.code(),
-                    message: "decided_before_utc must be greater than decided_after_utc".to_string(),
+                    message: "decided_before_utc must be greater than decided_after_utc"
+                        .to_string(),
                 }],
             ));
         }
@@ -295,107 +298,94 @@ where
             )
         })?;
 
-    rows.into_iter().map(decode_promotion_decision_row).collect()
+    rows.into_iter()
+        .map(decode_promotion_decision_row)
+        .collect()
 }
 
 fn decode_promotion_decision_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<PromotionDecisionRecord, PromotionDecisionPersistenceError> {
-    let lifecycle_action_raw: String = row
-        .try_get("lifecycle_action")
-        .map_err(|error| PromotionDecisionPersistenceError::row_decode_failure("lifecycle_action", error))?;
-    let lifecycle_action = PromotionLifecycleAction::parse(&lifecycle_action_raw)
-        .map_err(|error| PromotionDecisionPersistenceError::row_contract_failure("lifecycle_action", error))?;
-
-    let decision_state_raw: String = row
-        .try_get("decision_state")
-        .map_err(|error| PromotionDecisionPersistenceError::row_decode_failure("decision_state", error))?;
-    let decision_state = PromotionDecisionState::parse(&decision_state_raw)
-        .map_err(|error| PromotionDecisionPersistenceError::row_contract_failure("decision_state", error))?;
-
-    let reason_code: String = row
-        .try_get("reason_code")
-        .map_err(|error| PromotionDecisionPersistenceError::row_decode_failure("reason_code", error))?;
-    PromotionDecisionReasonCode::parse(&reason_code)
-        .map_err(|error| PromotionDecisionPersistenceError::row_contract_failure("reason_code", error))?;
-
-    let threshold_results_json: Value = row
-        .try_get("threshold_results_json")
-        .map_err(|error| {
-            PromotionDecisionPersistenceError::row_decode_failure("threshold_results_json", error)
+    let lifecycle_action_raw: String = row.try_get("lifecycle_action").map_err(|error| {
+        PromotionDecisionPersistenceError::row_decode_failure("lifecycle_action", error)
+    })?;
+    let lifecycle_action =
+        PromotionLifecycleAction::parse(&lifecycle_action_raw).map_err(|error| {
+            PromotionDecisionPersistenceError::row_contract_failure("lifecycle_action", error)
         })?;
+
+    let decision_state_raw: String = row.try_get("decision_state").map_err(|error| {
+        PromotionDecisionPersistenceError::row_decode_failure("decision_state", error)
+    })?;
+    let decision_state = PromotionDecisionState::parse(&decision_state_raw).map_err(|error| {
+        PromotionDecisionPersistenceError::row_contract_failure("decision_state", error)
+    })?;
+
+    let reason_code: String = row.try_get("reason_code").map_err(|error| {
+        PromotionDecisionPersistenceError::row_decode_failure("reason_code", error)
+    })?;
+    PromotionDecisionReasonCode::parse(&reason_code).map_err(|error| {
+        PromotionDecisionPersistenceError::row_contract_failure("reason_code", error)
+    })?;
+
+    let threshold_results_json: Value = row.try_get("threshold_results_json").map_err(|error| {
+        PromotionDecisionPersistenceError::row_decode_failure("threshold_results_json", error)
+    })?;
     let threshold_results = decode_threshold_results_json(threshold_results_json)?;
 
-    let missing_evidence_fields_json: Value = row
-        .try_get("missing_evidence_fields_json")
-        .map_err(|error| {
-            PromotionDecisionPersistenceError::row_decode_failure(
-                "missing_evidence_fields_json",
-                error,
-            )
-        })?;
-    let missing_evidence_fields = decode_missing_evidence_fields_json(missing_evidence_fields_json)?;
+    let missing_evidence_fields_json: Value =
+        row.try_get("missing_evidence_fields_json")
+            .map_err(|error| {
+                PromotionDecisionPersistenceError::row_decode_failure(
+                    "missing_evidence_fields_json",
+                    error,
+                )
+            })?;
+    let missing_evidence_fields =
+        decode_missing_evidence_fields_json(missing_evidence_fields_json)?;
 
     let record = PromotionDecisionRecord {
-        decision_id: row
-            .try_get("decision_id")
-            .map_err(|error| PromotionDecisionPersistenceError::row_decode_failure("decision_id", error))?,
-        candidate_id: row
-            .try_get("candidate_id")
-            .map_err(|error| PromotionDecisionPersistenceError::row_decode_failure("candidate_id", error))?,
-        validation_run_id: row
-            .try_get("validation_run_id")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("validation_run_id", error)
-            })?,
+        decision_id: row.try_get("decision_id").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("decision_id", error)
+        })?,
+        candidate_id: row.try_get("candidate_id").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("candidate_id", error)
+        })?,
+        validation_run_id: row.try_get("validation_run_id").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("validation_run_id", error)
+        })?,
         lifecycle_action,
         decision_state,
         reason_code,
-        observed_metrics: row
-            .try_get("observed_metrics_json")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("observed_metrics_json", error)
-            })?,
-        evidence_packet: row
-            .try_get("evidence_packet_json")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("evidence_packet_json", error)
-            })?,
+        observed_metrics: row.try_get("observed_metrics_json").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("observed_metrics_json", error)
+        })?,
+        evidence_packet: row.try_get("evidence_packet_json").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("evidence_packet_json", error)
+        })?,
         threshold_results,
         missing_evidence_fields,
-        gate_evaluation: row
-            .try_get("gate_evaluation_json")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("gate_evaluation_json", error)
-            })?,
-        shadow_readiness: row
-            .try_get("shadow_readiness_json")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("shadow_readiness_json", error)
-            })?,
-        actor_id: row
-            .try_get("actor_id")
-            .map_err(|error| PromotionDecisionPersistenceError::row_decode_failure("actor_id", error))?,
-        correlation_id: row
-            .try_get("correlation_id")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("correlation_id", error)
-            })?,
-        decided_at_utc: row
-            .try_get("decided_at_utc")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("decided_at_utc", error)
-            })?,
-        approval_request_id: row
-            .try_get("approval_request_id")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("approval_request_id", error)
-            })?,
-        approval_reference: row
-            .try_get("approval_reference")
-            .map_err(|error| {
-                PromotionDecisionPersistenceError::row_decode_failure("approval_reference", error)
-            })?,
+        gate_evaluation: row.try_get("gate_evaluation_json").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("gate_evaluation_json", error)
+        })?,
+        shadow_readiness: row.try_get("shadow_readiness_json").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("shadow_readiness_json", error)
+        })?,
+        actor_id: row.try_get("actor_id").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("actor_id", error)
+        })?,
+        correlation_id: row.try_get("correlation_id").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("correlation_id", error)
+        })?,
+        decided_at_utc: row.try_get("decided_at_utc").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("decided_at_utc", error)
+        })?,
+        approval_request_id: row.try_get("approval_request_id").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("approval_request_id", error)
+        })?,
+        approval_reference: row.try_get("approval_reference").map_err(|error| {
+            PromotionDecisionPersistenceError::row_decode_failure("approval_reference", error)
+        })?,
     };
 
     validate_record_for_persistence(&record)
@@ -439,16 +429,18 @@ fn decode_threshold_results_json(
         .iter()
         .enumerate()
         .map(|(index, threshold)| {
-            serde_json::from_value::<PromotionThresholdOutcome>(threshold.clone()).map_err(|error| {
-                PromotionDecisionPersistenceError::invalid_payload(
-                    format!("invalid threshold outcome at index {index}: {error}"),
-                    vec![PromotionDecisionValidationIssue {
-                        field: format!("threshold_results_json.thresholds[{index}]"),
-                        code: PromotionDecisionReasonCode::InvalidPayload.code(),
-                        message: "invalid promotion threshold outcome payload".to_string(),
-                    }],
-                )
-            })
+            serde_json::from_value::<PromotionThresholdOutcome>(threshold.clone()).map_err(
+                |error| {
+                    PromotionDecisionPersistenceError::invalid_payload(
+                        format!("invalid threshold outcome at index {index}: {error}"),
+                        vec![PromotionDecisionValidationIssue {
+                            field: format!("threshold_results_json.thresholds[{index}]"),
+                            code: PromotionDecisionReasonCode::InvalidPayload.code(),
+                            message: "invalid promotion threshold outcome payload".to_string(),
+                        }],
+                    )
+                },
+            )
         })
         .collect()
 }
@@ -545,10 +537,7 @@ fn map_contract_error(error: PromotionDecisionContractError) -> PromotionDecisio
     PromotionDecisionPersistenceError::invalid_payload(error.message, error.field_errors)
 }
 
-fn validate_non_empty(
-    field: &str,
-    value: &str,
-) -> Result<(), PromotionDecisionPersistenceError> {
+fn validate_non_empty(field: &str, value: &str) -> Result<(), PromotionDecisionPersistenceError> {
     if value.trim().is_empty() {
         return Err(PromotionDecisionPersistenceError::invalid_payload(
             format!("{field} cannot be blank"),
@@ -596,7 +585,9 @@ mod tests {
             validation_run_id: "candidate::alpha-1::1712447000".to_string(),
             lifecycle_action: PromotionLifecycleAction::Promote,
             decision_state: PromotionDecisionState::Denied,
-            reason_code: PromotionDecisionReasonCode::MissingEvidence.code().to_string(),
+            reason_code: PromotionDecisionReasonCode::MissingEvidence
+                .code()
+                .to_string(),
             observed_metrics: json!({
                 "out_of_sample_sharpe": 1.21,
                 "max_drawdown": -0.18
@@ -642,23 +633,22 @@ mod tests {
                 .contains("CREATE TABLE IF NOT EXISTS validation_runs")
         );
         assert!(
-            !PROMOTION_DECISIONS_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS shadow_evaluations")
+            !PROMOTION_DECISIONS_MIGRATION_SQL
+                .contains("CREATE TABLE IF NOT EXISTS shadow_evaluations")
         );
     }
 
     #[test]
     fn migration_enforces_promotion_decision_constraints_and_indexes() {
         assert!(
-            PROMOTION_DECISIONS_MIGRATION_SQL.contains(
-                "lifecycle_action IN ('promote', 'pause', 'retire')"
-            )
+            PROMOTION_DECISIONS_MIGRATION_SQL
+                .contains("lifecycle_action IN ('promote', 'pause', 'retire')")
         );
         assert!(
             PROMOTION_DECISIONS_MIGRATION_SQL.contains("decision_state IN ('allowed', 'denied')")
         );
         assert!(
-            PROMOTION_DECISIONS_MIGRATION_SQL
-                .contains("idx_promotion_decisions_candidate_lookup")
+            PROMOTION_DECISIONS_MIGRATION_SQL.contains("idx_promotion_decisions_candidate_lookup")
         );
         assert!(
             PROMOTION_DECISIONS_MIGRATION_SQL
@@ -695,7 +685,10 @@ mod tests {
 
         let error = validate_record_for_persistence(&record)
             .expect_err("evidence_packet must be a JSON object");
-        assert_eq!(error.code, PromotionDecisionReasonCode::InvalidPayload.code());
+        assert_eq!(
+            error.code,
+            PromotionDecisionReasonCode::InvalidPayload.code()
+        );
         assert!(
             error
                 .field_errors

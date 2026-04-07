@@ -3,7 +3,10 @@ use crate::middleware::{
 };
 use axum::{
     Router,
-    extract::{Extension, Path, Query, State, rejection::JsonRejection},
+    extract::{
+        Extension, Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
     middleware as axum_middleware,
     response::{IntoResponse, Response},
@@ -46,9 +49,9 @@ use domain::reporting_schedule::{
     parse_utc_timestamp,
 };
 use domain::research::{
-    AlphaHypothesisReasonCode, PromotionDecisionReasonCode, PromotionDecisionState,
-    ShadowEvaluationReasonCode, ValidationGateReasonCode, ValidationWorkflowReasonCode,
-    normalize_research_identifier,
+    AlphaHypothesisReasonCode, CounterfactualReplayReasonCode, PromotionDecisionReasonCode,
+    PromotionDecisionState, ShadowEvaluationReasonCode, ValidationGateReasonCode,
+    ValidationWorkflowReasonCode, normalize_research_identifier,
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
@@ -104,6 +107,11 @@ use reporting_service::exports::scheduling::{
 use reporting_service::exports::workflows::{
     GetExportArtifactInput, ListExportArtifactsInput, QueryExportJobInput, ReportExportJobEvidence,
     TriggerIncidentExportInput, TriggerOnDemandExportInput,
+};
+use research_gateway::promotion::counterfactual_replay::{
+    CounterfactualReplayEvidence, CounterfactualReplayServiceError,
+    ListCounterfactualReplayRunsInput, ReadCounterfactualReplayInput,
+    StartCounterfactualReplayInput,
 };
 use research_gateway::promotion::decisions::{
     ListPromotionDecisionsInput, PromotionDecisionEvidence, PromotionDecisionServiceError,
@@ -246,6 +254,14 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/research/shadow-evaluations/{evaluation_id}",
             get(read_shadow_evaluation),
+        )
+        .route(
+            "/control/research/counterfactual-replay-runs",
+            post(start_counterfactual_replay_run).get(list_counterfactual_replay_runs),
+        )
+        .route(
+            "/control/research/counterfactual-replay-runs/{replay_run_id}",
+            get(read_counterfactual_replay_run),
         )
         .route(
             "/control/research/promotion-decisions",
@@ -1907,6 +1923,213 @@ pub async fn list_shadow_evaluations(
         evaluations,
         endpoint,
         "shadow_evaluation_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn start_counterfactual_replay_run(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<CounterfactualReplayStartPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = "/control/research/counterfactual-replay-runs".to_string();
+    let authorization = match authorize_counterfactual_replay_mutation(
+        &state,
+        &actor,
+        &endpoint,
+        "counterfactual_replay_start",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return counterfactual_replay_payload_rejection_response(
+                &state,
+                &actor,
+                "counterfactual_replay_start",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_counterfactual_replay_orchestrator
+        .start_counterfactual_replay(StartCounterfactualReplayInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: payload.candidate_id,
+            validation_run_id: payload.validation_run_id,
+            correlation_id: effective_correlation_id.clone(),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return counterfactual_replay_service_error_response(
+                &state,
+                error,
+                "counterfactual_replay_start",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    counterfactual_replay_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "counterfactual_replay_start",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_counterfactual_replay_run(
+    State(state): State<ControlApiState>,
+    Path(replay_run_id): Path<String>,
+    Query(query): Query<CounterfactualReplayReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/counterfactual-replay-runs/{replay_run_id}");
+    let authorization = match authorize_counterfactual_replay_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "counterfactual_replay_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_counterfactual_replay_orchestrator
+        .read_counterfactual_replay(ReadCounterfactualReplayInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            replay_run_id,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return counterfactual_replay_service_error_response(
+                &state,
+                error,
+                "counterfactual_replay_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    counterfactual_replay_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "counterfactual_replay_read",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn list_counterfactual_replay_runs(
+    State(state): State<ControlApiState>,
+    query: Result<Query<CounterfactualReplayRunsQuery>, QueryRejection>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/counterfactual-replay-runs".to_string();
+    let authorization = match authorize_counterfactual_replay_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "counterfactual_replay_list",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(rejection) => {
+            return counterfactual_replay_query_rejection_response(
+                &state,
+                &actor,
+                "counterfactual_replay_list",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let candidate_id = query.candidate_id.clone();
+    let canonical_candidate_id = normalize_research_identifier(&candidate_id);
+
+    let replay_runs = match state
+        .research_counterfactual_replay_orchestrator
+        .list_counterfactual_replay_runs(ListCounterfactualReplayRunsInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            candidate_id: candidate_id.clone(),
+            limit: query.limit,
+            started_after_utc: query.started_after_utc,
+            started_before_utc: query.started_before_utc,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(replay_runs) => replay_runs,
+        Err(error) => {
+            return counterfactual_replay_service_error_response(
+                &state,
+                error,
+                "counterfactual_replay_list",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id.clone(),
+            );
+        }
+    };
+
+    counterfactual_replay_list_response(
+        &state,
+        &actor,
+        canonical_candidate_id,
+        replay_runs,
+        endpoint,
+        "counterfactual_replay_list",
         effective_correlation_id,
         authorization.timestamp_utc,
     )
@@ -6678,6 +6901,113 @@ fn authorize_promotion_decision_read(
     )))
 }
 
+fn authorize_counterfactual_replay_mutation(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ExecuteControlPlaneAction);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(counterfactual_replay_service_error_response(
+        state,
+        CounterfactualReplayServiceError {
+            code: CounterfactualReplayReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
+fn authorize_counterfactual_replay_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(counterfactual_replay_service_error_response(
+        state,
+        CounterfactualReplayServiceError {
+            code: CounterfactualReplayReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
 fn authorize_attribution_read(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -9048,6 +9378,376 @@ fn shadow_simulation_outcome_to_item(
     }
 }
 
+fn counterfactual_replay_detail_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: CounterfactualReplayEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let correlation_id = evidence.replay_run.correlation_id.clone();
+    let reason_code = evidence.reason_code.clone();
+    let replay_run = evidence.replay_run;
+    let run_id = replay_run.run_id.clone();
+    let candidate_id = replay_run.candidate_id.clone();
+    let validation_run_id = replay_run.validation_run_id.clone();
+    let run_state = replay_run.run_state.as_str().to_string();
+    let scenario_count = replay_run.scenario_results.len();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "run_id": run_id,
+            "candidate_id": candidate_id,
+            "validation_run_id": validation_run_id,
+            "run_state": run_state,
+            "scenario_count": scenario_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: if replay_run.run_state
+            == domain::research::CounterfactualReplayRunState::Completed
+        {
+            PrivilegedAuditOutcome::Allow
+        } else {
+            PrivilegedAuditOutcome::AuthorizationDenied
+        },
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    let status = if http_method == "POST" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        axum::Json(CounterfactualReplayEnvelope {
+            data: Some(CounterfactualReplayData::ReplayRun {
+                replay_run: counterfactual_replay_run_to_item(replay_run),
+                reason_code: evidence.reason_code,
+            }),
+            meta: CounterfactualReplayMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn counterfactual_replay_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    candidate_id: String,
+    replay_runs: Vec<domain::research::CounterfactualReplayRunRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let run_count = replay_runs.len();
+    let reason_code = CounterfactualReplayReasonCode::RunListed.code().to_string();
+    let run_items = replay_runs
+        .into_iter()
+        .map(counterfactual_replay_run_to_item)
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "candidate_id": candidate_id,
+            "run_count": run_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(CounterfactualReplayEnvelope {
+            data: Some(CounterfactualReplayData::ReplayRuns {
+                candidate_id,
+                replay_runs: run_items,
+            }),
+            meta: CounterfactualReplayMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn counterfactual_replay_payload_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: JsonRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    counterfactual_replay_service_error_response(
+        state,
+        CounterfactualReplayServiceError {
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: format!("invalid counterfactual replay payload: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn counterfactual_replay_query_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: QueryRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    counterfactual_replay_service_error_response(
+        state,
+        CounterfactualReplayServiceError {
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: format!("invalid counterfactual replay query: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn counterfactual_replay_service_error_response(
+    state: &ControlApiState,
+    error: CounterfactualReplayServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+    correlation_id: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") || action.ends_with("_list") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "error_code": error.code,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == CounterfactualReplayReasonCode::UnauthorizedRole.code() {
+        Some(CounterfactualReplaySecuritySignal {
+            name: if action.ends_with("_read") || action.ends_with("_list") {
+                "unauthorized_counterfactual_replay_read_attempt_v1"
+            } else {
+                "unauthorized_counterfactual_replay_mutation_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        counterfactual_replay_service_error_status(error.code),
+        axum::Json(CounterfactualReplayEnvelope::<CounterfactualReplayData> {
+            data: None,
+            meta: CounterfactualReplayMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(CounterfactualReplayEnvelopeError {
+                error_code: error.code.to_string(),
+                message: error.message,
+                field_errors: error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| CounterfactualReplayFieldError {
+                        field: issue.field,
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn counterfactual_replay_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == CounterfactualReplayReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == CounterfactualReplayReasonCode::UnauthorizedRole.code() => {
+            StatusCode::FORBIDDEN
+        }
+        "counterfactual_replay_run_constraint_violation" => StatusCode::CONFLICT,
+        code if code == CounterfactualReplayReasonCode::RunNotFound.code()
+            || code == CounterfactualReplayReasonCode::ScenarioIncomplete.code() =>
+        {
+            StatusCode::CONFLICT
+        }
+        code if code == CounterfactualReplayReasonCode::DependencyUnavailable.code()
+            || code == CounterfactualReplayReasonCode::StateUnavailable.code()
+            || code == CounterfactualReplayReasonCode::PersistenceUnavailable.code()
+            || code == "counterfactual_replay_run_query_failed"
+            || code == "counterfactual_replay_run_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn counterfactual_replay_run_to_item(
+    replay_run: domain::research::CounterfactualReplayRunRecord,
+) -> CounterfactualReplayRunItem {
+    CounterfactualReplayRunItem {
+        run_id: replay_run.run_id,
+        candidate_id: replay_run.candidate_id,
+        validation_run_id: replay_run.validation_run_id,
+        run_state: replay_run.run_state.as_str().to_string(),
+        reason_code: replay_run.reason_code,
+        scenario_results: replay_run
+            .scenario_results
+            .into_iter()
+            .map(counterfactual_replay_scenario_result_to_item)
+            .collect(),
+        replay_summary: counterfactual_replay_summary_to_item(replay_run.replay_summary),
+        actor_id: replay_run.actor_id,
+        correlation_id: replay_run.correlation_id,
+        started_at_utc: replay_run.started_at_utc,
+        completed_at_utc: replay_run.completed_at_utc,
+    }
+}
+
+fn counterfactual_replay_summary_to_item(
+    summary: domain::research::CounterfactualReplaySummary,
+) -> CounterfactualReplaySummaryItem {
+    CounterfactualReplaySummaryItem {
+        run_id: summary.run_id,
+        gate_outcome: summary.gate_outcome.as_str().to_string(),
+        reason_code: summary.reason_code,
+        baseline_net_pnl: summary.baseline_net_pnl,
+        stressed_net_pnl: summary.stressed_net_pnl,
+        delayed_exit_net_pnl: summary.delayed_exit_net_pnl,
+        degradation_pct: summary.degradation_pct,
+        tolerance_threshold_pct: summary.tolerance_threshold_pct,
+        scenarios: summary
+            .scenarios
+            .into_iter()
+            .map(counterfactual_replay_scenario_result_to_item)
+            .collect(),
+    }
+}
+
+fn counterfactual_replay_scenario_result_to_item(
+    result: domain::research::CounterfactualReplayScenarioResult,
+) -> CounterfactualReplayScenarioResultItem {
+    CounterfactualReplayScenarioResultItem {
+        scenario: result.scenario.as_str().to_string(),
+        net_pnl: result.net_pnl,
+        degradation_pct: result.degradation_pct,
+        gate_outcome: result.gate_outcome.as_str().to_string(),
+        reason_code: result.reason_code,
+        parameters: CounterfactualReplayScenarioParametersItem {
+            slippage_multiplier: result.parameters.slippage_multiplier,
+            fill_rate_multiplier: result.parameters.fill_rate_multiplier,
+            exit_delay_seconds: result.parameters.exit_delay_seconds,
+        },
+    }
+}
+
 fn validation_run_to_item(run: domain::research::ValidationWorkflowRunRecord) -> ValidationRunItem {
     ValidationRunItem {
         run_id: run.run_id,
@@ -9204,7 +9904,9 @@ fn promotion_decision_list_response(
     timestamp_utc: String,
 ) -> Response {
     let decision_count = decisions.len();
-    let reason_code = PromotionDecisionReasonCode::DecisionListed.code().to_string();
+    let reason_code = PromotionDecisionReasonCode::DecisionListed
+        .code()
+        .to_string();
     let decision_items = decisions
         .into_iter()
         .map(promotion_decision_to_item)
@@ -12269,6 +12971,33 @@ pub struct ShadowEvaluationReadQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CounterfactualReplayStartPayload {
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CounterfactualReplayRunsQuery {
+    pub candidate_id: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub started_after_utc: Option<String>,
+    #[serde(default)]
+    pub started_before_utc: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CounterfactualReplayReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PromotionDecisionStartPayload {
     pub candidate_id: String,
     pub validation_run_id: String,
@@ -13454,6 +14183,110 @@ pub struct ShadowSimulationOutcomeItem {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CounterfactualReplayEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: CounterfactualReplayMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<CounterfactualReplayEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CounterfactualReplayData {
+    ReplayRun {
+        replay_run: CounterfactualReplayRunItem,
+        reason_code: String,
+    },
+    ReplayRuns {
+        candidate_id: String,
+        replay_runs: Vec<CounterfactualReplayRunItem>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplayMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplayEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<CounterfactualReplayFieldError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<CounterfactualReplaySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplayFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplaySecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplayRunItem {
+    pub run_id: String,
+    pub candidate_id: String,
+    pub validation_run_id: String,
+    pub run_state: String,
+    pub reason_code: String,
+    pub scenario_results: Vec<CounterfactualReplayScenarioResultItem>,
+    pub replay_summary: CounterfactualReplaySummaryItem,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub started_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplaySummaryItem {
+    pub run_id: String,
+    pub gate_outcome: String,
+    pub reason_code: String,
+    pub baseline_net_pnl: f64,
+    pub stressed_net_pnl: f64,
+    pub delayed_exit_net_pnl: f64,
+    pub degradation_pct: f64,
+    pub tolerance_threshold_pct: f64,
+    pub scenarios: Vec<CounterfactualReplayScenarioResultItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplayScenarioResultItem {
+    pub scenario: String,
+    pub net_pnl: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_pct: Option<f64>,
+    pub gate_outcome: String,
+    pub reason_code: String,
+    pub parameters: CounterfactualReplayScenarioParametersItem,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterfactualReplayScenarioParametersItem {
+    pub slippage_multiplier: f64,
+    pub fill_rate_multiplier: f64,
+    pub exit_delay_seconds: i64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PromotionDecisionEnvelope<T: Serialize> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
@@ -14066,9 +14899,11 @@ mod tests {
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::research::{
-        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, PromotionDecisionReasonCode,
-        PromotionDecisionState, ShadowEvaluationReasonCode, ShadowEvaluationRecord,
-        ShadowEvaluationState, ShadowSimulationDecisionSide,
+        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, CounterfactualReplayGateOutcome,
+        CounterfactualReplayReasonCode, CounterfactualReplayRunRecord,
+        CounterfactualReplayRunState, CounterfactualReplayScenarioKind,
+        PromotionDecisionReasonCode, PromotionDecisionState, ShadowEvaluationReasonCode,
+        ShadowEvaluationRecord, ShadowEvaluationState, ShadowSimulationDecisionSide,
         ShadowSimulationOutcome, ShadowSimulationReasonCode, ValidationDiagnosticsPayload,
         ValidationGateComparator, ValidationGateReasonCode, ValidationGateValidationIssue,
         ValidationMetricDelta, ValidationStageComparison, ValidationWorkflowArtifactRecord,
@@ -14126,6 +14961,15 @@ mod tests {
         QueryExportJobInput, ReportExportJobEvidence, ReportExportOrchestrator,
         ReportExportWorkflowError, TriggerIncidentExportInput, TriggerOnDemandExportInput,
     };
+    use research_gateway::promotion::counterfactual_replay::{
+        CounterfactualReplayEvidence, CounterfactualReplayOrchestrator,
+        CounterfactualReplayServiceError, ListCounterfactualReplayRunsInput,
+        ReadCounterfactualReplayInput, StartCounterfactualReplayInput,
+    };
+    use research_gateway::promotion::decisions::{
+        ListPromotionDecisionsInput, PromotionDecisionEvidence, PromotionDecisionOrchestrator,
+        PromotionDecisionServiceError, ReadPromotionDecisionInput, StartPromotionDecisionInput,
+    };
     use research_gateway::validation::gate_policies::{
         EvaluateValidationGatePoliciesInput, ListValidationGatePoliciesInput,
         ReadValidationGatePolicyInput, UpsertValidationGatePolicyInput,
@@ -14136,10 +14980,6 @@ mod tests {
     use research_gateway::validation::hypothesis_registry::{
         AlphaHypothesisEvidence, HypothesisRegistryOrchestrator, HypothesisRegistryServiceError,
         ReadAlphaHypothesisInput, UpsertAlphaHypothesisInput,
-    };
-    use research_gateway::promotion::decisions::{
-        ListPromotionDecisionsInput, PromotionDecisionEvidence, PromotionDecisionOrchestrator,
-        PromotionDecisionServiceError, ReadPromotionDecisionInput, StartPromotionDecisionInput,
     };
     use research_gateway::validation::shadow_mode::{
         ListShadowEvaluationsInput, ReadShadowEvaluationInput, ShadowEvaluationEvidence,
@@ -15545,6 +16385,187 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct StubCounterfactualReplayOrchestrator {
+        start_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        list_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl StubCounterfactualReplayOrchestrator {
+        fn service_error(
+            code: &'static str,
+            message: &'static str,
+        ) -> CounterfactualReplayServiceError {
+            CounterfactualReplayServiceError {
+                code,
+                message: message.to_string(),
+                field_errors: if code == CounterfactualReplayReasonCode::InvalidPayload.code() {
+                    vec![domain::research::CounterfactualReplayValidationIssue {
+                        field: "candidate_id".to_string(),
+                        code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+                        message: "candidate_id cannot be blank".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+
+        fn sample_run(
+            run_id: String,
+            candidate_id: String,
+            validation_run_id: String,
+            run_state: CounterfactualReplayRunState,
+            reason_code: String,
+            correlation_id: String,
+            timestamp_utc: String,
+        ) -> CounterfactualReplayRunRecord {
+            let scenarios = vec![
+                domain::research::CounterfactualReplayScenarioResult {
+                    scenario: CounterfactualReplayScenarioKind::Baseline,
+                    net_pnl: 120.0,
+                    degradation_pct: Some(0.0),
+                    gate_outcome: CounterfactualReplayGateOutcome::Allow,
+                    reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                        .code()
+                        .to_string(),
+                    parameters: domain::research::CounterfactualReplayScenarioParameters {
+                        slippage_multiplier: 1.0,
+                        fill_rate_multiplier: 1.0,
+                        exit_delay_seconds: 0,
+                    },
+                },
+                domain::research::CounterfactualReplayScenarioResult {
+                    scenario: CounterfactualReplayScenarioKind::StressedExecution,
+                    net_pnl: 114.0,
+                    degradation_pct: Some(-5.0),
+                    gate_outcome: CounterfactualReplayGateOutcome::Allow,
+                    reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                        .code()
+                        .to_string(),
+                    parameters: domain::research::CounterfactualReplayScenarioParameters {
+                        slippage_multiplier: 2.0,
+                        fill_rate_multiplier: 0.5,
+                        exit_delay_seconds: 0,
+                    },
+                },
+                domain::research::CounterfactualReplayScenarioResult {
+                    scenario: CounterfactualReplayScenarioKind::DelayedExit,
+                    net_pnl: 116.4,
+                    degradation_pct: Some(-3.0),
+                    gate_outcome: CounterfactualReplayGateOutcome::Allow,
+                    reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                        .code()
+                        .to_string(),
+                    parameters: domain::research::CounterfactualReplayScenarioParameters {
+                        slippage_multiplier: 1.0,
+                        fill_rate_multiplier: 1.0,
+                        exit_delay_seconds: 60,
+                    },
+                },
+            ];
+
+            CounterfactualReplayRunRecord {
+                run_id: run_id.clone(),
+                candidate_id,
+                validation_run_id,
+                run_state,
+                reason_code,
+                scenario_results: scenarios.clone(),
+                replay_summary: domain::research::CounterfactualReplaySummary {
+                    run_id,
+                    gate_outcome: CounterfactualReplayGateOutcome::Allow,
+                    reason_code: CounterfactualReplayReasonCode::ToleranceSatisfied
+                        .code()
+                        .to_string(),
+                    baseline_net_pnl: 120.0,
+                    stressed_net_pnl: 114.0,
+                    delayed_exit_net_pnl: 116.4,
+                    degradation_pct: -5.0,
+                    tolerance_threshold_pct: -5.0,
+                    scenarios,
+                },
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                started_at_utc: timestamp_utc.clone(),
+                completed_at_utc: Some(timestamp_utc),
+            }
+        }
+    }
+
+    impl CounterfactualReplayOrchestrator for StubCounterfactualReplayOrchestrator {
+        fn start_counterfactual_replay(
+            &self,
+            input: StartCounterfactualReplayInput,
+        ) -> Result<CounterfactualReplayEvidence, CounterfactualReplayServiceError> {
+            if let Some((code, message)) = self.start_error {
+                return Err(Self::service_error(code, message));
+            }
+            let replay_run = Self::sample_run(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                input.validation_run_id,
+                CounterfactualReplayRunState::Completed,
+                CounterfactualReplayReasonCode::RunCompleted
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.requested_at_utc,
+            );
+            Ok(CounterfactualReplayEvidence {
+                replay_run,
+                reason_code: CounterfactualReplayReasonCode::RunStarted
+                    .code()
+                    .to_string(),
+            })
+        }
+
+        fn read_counterfactual_replay(
+            &self,
+            input: ReadCounterfactualReplayInput,
+        ) -> Result<CounterfactualReplayEvidence, CounterfactualReplayServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(Self::service_error(code, message));
+            }
+            let replay_run = Self::sample_run(
+                input.replay_run_id,
+                "candidate::alpha-1".to_string(),
+                "candidate::alpha-1::1712447000".to_string(),
+                CounterfactualReplayRunState::Completed,
+                CounterfactualReplayReasonCode::RunCompleted
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            );
+            Ok(CounterfactualReplayEvidence {
+                replay_run,
+                reason_code: CounterfactualReplayReasonCode::RunRead.code().to_string(),
+            })
+        }
+
+        fn list_counterfactual_replay_runs(
+            &self,
+            input: ListCounterfactualReplayRunsInput,
+        ) -> Result<Vec<CounterfactualReplayRunRecord>, CounterfactualReplayServiceError> {
+            if let Some((code, message)) = self.list_error {
+                return Err(Self::service_error(code, message));
+            }
+            Ok(vec![Self::sample_run(
+                "candidate::alpha-1::1712457600000000000".to_string(),
+                input.candidate_id,
+                "candidate::alpha-1::1712447000".to_string(),
+                CounterfactualReplayRunState::Completed,
+                CounterfactualReplayReasonCode::RunCompleted
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            )])
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct StubPromotionDecisionOrchestrator {
         start_error: Option<(&'static str, &'static str)>,
         read_error: Option<(&'static str, &'static str)>,
@@ -15552,7 +16573,10 @@ mod tests {
     }
 
     impl StubPromotionDecisionOrchestrator {
-        fn service_error(code: &'static str, message: &'static str) -> PromotionDecisionServiceError {
+        fn service_error(
+            code: &'static str,
+            message: &'static str,
+        ) -> PromotionDecisionServiceError {
             PromotionDecisionServiceError {
                 code,
                 message: message.to_string(),
@@ -15592,7 +16616,11 @@ mod tests {
                     "data_quality_report": { "artifact_id": "quality::001" },
                     "purged_cpcv_results": { "artifact_id": "cpcv::001" },
                     "calibration_report": { "artifact_id": "calibration::001" },
-                    "counterfactual_replay_summary": { "status": "deferred_to_story_6_6" }
+                    "counterfactual_replay_summary": {
+                        "run_id": "candidate::alpha-1::1712449000",
+                        "gate_outcome": "allow",
+                        "reason_code": "counterfactual_replay_tolerance_satisfied"
+                    }
                 }),
                 threshold_results: vec![domain::research::PromotionThresholdOutcome {
                     metric_key: "out_of_sample_sharpe".to_string(),
@@ -15632,12 +16660,17 @@ mod tests {
                 "candidate::alpha-1::1712457600000000000".to_string(),
                 input.candidate_id,
                 input.validation_run_id,
-                PromotionDecisionReasonCode::DecisionAllowed.code().to_string(),
+                PromotionDecisionReasonCode::DecisionAllowed
+                    .code()
+                    .to_string(),
                 PromotionDecisionState::Allowed,
                 input.correlation_id,
                 input.requested_at_utc,
             );
-            if input.lifecycle_action.trim().eq_ignore_ascii_case("promote")
+            if input
+                .lifecycle_action
+                .trim()
+                .eq_ignore_ascii_case("promote")
                 && input
                     .approval_reference
                     .as_deref()
@@ -15681,7 +16714,9 @@ mod tests {
                 input.decision_id,
                 "candidate::alpha-1".to_string(),
                 "candidate::alpha-1::1712447000".to_string(),
-                PromotionDecisionReasonCode::DecisionAllowed.code().to_string(),
+                PromotionDecisionReasonCode::DecisionAllowed
+                    .code()
+                    .to_string(),
                 PromotionDecisionState::Allowed,
                 input.correlation_id,
                 input.queried_at_utc,
@@ -15704,7 +16739,9 @@ mod tests {
                 "candidate::alpha-1::1712457600000000000".to_string(),
                 input.candidate_id,
                 "candidate::alpha-1::1712447000".to_string(),
-                PromotionDecisionReasonCode::DecisionAllowed.code().to_string(),
+                PromotionDecisionReasonCode::DecisionAllowed
+                    .code()
+                    .to_string(),
                 PromotionDecisionState::Allowed,
                 input.correlation_id,
                 input.queried_at_utc,
@@ -16594,6 +17631,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_research_shadow_mode_orchestrator(shadow_mode_orchestrator),
+        )
+    }
+
+    fn test_app_with_counterfactual_replay_orchestrator(
+        counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_counterfactual_replay_orchestrator(counterfactual_replay_orchestrator),
         )
     }
 
@@ -21096,6 +22155,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn counterfactual_replay_start_route_returns_data_meta_error_envelope() {
+        let app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-start-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "replay_run");
+        assert_eq!(
+            payload["data"]["replay_run"]["run_id"],
+            "candidate::alpha-1::1712457600000000000"
+        );
+        assert_eq!(payload["meta"]["action"], "counterfactual_replay_start");
+        assert!(payload["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn counterfactual_replay_read_list_routes_return_envelope_shapes() {
+        let app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator::default(),
+        ));
+
+        let read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs/candidate::alpha-1::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(read_payload["data"]["kind"], "replay_run");
+        assert_eq!(read_payload["meta"]["action"], "counterfactual_replay_read");
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs?candidate_id=%20Candidate::Alpha-1%20&limit=1")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(list_payload["data"]["kind"], "replay_runs");
+        assert_eq!(
+            list_payload["data"]["replay_runs"][0]["reason_code"],
+            "counterfactual_replay_run_completed"
+        );
+        assert_eq!(list_payload["data"]["candidate_id"], "candidate::alpha-1");
+        assert_eq!(list_payload["meta"]["action"], "counterfactual_replay_list");
+    }
+
+    #[tokio::test]
+    async fn counterfactual_replay_start_route_maps_json_rejection_to_bad_request_envelope() {
+        let app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-start-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":123,
+                            "validation_run_id":"candidate::alpha-1::1712447000"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "counterfactual_replay_invalid_payload"
+        );
+        assert_eq!(payload["meta"]["action"], "counterfactual_replay_start");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn counterfactual_replay_start_route_auth_denial_returns_replay_envelope() {
+        let app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-start-auth-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["meta"]["action"], "counterfactual_replay_start");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "counterfactual_replay_unauthorized_role"
+        );
+        assert_eq!(
+            payload["error"]["security_signal"]["name"],
+            "unauthorized_counterfactual_replay_mutation_attempt_v1"
+        );
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn counterfactual_replay_list_route_maps_query_rejection_to_bad_request_envelope() {
+        let app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs?candidate_id=candidate::alpha-1&limit=abc")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-list-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["meta"]["action"], "counterfactual_replay_list");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "counterfactual_replay_invalid_payload"
+        );
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn counterfactual_replay_start_route_maps_not_found_to_conflict() {
+        let app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator {
+                start_error: Some((
+                    CounterfactualReplayReasonCode::RunNotFound.code(),
+                    "counterfactual replay run not found",
+                )),
+                ..Default::default()
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-start-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "counterfactual_replay_run_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn counterfactual_replay_service_errors_emit_unauthorized_security_signals() {
+        let mutation_app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator {
+                start_error: Some((
+                    CounterfactualReplayReasonCode::UnauthorizedRole.code(),
+                    "forbidden counterfactual replay mutation",
+                )),
+                ..Default::default()
+            },
+        ));
+        let mutation_response = mutation_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-start-004")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "candidate_id":"candidate::alpha-1",
+                            "validation_run_id":"candidate::alpha-1::1712447000"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        let mutation_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(mutation_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            mutation_payload["error"]["security_signal"]["name"],
+            "unauthorized_counterfactual_replay_mutation_attempt_v1"
+        );
+
+        let read_app = test_app_with_counterfactual_replay_orchestrator(Arc::new(
+            StubCounterfactualReplayOrchestrator {
+                read_error: Some((
+                    CounterfactualReplayReasonCode::UnauthorizedRole.code(),
+                    "forbidden counterfactual replay read",
+                )),
+                ..Default::default()
+            },
+        ));
+        let read_response = read_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/counterfactual-replay-runs/candidate::alpha-1::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-counterfactual-replay-read-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::FORBIDDEN);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            read_payload["error"]["security_signal"]["name"],
+            "unauthorized_counterfactual_replay_read_attempt_v1"
+        );
+    }
+
+    #[tokio::test]
     async fn promotion_decision_start_route_returns_data_meta_error_envelope() {
         let app = test_app_with_promotion_decision_orchestrator(Arc::new(
             StubPromotionDecisionOrchestrator::default(),
@@ -21118,7 +22534,7 @@ mod tests {
                             "lifecycle_action":"promote",
                             "observed_metrics":{"out_of_sample_sharpe":1.28,"max_drawdown":-0.17},
                             "thresholds":[{"metric_key":"out_of_sample_sharpe","comparator":"gte","threshold_value":1.0}],
-                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"status":"deferred_to_story_6_6"}}
+                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"run_id":"candidate::alpha-1::1712449000","gate_outcome":"allow","reason_code":"counterfactual_replay_tolerance_satisfied"}}
                         }"#,
                     ))
                     .expect("request should build"),
@@ -21234,7 +22650,7 @@ mod tests {
                             "lifecycle_action":"promote",
                             "observed_metrics":{"out_of_sample_sharpe":1.28,"max_drawdown":-0.17},
                             "thresholds":[{"metric_key":"out_of_sample_sharpe","comparator":"gte","threshold_value":1.0}],
-                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"status":"deferred_to_story_6_6"}}
+                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"run_id":"candidate::alpha-1::1712449000","gate_outcome":"allow","reason_code":"counterfactual_replay_tolerance_satisfied"}}
                         }"#,
                     ))
                     .expect("request should build"),
@@ -21331,7 +22747,7 @@ mod tests {
                             "lifecycle_action":"promote",
                             "observed_metrics":{"out_of_sample_sharpe":1.28,"max_drawdown":-0.17},
                             "thresholds":[{"metric_key":"out_of_sample_sharpe","comparator":"gte","threshold_value":1.0}],
-                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"status":"deferred_to_story_6_6"}}
+                            "evidence_packet":{"data_quality_report":{"artifact_id":"quality::001"},"purged_cpcv_results":{"artifact_id":"cpcv::001"},"calibration_report":{"artifact_id":"calibration::001"},"counterfactual_replay_summary":{"run_id":"candidate::alpha-1::1712449000","gate_outcome":"allow","reason_code":"counterfactual_replay_tolerance_satisfied"}}
                         }"#,
                     ))
                     .expect("request should build"),

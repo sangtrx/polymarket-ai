@@ -1,8 +1,13 @@
+use crate::promotion::counterfactual_replay::{
+    CounterfactualReplayOrchestrator, CounterfactualReplayService,
+    CounterfactualReplayServiceError, StartCounterfactualReplayInput,
+};
 use crate::promotion::evaluate_promotion_entry_gates;
 use crate::validation::gate_policies::{
     ValidationGatePolicyOrchestrator, ValidationGatePolicyService, ValidationGatePolicyServiceError,
 };
 use domain::research::{
+    CounterfactualReplayGateOutcome, CounterfactualReplayReasonCode,
     PromotionDecisionContractError, PromotionDecisionReasonCode, PromotionDecisionRecord,
     PromotionDecisionState, PromotionDecisionValidationIssue, PromotionLifecycleAction,
     PromotionThresholdDefinition, ShadowEvaluationRecord, ValidationGateReasonCode,
@@ -12,15 +17,18 @@ use domain::research::{
     validate_promotion_evidence_packet,
 };
 use persistence::postgres::promotion_decisions::{
-    PromotionDecisionPersistenceError, list_promotion_decisions_by_candidate as pg_list_promotion_decisions_by_candidate,
+    PromotionDecisionPersistenceError,
+    list_promotion_decisions_by_candidate as pg_list_promotion_decisions_by_candidate,
     load_promotion_decision as pg_load_promotion_decision,
     upsert_promotion_decision as pg_upsert_promotion_decision,
 };
 use persistence::postgres::shadow_evaluations::{
-    ShadowEvaluationPersistenceError, list_shadow_evaluations_by_candidate as pg_list_shadow_evaluations_by_candidate,
+    ShadowEvaluationPersistenceError,
+    list_shadow_evaluations_by_candidate as pg_list_shadow_evaluations_by_candidate,
 };
 use persistence::postgres::validation_artifacts::{
-    ValidationArtifactPersistenceError, list_validation_artifacts_by_run as pg_list_validation_artifacts_by_run,
+    ValidationArtifactPersistenceError,
+    list_validation_artifacts_by_run as pg_list_validation_artifacts_by_run,
 };
 use persistence::postgres::validation_runs::{
     ValidationRunPersistenceError, load_validation_run as pg_load_validation_run,
@@ -214,6 +222,7 @@ pub struct PromotionDecisionService {
     validation_evidence: Arc<dyn ValidationEvidencePort>,
     validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
     shadow_evidence: Arc<dyn ShadowEvidencePort>,
+    counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
     operation_lock: Arc<Mutex<()>>,
 }
 
@@ -223,12 +232,14 @@ impl PromotionDecisionService {
         validation_evidence: Arc<dyn ValidationEvidencePort>,
         validation_gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
         shadow_evidence: Arc<dyn ShadowEvidencePort>,
+        counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
     ) -> Self {
         Self {
             repository,
             validation_evidence,
             validation_gate_orchestrator,
             shadow_evidence,
+            counterfactual_replay_orchestrator,
             operation_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -239,15 +250,20 @@ impl PromotionDecisionService {
             Arc::new(StaticValidationEvidencePort::default()),
             Arc::new(ValidationGatePolicyService::default()),
             Arc::new(StaticShadowEvidencePort),
+            Arc::new(CounterfactualReplayService::in_memory()),
         )
     }
 
-    pub fn postgres(pool: PgPool, gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>) -> Self {
+    pub fn postgres(
+        pool: PgPool,
+        gate_orchestrator: Arc<dyn ValidationGatePolicyOrchestrator>,
+    ) -> Self {
         Self::new(
             Arc::new(PostgresPromotionDecisionRepository::new(pool.clone())),
             Arc::new(PostgresValidationEvidencePort::new(pool.clone())),
             gate_orchestrator,
-            Arc::new(PostgresShadowEvidencePort::new(pool)),
+            Arc::new(PostgresShadowEvidencePort::new(pool.clone())),
+            Arc::new(CounterfactualReplayService::postgres(pool.clone())),
         )
     }
 
@@ -267,12 +283,25 @@ impl PromotionDecisionService {
         self
     }
 
-    pub fn with_shadow_evidence_port(mut self, shadow_evidence: Arc<dyn ShadowEvidencePort>) -> Self {
+    pub fn with_shadow_evidence_port(
+        mut self,
+        shadow_evidence: Arc<dyn ShadowEvidencePort>,
+    ) -> Self {
         self.shadow_evidence = shadow_evidence;
         self
     }
 
-    fn lock_operations(&self) -> Result<std::sync::MutexGuard<'_, ()>, PromotionDecisionServiceError> {
+    pub fn with_counterfactual_replay_orchestrator(
+        mut self,
+        counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
+    ) -> Self {
+        self.counterfactual_replay_orchestrator = counterfactual_replay_orchestrator;
+        self
+    }
+
+    fn lock_operations(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, PromotionDecisionServiceError> {
         self.operation_lock.lock().map_err(|_| {
             PromotionDecisionServiceError::persistence_unavailable(
                 "promotion decision operation lock poisoned by prior panic",
@@ -300,6 +329,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                 &input.actor_id,
                 &input.candidate_id,
                 None,
+                None,
                 error.code,
                 input.approval_reference.as_deref(),
                 &input.correlation_id,
@@ -322,14 +352,16 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
         let decision_id =
             compose_promotion_decision_id(&normalized_candidate_id, &input.requested_at_utc)
                 .map_err(map_contract_error)?;
-        let _requested_at = parse_promotion_utc_timestamp(&input.requested_at_utc)
-            .map_err(map_contract_error)?;
+        let _requested_at =
+            parse_promotion_utc_timestamp(&input.requested_at_utc).map_err(map_contract_error)?;
         let _lock = self.lock_operations()?;
 
-        let threshold_results = evaluate_promotion_thresholds(&input.thresholds, &input.observed_metrics)
-            .map_err(map_contract_error)?;
+        let mut evidence_packet = input.evidence_packet.clone();
+        let threshold_results =
+            evaluate_promotion_thresholds(&input.thresholds, &input.observed_metrics)
+                .map_err(map_contract_error)?;
         let packet_missing_fields =
-            validate_promotion_evidence_packet(lifecycle_action, &input.evidence_packet)
+            validate_promotion_evidence_packet(lifecycle_action, &evidence_packet)
                 .map_err(map_contract_error)?;
 
         let validation_run = self
@@ -345,6 +377,38 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
             &validation_artifacts,
             packet_missing_fields,
         );
+        let mut replay_gate_denied = false;
+        let mut replay_run_id: Option<String> = None;
+
+        if lifecycle_action == PromotionLifecycleAction::Promote {
+            let replay_evidence = self
+                .counterfactual_replay_orchestrator
+                .start_counterfactual_replay(StartCounterfactualReplayInput {
+                    actor_id: input.actor_id.clone(),
+                    actor_role: input.actor_role.clone(),
+                    candidate_id: normalized_candidate_id.clone(),
+                    validation_run_id: normalized_validation_run_id.clone(),
+                    correlation_id: input.correlation_id.clone(),
+                    requested_at_utc: input.requested_at_utc.clone(),
+                })
+                .map_err(map_replay_error)?;
+            if let Some(packet) = evidence_packet.as_object_mut() {
+                packet.insert(
+                    "counterfactual_replay_summary".to_string(),
+                    serde_json::to_value(&replay_evidence.replay_run.replay_summary).map_err(
+                        |_| {
+                            PromotionDecisionServiceError::state_unavailable(
+                                "counterfactual replay summary serialization failed",
+                            )
+                        },
+                    )?,
+                );
+            }
+            missing_evidence_fields.retain(|field| field != "counterfactual_replay_summary");
+            replay_gate_denied = replay_evidence.replay_run.replay_summary.gate_outcome
+                == CounterfactualReplayGateOutcome::Deny;
+            replay_run_id = Some(replay_evidence.replay_run.run_id.clone());
+        }
 
         let mut gate_denied = false;
         let gate_evaluation = match evaluate_promotion_entry_gates(
@@ -374,7 +438,8 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                 })
             }
             Err(error) if is_gate_dependency_error(error.code) => {
-                let service_error = PromotionDecisionServiceError::dependency_unavailable(error.message);
+                let service_error =
+                    PromotionDecisionServiceError::dependency_unavailable(error.message);
                 emit_promotion_decision_telemetry(
                     "promotion_decision_start_v1",
                     "promotion_decision_start",
@@ -382,6 +447,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                     &input.actor_id,
                     &normalized_candidate_id,
                     Some(&decision_id),
+                    None,
                     service_error.code,
                     input.approval_reference.as_deref(),
                     &input.correlation_id,
@@ -398,6 +464,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                     &input.actor_id,
                     &normalized_candidate_id,
                     Some(&decision_id),
+                    None,
                     service_error.code,
                     input.approval_reference.as_deref(),
                     &input.correlation_id,
@@ -443,19 +510,34 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
 
         let has_failed_thresholds = threshold_results.iter().any(|result| !result.passed);
         let mut decision_state = PromotionDecisionState::Allowed;
-        let mut decision_reason_code = PromotionDecisionReasonCode::DecisionAllowed.code().to_string();
+        let mut decision_reason_code = PromotionDecisionReasonCode::DecisionAllowed
+            .code()
+            .to_string();
         if !missing_evidence_fields.is_empty() {
             decision_state = PromotionDecisionState::Denied;
-            decision_reason_code = PromotionDecisionReasonCode::MissingEvidence.code().to_string();
+            decision_reason_code = PromotionDecisionReasonCode::MissingEvidence
+                .code()
+                .to_string();
         } else if has_failed_thresholds {
             decision_state = PromotionDecisionState::Denied;
-            decision_reason_code = PromotionDecisionReasonCode::ThresholdFailed.code().to_string();
+            decision_reason_code = PromotionDecisionReasonCode::ThresholdFailed
+                .code()
+                .to_string();
         } else if gate_denied {
             decision_state = PromotionDecisionState::Denied;
             decision_reason_code = PromotionDecisionReasonCode::GateDenied.code().to_string();
-        } else if lifecycle_action == PromotionLifecycleAction::Promote && approval_reference.is_none() {
+        } else if replay_gate_denied {
             decision_state = PromotionDecisionState::Denied;
-            decision_reason_code = PromotionDecisionReasonCode::ApprovalRequired.code().to_string();
+            decision_reason_code = PromotionDecisionReasonCode::ReplayGateDenied
+                .code()
+                .to_string();
+        } else if lifecycle_action == PromotionLifecycleAction::Promote
+            && approval_reference.is_none()
+        {
+            decision_state = PromotionDecisionState::Denied;
+            decision_reason_code = PromotionDecisionReasonCode::ApprovalRequired
+                .code()
+                .to_string();
         }
 
         let decision = canonicalize_promotion_decision_record(&PromotionDecisionRecord {
@@ -466,7 +548,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
             decision_state,
             reason_code: decision_reason_code.clone(),
             observed_metrics: input.observed_metrics.clone(),
-            evidence_packet: input.evidence_packet.clone(),
+            evidence_packet,
             threshold_results,
             missing_evidence_fields,
             gate_evaluation,
@@ -491,6 +573,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
             &input.actor_id,
             &decision.candidate_id,
             Some(&decision.decision_id),
+            replay_run_id.as_deref(),
             &decision.reason_code,
             decision.approval_reference.as_deref(),
             &decision.correlation_id,
@@ -517,6 +600,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                 &input.actor_id,
                 &input.decision_id,
                 Some(&input.decision_id),
+                None,
                 error.code,
                 None,
                 &input.correlation_id,
@@ -540,6 +624,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                 &input.actor_id,
                 &normalized_decision_id,
                 Some(&normalized_decision_id),
+                None,
                 error.code,
                 None,
                 &input.correlation_id,
@@ -555,6 +640,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
             &input.actor_id,
             &decision.candidate_id,
             Some(&decision.decision_id),
+            None,
             PromotionDecisionReasonCode::DecisionRead.code(),
             decision.approval_reference.as_deref(),
             &input.correlation_id,
@@ -563,9 +649,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
 
         Ok(PromotionDecisionEvidence {
             decision,
-            reason_code: PromotionDecisionReasonCode::DecisionRead
-                .code()
-                .to_string(),
+            reason_code: PromotionDecisionReasonCode::DecisionRead.code().to_string(),
         })
     }
 
@@ -580,6 +664,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                 "deny",
                 &input.actor_id,
                 &input.candidate_id,
+                None,
                 None,
                 error.code,
                 None,
@@ -608,13 +693,16 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
         }
         let normalized_decided_after =
             normalize_optional_timestamp("decided_after_utc", input.decided_after_utc.as_deref())?;
-        let normalized_decided_before =
-            normalize_optional_timestamp("decided_before_utc", input.decided_before_utc.as_deref())?;
+        let normalized_decided_before = normalize_optional_timestamp(
+            "decided_before_utc",
+            input.decided_before_utc.as_deref(),
+        )?;
         if let (Some(decided_after), Some(decided_before)) = (
             normalized_decided_after.as_deref(),
             normalized_decided_before.as_deref(),
         ) {
-            let decided_after_ts = parse_promotion_utc_timestamp(decided_after).map_err(map_contract_error)?;
+            let decided_after_ts =
+                parse_promotion_utc_timestamp(decided_after).map_err(map_contract_error)?;
             let decided_before_ts =
                 parse_promotion_utc_timestamp(decided_before).map_err(map_contract_error)?;
             if decided_before_ts <= decided_after_ts {
@@ -641,7 +729,10 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
                 }],
             ));
         }
-        let limit = input.limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .clamp(1, MAX_LIST_LIMIT);
         let decisions = self.repository.list_by_candidate(
             &normalized_candidate_id,
             normalized_decided_after.as_deref(),
@@ -654,6 +745,7 @@ impl PromotionDecisionOrchestrator for PromotionDecisionService {
             "allow",
             &input.actor_id,
             &normalized_candidate_id,
+            None,
             None,
             PromotionDecisionReasonCode::DecisionListed.code(),
             None,
@@ -758,6 +850,30 @@ fn map_gate_error(error: ValidationGatePolicyServiceError) -> PromotionDecisionS
     )
 }
 
+fn map_replay_error(error: CounterfactualReplayServiceError) -> PromotionDecisionServiceError {
+    if error.code == CounterfactualReplayReasonCode::DependencyUnavailable.code() {
+        return PromotionDecisionServiceError::dependency_unavailable(error.message);
+    }
+    if error.code == CounterfactualReplayReasonCode::StateUnavailable.code() {
+        return PromotionDecisionServiceError::state_unavailable(error.message);
+    }
+    if error.code == CounterfactualReplayReasonCode::PersistenceUnavailable.code() {
+        return PromotionDecisionServiceError::persistence_unavailable(error.message);
+    }
+    PromotionDecisionServiceError::invalid_payload(
+        error.message,
+        error
+            .field_errors
+            .into_iter()
+            .map(|issue| PromotionDecisionValidationIssue {
+                field: issue.field,
+                code: issue.code,
+                message: issue.message,
+            })
+            .collect(),
+    )
+}
+
 fn map_contract_error(error: PromotionDecisionContractError) -> PromotionDecisionServiceError {
     PromotionDecisionServiceError::invalid_payload(error.message, error.field_errors)
 }
@@ -827,6 +943,7 @@ fn emit_promotion_decision_telemetry(
     actor_id: &str,
     candidate_id: &str,
     decision_id: Option<&str>,
+    replay_run_id: Option<&str>,
     reason_code: &str,
     approval_reference: Option<&str>,
     correlation_id: &str,
@@ -839,6 +956,7 @@ fn emit_promotion_decision_telemetry(
         actor_id,
         candidate_id,
         decision_id,
+        replay_run_id,
         reason_code,
         approval_reference,
         correlation_id,
@@ -869,6 +987,8 @@ struct PromotionDecisionTelemetryEvent<'a> {
     candidate_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     decision_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_run_id: Option<&'a str>,
     reason_code: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     approval_reference: Option<&'a str>,
@@ -1122,7 +1242,10 @@ impl ShadowEvidencePort for PostgresShadowEvidencePort {
             None,
             1,
         ))?;
-        Ok(evaluations.into_iter().next().map(shadow_record_to_readiness))
+        Ok(evaluations
+            .into_iter()
+            .next()
+            .map(shadow_record_to_readiness))
     }
 }
 
@@ -1168,15 +1291,13 @@ pub struct InMemoryPromotionDecisionRepository {
 
 impl PromotionDecisionRepositoryPort for InMemoryPromotionDecisionRepository {
     fn upsert(&self, record: PromotionDecisionRecord) -> Result<(), PromotionDecisionServiceError> {
-        let canonical = canonicalize_promotion_decision_record(&record).map_err(map_contract_error)?;
-        let mut records = self
-            .records
-            .lock()
-            .map_err(|_| {
-                PromotionDecisionServiceError::persistence_unavailable(
-                    "in-memory promotion decision store lock poisoned",
-                )
-            })?;
+        let canonical =
+            canonicalize_promotion_decision_record(&record).map_err(map_contract_error)?;
+        let mut records = self.records.lock().map_err(|_| {
+            PromotionDecisionServiceError::persistence_unavailable(
+                "in-memory promotion decision store lock poisoned",
+            )
+        })?;
         records.insert(canonical.decision_id.clone(), canonical);
         Ok(())
     }
@@ -1186,18 +1307,17 @@ impl PromotionDecisionRepositoryPort for InMemoryPromotionDecisionRepository {
         decision_id: &str,
     ) -> Result<Option<PromotionDecisionRecord>, PromotionDecisionServiceError> {
         let normalized_decision_id = normalize_research_identifier(decision_id);
-        let records = self
-            .records
-            .lock()
-            .map_err(|_| {
-                PromotionDecisionServiceError::persistence_unavailable(
-                    "in-memory promotion decision store lock poisoned",
-                )
-            })?;
+        let records = self.records.lock().map_err(|_| {
+            PromotionDecisionServiceError::persistence_unavailable(
+                "in-memory promotion decision store lock poisoned",
+            )
+        })?;
         records
             .get(&normalized_decision_id)
             .cloned()
-            .map(|record| canonicalize_promotion_decision_record(&record).map_err(map_contract_error))
+            .map(|record| {
+                canonicalize_promotion_decision_record(&record).map_err(map_contract_error)
+            })
             .transpose()
     }
 
@@ -1230,14 +1350,11 @@ impl PromotionDecisionRepositoryPort for InMemoryPromotionDecisionRepository {
             .map(|value| parse_promotion_utc_timestamp(value).map_err(map_contract_error))
             .transpose()?;
 
-        let records = self
-            .records
-            .lock()
-            .map_err(|_| {
-                PromotionDecisionServiceError::persistence_unavailable(
-                    "in-memory promotion decision store lock poisoned",
-                )
-            })?;
+        let records = self.records.lock().map_err(|_| {
+            PromotionDecisionServiceError::persistence_unavailable(
+                "in-memory promotion decision store lock poisoned",
+            )
+        })?;
         let mut decisions = records
             .values()
             .filter(|record| record.candidate_id == normalized_candidate_id)
@@ -1255,15 +1372,21 @@ impl PromotionDecisionRepositoryPort for InMemoryPromotionDecisionRepository {
             .filter(|record| {
                 let decided_at = parse_promotion_utc_timestamp(&record.decided_at_utc);
                 if let Ok(decided_at) = decided_at {
-                    let after_ok = decided_after.map(|after| decided_at >= after).unwrap_or(true);
-                    let before_ok = decided_before.map(|before| decided_at < before).unwrap_or(true);
+                    let after_ok = decided_after
+                        .map(|after| decided_at >= after)
+                        .unwrap_or(true);
+                    let before_ok = decided_before
+                        .map(|before| decided_at < before)
+                        .unwrap_or(true);
                     after_ok && before_ok
                 } else {
                     false
                 }
             })
             .take(limit as usize)
-            .map(|record| canonicalize_promotion_decision_record(&record).map_err(map_contract_error))
+            .map(|record| {
+                canonicalize_promotion_decision_record(&record).map_err(map_contract_error)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(filtered)
     }
@@ -1588,11 +1711,12 @@ mod tests {
             validation_evidence,
             gate_orchestrator,
             shadow_evidence,
+            Arc::new(CounterfactualReplayService::in_memory()),
         )
     }
 
     #[test]
-    fn promotion_decision_start_denies_when_fr45_packet_is_incomplete() {
+    fn promotion_decision_start_backfills_counterfactual_replay_summary_when_missing() {
         let service = service_with_ports(
             Arc::new(StubValidationEvidencePort::with_defaults()),
             Arc::new(StubValidationGateOrchestrator::default()),
@@ -1607,19 +1731,37 @@ mod tests {
 
         let evidence = service
             .start_promotion_decision(input)
-            .expect("decision should persist as denied");
+            .expect("decision should persist");
         assert_eq!(
             evidence.decision.decision_state,
-            PromotionDecisionState::Denied
+            PromotionDecisionState::Allowed
         );
         assert_eq!(
             evidence.decision.reason_code,
-            PromotionDecisionReasonCode::MissingEvidence.code()
+            PromotionDecisionReasonCode::DecisionAllowed.code()
         );
-        assert!(evidence
+        assert!(
+            !evidence
+                .decision
+                .missing_evidence_fields
+                .contains(&"counterfactual_replay_summary".to_string())
+        );
+        let summary = evidence
             .decision
-            .missing_evidence_fields
-            .contains(&"counterfactual_replay_summary".to_string()));
+            .evidence_packet
+            .get("counterfactual_replay_summary")
+            .and_then(Value::as_object)
+            .expect("replay summary should be materialized");
+        assert_eq!(
+            summary.get("gate_outcome").and_then(Value::as_str),
+            Some("allow")
+        );
+        assert!(
+            summary
+                .get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        );
     }
 
     #[test]
@@ -1643,10 +1785,12 @@ mod tests {
             evidence.decision.reason_code,
             PromotionDecisionReasonCode::MissingEvidence.code()
         );
-        assert!(evidence
-            .decision
-            .missing_evidence_fields
-            .contains(&"validation_run_id".to_string()));
+        assert!(
+            evidence
+                .decision
+                .missing_evidence_fields
+                .contains(&"validation_run_id".to_string())
+        );
     }
 
     #[test]
@@ -1669,6 +1813,35 @@ mod tests {
             PromotionDecisionReasonCode::DecisionAllowed.code()
         );
         assert!(evidence.decision.missing_evidence_fields.is_empty());
+    }
+
+    #[test]
+    fn promotion_decision_start_denies_when_counterfactual_replay_gate_fails() {
+        let replay_orchestrator = CounterfactualReplayService::in_memory()
+            .with_shadow_evidence_port(Arc::new(
+                crate::promotion::counterfactual_replay::StaticShadowEvidencePort {
+                    slippage_bps: 120.0,
+                    simulated_fill_price: 0.43,
+                },
+            ));
+        let service = service_with_ports(
+            Arc::new(StubValidationEvidencePort::with_defaults()),
+            Arc::new(StubValidationGateOrchestrator::default()),
+            Arc::new(StubShadowEvidencePort::default()),
+        )
+        .with_counterfactual_replay_orchestrator(Arc::new(replay_orchestrator));
+
+        let evidence = service
+            .start_promotion_decision(sample_start_input())
+            .expect("replay denial should persist as denied decision");
+        assert_eq!(
+            evidence.decision.decision_state,
+            PromotionDecisionState::Denied
+        );
+        assert_eq!(
+            evidence.decision.reason_code,
+            PromotionDecisionReasonCode::ReplayGateDenied.code()
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod api_contract_versions;
 pub mod approvals;
 pub mod attribution_snapshots;
 pub mod audit;
+pub mod counterfactual_replay_runs;
 pub mod credential_rotation;
 pub mod export_jobs;
 pub mod freshness_gate;

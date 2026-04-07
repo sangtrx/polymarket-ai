@@ -889,3 +889,34 @@
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-5` ✅
 - `source "$HOME/.cargo/env" && npm test` ✅
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-5` ✅ (2026-04-07 22:48:47 QA automation rerun with expanded Story 6.5 list critical-flow E2E coverage)
+
+---
+
+## Story 6.6 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::counterfactual_replay_`) — validates FR46 formula semantics, deterministic boundary behavior (`== -5.0` allow path), invalid-baseline fail-closed diagnostics, replay-summary completeness, and placeholder rejection continuity.
+- [x] `crates/persistence/src/postgres/counterfactual_replay_runs.rs` (`postgres::counterfactual_replay_runs::tests::`) — validates `counterfactual_replay_runs` schema-scope isolation, canonical constraints/indexes, deterministic list ordering, and machine-readable persistence validation/error behavior.
+- [x] `services/research-gateway/src/promotion/counterfactual_replay.rs` (`promotion::counterfactual_replay::tests::`) — validates required scenario execution (`baseline`, `stressed_execution`, `delayed_exit`), seam reuse with Story 6.3 + 6.4 evidence ports, FR46 boundary handling, and fail-closed dependency/state behavior.
+- [x] `services/research-gateway/src/promotion/decisions.rs` (`promotion::decisions::tests::promotion_decision_start_`) — validates replay-summary backfill, replay-gate deny mapping (`promotion_decision_replay_gate_denied`), and preserve-existing promotion threshold/approval flows.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::counterfactual_replay_`) — validates authenticated replay start/read/list route behavior, canonical `data/meta/error` envelopes, deterministic `400/403/409/503/500` status mapping, malformed payload rejection, and unauthorized security-signal emission.
+- [x] `tests/api/story-6-6-counterfactual-replay-stress-gating-api.test.mjs` — validates route wiring, payload/query/envelope contracts, middleware/main replay orchestrator wiring, research-gateway seam exports, replay route negative-path guards (malformed JSON/query + auth-denial envelope), unauthorized signal continuity, and correlation-id continuity in replay list/query paths.
+- [x] `tests/e2e/story-6-6-counterfactual-replay-stress-gating.e2e.test.mjs` — validates migration scope boundaries, FR46 runbook contract coverage, seam-reuse guarantees, deterministic persistence/query boundary behavior, list-window boundary fail-closed diagnostics, NFR14 telemetry traceability tuple continuity, promote integration continuity, and Story 6.6 QA command wiring.
+
+### Coverage
+
+- Story 6.6 now has deterministic automated coverage for:
+  - FR46 scenario completeness and parameter fidelity (`2x` slippage, `50%` reduced fills, `60s` delayed exit),
+  - deterministic tolerance formula and boundary semantics (`< -5.0` deny, `== -5.0` allow),
+  - fail-closed baseline admissibility and dependency/state/persistence error handling,
+  - authenticated control-plane replay envelopes/status/security-signal continuity,
+  - Story 6.5 promote-path replay integration with canonical summary backfill and replay-gate deny reason-code continuity.
+- Automated Story 6.6 regression inventory in this QA refresh: **44 Story-6.6 tests passing** (`domain: 5`, `persistence: 5`, `research-gateway: 11`, `control-api: 5`, `api/e2e: 18`).
+
+### Execution Result
+
+- `node --test tests/api/story-6-6*.test.mjs tests/e2e/story-6-6*.test.mjs` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-6` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-5` ✅ (regression verification after Story 6.6 replay integration)
+- `source "$HOME/.cargo/env" && node --test tests/api/story-6-6*.test.mjs tests/e2e/story-6-6*.test.mjs && npm run --silent qa:test:story-6-6` ✅ (2026-04-08 01:13:10 QA automation refresh with expanded negative-path and telemetry coverage)

@@ -107,6 +107,7 @@ Unauthorized security-signal names:
 
 - [alpha-hypothesis-registry.md](./alpha-hypothesis-registry.md)
 - [alpha-validation-gate-policies.md](./alpha-validation-gate-policies.md)
+- [alpha-counterfactual-replay-stress-gating.md](./alpha-counterfactual-replay-stress-gating.md)
 - [reward-risk-policy-operations.md](./reward-risk-policy-operations.md)
 - [risk-limit-policy-operations.md](./risk-limit-policy-operations.md)
 - [report-export-workflows.md](./report-export-workflows.md)
