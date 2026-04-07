@@ -6,8 +6,9 @@ use domain::order::{
     normalize_order_idempotency_key, normalize_order_submission_idempotency_key,
 };
 use domain::risk::{
-    EmergencyControlMode, EmergencyControlReasonCode, PreTradeDecisionOutcome, PreTradeReasonCode,
-    UserStreamEvent, UserStreamEventStatus,
+    EmergencyControlMode, EmergencyControlReasonCode, PreTradeDecisionOutcome,
+    PreTradeParticipationGuardrailEvidence, PreTradeReasonCode, UserStreamEvent,
+    UserStreamEventStatus,
 };
 use persistence::postgres::orders::{
     OrderLifecyclePersistDisposition, OrderLifecyclePersistOutcome, OrderLifecyclePersistenceError,
@@ -58,19 +59,21 @@ impl Error for OrderLifecycleRuntimeError {}
 
 pub const DEFAULT_PRETRADE_ADJUDICATION_TIMEOUT_MS: u64 = 1_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreTradeAdjudicationRequest {
     pub order_id: String,
     pub market_id: String,
     pub correlation_id: String,
     pub requested_at_utc: String,
+    pub requested_order_size_units: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreTradeAdjudicationDecision {
     pub allowed: bool,
     pub reason_code: String,
     pub decided_at_utc: String,
+    pub participation_guardrail: Option<PreTradeParticipationGuardrailEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +123,7 @@ impl RiskAdjudicationPort for AllowAllRiskAdjudicationPort {
                 allowed: true,
                 reason_code: PreTradeReasonCode::Pass.code().to_string(),
                 decided_at_utc: request.requested_at_utc.clone(),
+                participation_guardrail: None,
             })
         })
     }
@@ -185,10 +189,25 @@ impl RiskAdjudicationPort for PostgresRiskAdjudicationPort {
                         )
                     })?;
 
+            let mut allowed = matches!(persisted_decision.outcome, PreTradeDecisionOutcome::Allow);
+            let mut reason_code = persisted_decision.reason_code.clone();
+            if allowed
+                && participation_guardrail_size_cap_exceeded(
+                    request.requested_order_size_units,
+                    persisted_decision.participation_guardrail.as_ref(),
+                )
+            {
+                allowed = false;
+                reason_code = PreTradeReasonCode::ParticipationGuardrailOvernightCapExceeded
+                    .code()
+                    .to_string();
+            }
+
             Ok(PreTradeAdjudicationDecision {
-                allowed: matches!(persisted_decision.outcome, PreTradeDecisionOutcome::Allow),
-                reason_code: persisted_decision.reason_code,
+                allowed,
+                reason_code,
                 decided_at_utc: persisted_decision.evaluated_at_utc,
+                participation_guardrail: persisted_decision.participation_guardrail,
             })
         })
     }
@@ -398,11 +417,12 @@ pub struct OrderLifecycleCommandOutcome {
     pub timestamp_utc: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubmitOrderCommand {
     pub order_id: String,
     pub market_id: String,
     pub mode: OrderMode,
+    pub requested_order_size_units: f64,
     pub idempotency_key: String,
     pub correlation_id: String,
     pub requested_at_utc: String,
@@ -541,12 +561,14 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
             &command.correlation_id,
             &command.requested_at_utc,
         )?;
+        validate_requested_order_size_units(command.requested_order_size_units)?;
         self.enforce_emergency_mode_for_submit(&command).await?;
         let adjudication_request = PreTradeAdjudicationRequest {
             order_id: command.order_id.clone(),
             market_id: command.market_id.clone(),
             correlation_id: command.correlation_id.clone(),
             requested_at_utc: command.requested_at_utc.clone(),
+            requested_order_size_units: command.requested_order_size_units,
         };
         let adjudication_decision = match self
             .adjudicate_submit_order_request(&adjudication_request)
@@ -863,8 +885,22 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
                 ))
             }
             Ok(Ok(decision)) => {
-                let normalized_reason_code = normalize_pretrade_reason_code(&decision.reason_code);
-                if decision.allowed && normalized_reason_code != PreTradeReasonCode::Pass.code() {
+                let mut allowed = decision.allowed;
+                let mut normalized_reason_code =
+                    normalize_pretrade_reason_code(&decision.reason_code).to_string();
+                if allowed
+                    && participation_guardrail_size_cap_exceeded(
+                        request.requested_order_size_units,
+                        decision.participation_guardrail.as_ref(),
+                    )
+                {
+                    allowed = false;
+                    normalized_reason_code =
+                        PreTradeReasonCode::ParticipationGuardrailOvernightCapExceeded
+                            .code()
+                            .to_string();
+                }
+                if allowed && normalized_reason_code != PreTradeReasonCode::Pass.code() {
                     return Err(OrderLifecycleRuntimeError::new(
                         PreTradeReasonCode::InvalidPayload.code(),
                         format!(
@@ -873,16 +909,17 @@ impl<S: OrderLifecycleStore> OrderLifecycleRuntime<S> {
                         ),
                     ));
                 }
-                if !decision.allowed && normalized_reason_code == PreTradeReasonCode::Pass.code() {
+                if !allowed && normalized_reason_code == PreTradeReasonCode::Pass.code() {
                     return Err(OrderLifecycleRuntimeError::new(
                         PreTradeReasonCode::InvalidPayload.code(),
                         "pre-trade adjudication deny decision cannot use pretrade_gate_pass reason_code",
                     ));
                 }
                 Ok(PreTradeAdjudicationDecision {
-                    allowed: decision.allowed,
-                    reason_code: normalized_reason_code.to_string(),
+                    allowed,
+                    reason_code: normalized_reason_code,
                     decided_at_utc: decision.decided_at_utc,
+                    participation_guardrail: decision.participation_guardrail,
                 })
             }
         }
@@ -1005,6 +1042,28 @@ fn validate_runtime_command_fields(
     validate_non_empty("requested_at_utc", requested_at_utc)?;
     validate_timestamp_utc("requested_at_utc", requested_at_utc)?;
     Ok(())
+}
+
+fn validate_requested_order_size_units(
+    requested_order_size_units: f64,
+) -> Result<(), OrderLifecycleRuntimeError> {
+    if requested_order_size_units.is_finite() && requested_order_size_units > 0.0 {
+        return Ok(());
+    }
+    Err(OrderLifecycleRuntimeError::new(
+        OrderLifecycleReasonCode::InvalidPayload.code(),
+        "requested_order_size_units must be finite and > 0",
+    ))
+}
+
+fn participation_guardrail_size_cap_exceeded(
+    requested_order_size_units: f64,
+    participation_guardrail: Option<&PreTradeParticipationGuardrailEvidence>,
+) -> bool {
+    participation_guardrail
+        .filter(|evidence| evidence.guardrail_mode == "size_cap")
+        .and_then(|evidence| evidence.capped_max_order_size_units)
+        .is_some_and(|cap| requested_order_size_units > cap)
 }
 
 fn validate_non_empty(field: &'static str, value: &str) -> Result<(), OrderLifecycleRuntimeError> {
@@ -1399,6 +1458,7 @@ mod tests {
             order_id: order_id.to_string(),
             market_id: "market-1".to_string(),
             mode: OrderMode::Limit,
+            requested_order_size_units: 10.0,
             idempotency_key: format!("submit::{order_id}"),
             correlation_id: format!("corr-submit-{order_id}"),
             requested_at_utc: "2026-04-06T00:00:00Z".to_string(),
@@ -1453,6 +1513,7 @@ mod tests {
                     allowed: false,
                     reason_code: PreTradeReasonCode::VenueIneligible.code().to_string(),
                     decided_at_utc: request.requested_at_utc.clone(),
+                    participation_guardrail: None,
                 })
             })
         }
@@ -1509,6 +1570,7 @@ mod tests {
                     allowed: true,
                     reason_code: PreTradeReasonCode::Pass.code().to_string(),
                     decided_at_utc: request.requested_at_utc.clone(),
+                    participation_guardrail: None,
                 })
             })
         }
@@ -1537,6 +1599,52 @@ mod tests {
                     allowed: false,
                     reason_code: PreTradeReasonCode::Pass.code().to_string(),
                     decided_at_utc: request.requested_at_utc.clone(),
+                    participation_guardrail: None,
+                })
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SizeCapRiskAdjudicationPort;
+
+    impl RiskAdjudicationPort for SizeCapRiskAdjudicationPort {
+        fn adjudicate_submit<'a>(
+            &'a self,
+            request: &'a PreTradeAdjudicationRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            PreTradeAdjudicationDecision,
+                            PreTradeAdjudicationPortError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(PreTradeAdjudicationDecision {
+                    allowed: true,
+                    reason_code: PreTradeReasonCode::Pass.code().to_string(),
+                    decided_at_utc: request.requested_at_utc.clone(),
+                    participation_guardrail: Some(PreTradeParticipationGuardrailEvidence {
+                        event_id: format!("fr41::{}::size-cap", request.order_id),
+                        guardrail_mode: "size_cap".to_string(),
+                        reason_code: "fr41_participation_overnight_size_cap_active".to_string(),
+                        market_id: request.market_id.clone(),
+                        cluster_id: "cluster_alpha".to_string(),
+                        correlation_id: request.correlation_id.clone(),
+                        observed_at_utc: request.requested_at_utc.clone(),
+                        evaluated_at_utc: request.requested_at_utc.clone(),
+                        liquidity_depth_usd: 12_500.0,
+                        inactivity_gap_seconds: 15_000.0,
+                        threshold_liquidity_depth_usd: 10_000.0,
+                        threshold_inactivity_pause_seconds: 900.0,
+                        threshold_overnight_gap_seconds: 14_400.0,
+                        normal_max_order_size_units: Some(20.0),
+                        capped_max_order_size_units: Some(5.0),
+                    }),
                 })
             })
         }
@@ -1727,6 +1835,51 @@ mod tests {
             .await
             .expect("hydrate should succeed");
         assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_size_cap_exceeded_is_rejected_without_side_effects() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(SizeCapRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
+
+        let error = runtime
+            .submit_order(sample_submit_command("order-pretrade-size-cap-exceeded"))
+            .await
+            .expect_err("size-cap overflow must fail submit path closed");
+        assert_eq!(
+            error.code,
+            PreTradeReasonCode::ParticipationGuardrailOvernightCapExceeded.code()
+        );
+        let hydrated = runtime
+            .hydrate_order("order-pretrade-size-cap-exceeded")
+            .await
+            .expect("hydrate should succeed");
+        assert!(hydrated.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_order_within_size_cap_is_accepted() {
+        let store = InMemoryOrderLifecycleStore::default();
+        let runtime = OrderLifecycleRuntime::with_risk_adjudication_port(
+            store,
+            Arc::new(SizeCapRiskAdjudicationPort),
+            Duration::from_millis(100),
+        );
+        let mut command = sample_submit_command("order-pretrade-size-cap-allow");
+        command.requested_order_size_units = 5.0;
+
+        let outcome = runtime
+            .submit_order(command)
+            .await
+            .expect("size-cap boundary should allow submit");
+        assert_eq!(
+            outcome.reason_code,
+            OrderLifecycleReasonCode::SubmissionAccepted.code()
+        );
     }
 
     #[tokio::test]

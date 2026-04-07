@@ -1,6 +1,6 @@
 use domain::risk::{
-    RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode,
-    validate_risk_limit_profile_version,
+    InventoryLimitRule, RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode,
+    RiskLimitScope, validate_risk_limit_profile_version,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -12,6 +12,12 @@ pub const LIMIT_STATE_STALE_THRESHOLD_SECONDS: i64 = 60;
 pub trait RuntimeRiskLimitStateReader: Send + Sync {
     fn active_profile(&self, profile_key: &str) -> Option<RiskLimitProfileVersion>;
     fn pending_profiles(&self, profile_key: &str) -> Vec<RiskLimitProfileVersion>;
+    fn normal_max_order_size_units(
+        &self,
+        profile_key: &str,
+        market_id: &str,
+        cluster_id: &str,
+    ) -> Option<f64>;
     fn state_unavailable_reason_code(&self) -> Option<String>;
 }
 
@@ -19,6 +25,7 @@ pub trait RuntimeRiskLimitStateReader: Send + Sync {
 pub struct InMemoryRiskLimitState {
     active_profiles: Arc<RwLock<BTreeMap<String, RiskLimitProfileVersion>>>,
     pending_profiles: Arc<RwLock<BTreeMap<String, Vec<RiskLimitProfileVersion>>>>,
+    inventory_rules: Arc<RwLock<BTreeMap<String, Vec<InventoryLimitRule>>>>,
     unavailable_reason_code: Arc<RwLock<Option<String>>>,
 }
 
@@ -37,6 +44,13 @@ impl InMemoryRiskLimitState {
             .entry(profile.profile_key.trim().to_ascii_lowercase())
             .or_default()
             .push(profile);
+    }
+
+    pub fn upsert_inventory_rules(&self, profile_key: &str, rules: Vec<InventoryLimitRule>) {
+        self.inventory_rules
+            .write()
+            .expect("inventory rules lock should not be poisoned")
+            .insert(profile_key.trim().to_ascii_lowercase(), rules);
     }
 
     pub fn set_state_unavailable(&self, reason_code: &str) {
@@ -76,6 +90,49 @@ impl RuntimeRiskLimitStateReader for InMemoryRiskLimitState {
             .get(&profile_key.trim().to_ascii_lowercase())
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn normal_max_order_size_units(
+        &self,
+        profile_key: &str,
+        market_id: &str,
+        cluster_id: &str,
+    ) -> Option<f64> {
+        let normalized_profile_key = profile_key.trim().to_ascii_lowercase();
+        let normalized_market_id = market_id.trim().to_ascii_lowercase();
+        let normalized_cluster_id = cluster_id.trim().to_ascii_lowercase();
+        let market_scope_candidates = [
+            normalized_market_id.clone(),
+            format!("market::{normalized_market_id}"),
+        ];
+        let strategy_scope_candidates = [
+            normalized_cluster_id.clone(),
+            format!("strategy::{normalized_cluster_id}"),
+        ];
+
+        let rules = self
+            .inventory_rules
+            .read()
+            .expect("inventory rules lock should not be poisoned")
+            .get(&normalized_profile_key)
+            .cloned()
+            .unwrap_or_default();
+
+        let select_rule = |scope: RiskLimitScope, candidates: &[String]| {
+            rules
+                .iter()
+                .find(|rule| {
+                    rule.scope == scope
+                        && candidates
+                            .iter()
+                            .any(|candidate| rule.scope_id.trim().eq_ignore_ascii_case(candidate))
+                })
+                .map(|rule| rule.max_order_size_units)
+                .filter(|value| value.is_finite() && *value > 0.0)
+        };
+
+        select_rule(RiskLimitScope::Market, &market_scope_candidates)
+            .or_else(|| select_rule(RiskLimitScope::Strategy, &strategy_scope_candidates))
     }
 
     fn state_unavailable_reason_code(&self) -> Option<String> {
@@ -214,7 +271,7 @@ struct RiskLimitStateTelemetryEvent<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::risk::{RiskLimitScope, RiskScopeLimit};
+    use domain::risk::{InventoryLimitRule, RiskLimitScope, RiskScopeLimit};
 
     fn sample_scope(
         scope: RiskLimitScope,
@@ -266,6 +323,26 @@ mod tests {
             reason_code: RiskLimitReasonCode::ApprovalRequired.code().to_string(),
             approval_reference: None,
             ..sample_active_profile(updated_at_utc)
+        }
+    }
+
+    fn sample_inventory_rule(
+        scope: RiskLimitScope,
+        scope_id: &str,
+        max_order_size_units: f64,
+    ) -> InventoryLimitRule {
+        InventoryLimitRule {
+            rule_id: format!("rule::{scope_id}"),
+            profile_key: "default".to_string(),
+            profile_version: 2,
+            scope,
+            scope_id: scope_id.to_string(),
+            max_position_units: 200.0,
+            max_order_size_units,
+            max_concentration_pct_nav: 30.0,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-risk-limit-001".to_string(),
+            updated_at_utc: "2026-04-06T00:00:00Z".to_string(),
         }
     }
 
@@ -355,5 +432,58 @@ mod tests {
             evaluate_risk_limit_state_snapshot(&state, "default", "2026-04-06T00:00:30Z");
         assert!(snapshot.available);
         assert_eq!(snapshot.pending_profile_count, 2);
+    }
+
+    #[test]
+    fn normal_max_order_size_prefers_market_scoped_rule() {
+        let state = InMemoryRiskLimitState::default();
+        state.upsert_inventory_rules(
+            "default",
+            vec![
+                sample_inventory_rule(RiskLimitScope::Strategy, "strategy::cluster_alpha", 55.0),
+                sample_inventory_rule(RiskLimitScope::Market, "market::market_yes_no_1", 40.0),
+            ],
+        );
+
+        let max_order_size =
+            state.normal_max_order_size_units("default", "market_yes_no_1", "cluster_alpha");
+        assert_eq!(max_order_size, Some(40.0));
+    }
+
+    #[test]
+    fn normal_max_order_size_falls_back_to_strategy_rule_when_market_rule_missing() {
+        let state = InMemoryRiskLimitState::default();
+        state.upsert_inventory_rules(
+            "default",
+            vec![sample_inventory_rule(
+                RiskLimitScope::Strategy,
+                "strategy::cluster_alpha",
+                32.0,
+            )],
+        );
+
+        let max_order_size =
+            state.normal_max_order_size_units("default", "market_yes_no_1", "cluster_alpha");
+        assert_eq!(max_order_size, Some(32.0));
+    }
+
+    #[test]
+    fn normal_max_order_size_is_unavailable_without_matching_market_or_strategy_rule() {
+        let state = InMemoryRiskLimitState::default();
+        state.upsert_inventory_rules(
+            "default",
+            vec![
+                sample_inventory_rule(RiskLimitScope::Market, "market::unrelated_market", 40.0),
+                sample_inventory_rule(
+                    RiskLimitScope::Strategy,
+                    "strategy::unrelated_cluster",
+                    32.0,
+                ),
+            ],
+        );
+
+        let max_order_size =
+            state.normal_max_order_size_units("default", "market_yes_no_1", "cluster_alpha");
+        assert_eq!(max_order_size, None);
     }
 }

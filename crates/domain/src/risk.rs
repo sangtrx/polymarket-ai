@@ -20,6 +20,10 @@ pub const REWARD_RISK_DEFAULT_THRESHOLD: f64 = 1.2;
 pub const REWARD_RISK_MIN_VOLATILITY_BPS: f64 = 0.000_001;
 pub const FR40_REBATE_DELTA_THRESHOLD_BPS: f64 = 20.0;
 pub const FR40_SPREAD_WIDENING_THRESHOLD_BPS: f64 = 50.0;
+pub const FR41_LOW_LIQUIDITY_DEPTH_USD_THRESHOLD: f64 = 10_000.0;
+pub const FR41_INACTIVITY_PAUSE_THRESHOLD_SECONDS: f64 = 900.0;
+pub const FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS: f64 = 14_400.0;
+pub const FR41_OVERNIGHT_CAP_FACTOR: f64 = 0.25;
 pub const EMERGENCY_CONTROL_ACK_MAX_SECONDS: f64 = 1.0;
 pub const EMERGENCY_CONTROL_STATE_REFLECTION_MAX_SECONDS: f64 = 5.0;
 pub const EMERGENCY_CONTROL_SAFE_STATE_MAX_SECONDS: f64 = 5.0;
@@ -448,6 +452,8 @@ pub struct MarketSnapshot {
     pub market_id: String,
     pub cluster_id: String,
     pub liquidity_depth_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactivity_gap_seconds: Option<f64>,
     pub spread_bps: f64,
     pub reward_score: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1907,6 +1913,7 @@ pub fn market_stream_tick_to_snapshot(
         expected_volatility_bps: Some(1.0),
         venue_eligibility_state: None,
         projected_exposure_pct_nav,
+        inactivity_gap_seconds: None,
         observed_at_utc: tick.observed_at_utc.clone(),
     })
 }
@@ -3024,6 +3031,476 @@ pub fn evaluate_freshness_gate(
     })
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticipationGuardrailMode {
+    Pass,
+    Pause,
+    SizeCap,
+    Unavailable,
+}
+
+impl ParticipationGuardrailMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Pause => "pause",
+            Self::SizeCap => "size_cap",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ParticipationGuardrailContractError> {
+        match value {
+            "pass" => Ok(Self::Pass),
+            "pause" => Ok(Self::Pause),
+            "size_cap" => Ok(Self::SizeCap),
+            "unavailable" => Ok(Self::Unavailable),
+            _ => Err(ParticipationGuardrailContractError::invalid_payload(
+                format!("unknown FR41 guardrail mode `{value}`"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticipationGuardrailReasonCode {
+    NoTrigger,
+    LowLiquidityPause,
+    InactivityPause,
+    OvernightSizeCapActive,
+    DependencyUnavailable,
+    InvalidPayload,
+    PersistenceUnavailable,
+    EvidencePersisted,
+    EvidenceRead,
+}
+
+impl ParticipationGuardrailReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NoTrigger => "fr41_participation_no_trigger",
+            Self::LowLiquidityPause => "fr41_participation_low_liquidity_pause",
+            Self::InactivityPause => "fr41_participation_inactivity_pause",
+            Self::OvernightSizeCapActive => "fr41_participation_overnight_size_cap_active",
+            Self::DependencyUnavailable => "fr41_participation_dependency_unavailable",
+            Self::InvalidPayload => "fr41_participation_invalid_payload",
+            Self::PersistenceUnavailable => "fr41_participation_persistence_unavailable",
+            Self::EvidencePersisted => "fr41_participation_evidence_persisted",
+            Self::EvidenceRead => "fr41_participation_evidence_read",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ParticipationGuardrailContractError> {
+        match value {
+            "fr41_participation_no_trigger" => Ok(Self::NoTrigger),
+            "fr41_participation_low_liquidity_pause" => Ok(Self::LowLiquidityPause),
+            "fr41_participation_inactivity_pause" => Ok(Self::InactivityPause),
+            "fr41_participation_overnight_size_cap_active" => Ok(Self::OvernightSizeCapActive),
+            "fr41_participation_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "fr41_participation_invalid_payload" => Ok(Self::InvalidPayload),
+            "fr41_participation_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            "fr41_participation_evidence_persisted" => Ok(Self::EvidencePersisted),
+            "fr41_participation_evidence_read" => Ok(Self::EvidenceRead),
+            _ => Err(ParticipationGuardrailContractError::invalid_payload(
+                format!("unknown FR41 reason code `{value}`"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipationGuardrailValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipationGuardrailContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<ParticipationGuardrailValidationIssue>,
+}
+
+impl ParticipationGuardrailContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<ParticipationGuardrailValidationIssue>,
+    ) -> Self {
+        Self {
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+
+    pub fn dependency_unavailable_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<ParticipationGuardrailValidationIssue>,
+    ) -> Self {
+        Self {
+            code: ParticipationGuardrailReasonCode::DependencyUnavailable.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParticipationGuardrailEvaluationInput {
+    pub market_id: String,
+    pub cluster_id: String,
+    pub correlation_id: String,
+    pub observed_at_utc: String,
+    pub liquidity_depth_usd: Option<f64>,
+    pub inactivity_gap_seconds: Option<f64>,
+    pub normal_max_order_size_units: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParticipationGuardrailEvaluationOutcome {
+    pub market_id: String,
+    pub cluster_id: String,
+    pub correlation_id: String,
+    pub observed_at_utc: String,
+    pub guardrail_mode: ParticipationGuardrailMode,
+    pub reason_code: String,
+    pub liquidity_depth_usd: f64,
+    pub inactivity_gap_seconds: f64,
+    pub threshold_liquidity_depth_usd: f64,
+    pub threshold_inactivity_pause_seconds: f64,
+    pub threshold_overnight_gap_seconds: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_max_order_size_units: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capped_max_order_size_units: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreTradeParticipationGuardrailEvidence {
+    pub event_id: String,
+    pub guardrail_mode: String,
+    pub reason_code: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub correlation_id: String,
+    pub observed_at_utc: String,
+    pub evaluated_at_utc: String,
+    pub liquidity_depth_usd: f64,
+    pub inactivity_gap_seconds: f64,
+    pub threshold_liquidity_depth_usd: f64,
+    pub threshold_inactivity_pause_seconds: f64,
+    pub threshold_overnight_gap_seconds: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_max_order_size_units: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capped_max_order_size_units: Option<f64>,
+}
+
+pub fn evaluate_fr41_participation_guardrail(
+    input: &ParticipationGuardrailEvaluationInput,
+) -> Result<ParticipationGuardrailEvaluationOutcome, ParticipationGuardrailContractError> {
+    let mut field_errors = Vec::new();
+    validate_participation_guardrail_identifier_field(
+        &mut field_errors,
+        "market_id",
+        &input.market_id,
+    );
+    validate_participation_guardrail_identifier_field(
+        &mut field_errors,
+        "cluster_id",
+        &input.cluster_id,
+    );
+    validate_participation_guardrail_identifier_field(
+        &mut field_errors,
+        "correlation_id",
+        &input.correlation_id,
+    );
+    validate_participation_guardrail_timestamp_field(
+        &mut field_errors,
+        "observed_at_utc",
+        &input.observed_at_utc,
+    );
+    if !field_errors.is_empty() {
+        return Err(
+            ParticipationGuardrailContractError::invalid_payload_with_issues(
+                "FR41 participation guardrail payload is invalid",
+                field_errors,
+            ),
+        );
+    }
+
+    let mut dependency_issues = Vec::new();
+    let liquidity_depth_usd = require_participation_guardrail_signal(
+        &mut dependency_issues,
+        "liquidity_depth_usd",
+        input.liquidity_depth_usd,
+        false,
+    );
+    let inactivity_gap_seconds = require_participation_guardrail_signal(
+        &mut dependency_issues,
+        "inactivity_gap_seconds",
+        input.inactivity_gap_seconds,
+        false,
+    );
+    if !dependency_issues.is_empty() {
+        return Err(
+            ParticipationGuardrailContractError::dependency_unavailable_with_issues(
+                "required FR41 dependencies are unavailable",
+                dependency_issues,
+            ),
+        );
+    }
+    let liquidity_depth_usd = liquidity_depth_usd.expect("dependency checks guarantee liquidity");
+    let inactivity_gap_seconds =
+        inactivity_gap_seconds.expect("dependency checks guarantee inactivity");
+
+    let mut normal_max_order_size_units = None;
+    let mut capped_max_order_size_units = None;
+    let (guardrail_mode, reason_code) =
+        if liquidity_depth_usd < FR41_LOW_LIQUIDITY_DEPTH_USD_THRESHOLD {
+            (
+                ParticipationGuardrailMode::Pause,
+                ParticipationGuardrailReasonCode::LowLiquidityPause,
+            )
+        } else if inactivity_gap_seconds > FR41_INACTIVITY_PAUSE_THRESHOLD_SECONDS
+            && inactivity_gap_seconds <= FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS
+        {
+            (
+                ParticipationGuardrailMode::Pause,
+                ParticipationGuardrailReasonCode::InactivityPause,
+            )
+        } else if inactivity_gap_seconds > FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS {
+            let normal_baseline = require_participation_guardrail_signal(
+                &mut dependency_issues,
+                "normal_max_order_size_units",
+                input.normal_max_order_size_units,
+                true,
+            );
+            if !dependency_issues.is_empty() {
+                return Err(
+                    ParticipationGuardrailContractError::dependency_unavailable_with_issues(
+                        "required FR41 size-cap baseline is unavailable",
+                        dependency_issues,
+                    ),
+                );
+            }
+            let normal_baseline = normal_baseline
+                .expect("dependency checks guarantee size-cap baseline availability");
+            let capped = normal_baseline * FR41_OVERNIGHT_CAP_FACTOR;
+            if !capped.is_finite() || capped <= 0.0 {
+                return Err(
+                    ParticipationGuardrailContractError::dependency_unavailable_with_issues(
+                        "required FR41 size-cap baseline is unavailable",
+                        vec![ParticipationGuardrailValidationIssue {
+                        field: "normal_max_order_size_units",
+                        code: ParticipationGuardrailReasonCode::DependencyUnavailable.code(),
+                        message:
+                            "normal_max_order_size_units must produce a finite capped order size"
+                                .to_string(),
+                    }],
+                    ),
+                );
+            }
+            normal_max_order_size_units = Some(normal_baseline);
+            capped_max_order_size_units = Some(capped);
+            (
+                ParticipationGuardrailMode::SizeCap,
+                ParticipationGuardrailReasonCode::OvernightSizeCapActive,
+            )
+        } else {
+            (
+                ParticipationGuardrailMode::Pass,
+                ParticipationGuardrailReasonCode::NoTrigger,
+            )
+        };
+
+    Ok(ParticipationGuardrailEvaluationOutcome {
+        market_id: input.market_id.trim().to_ascii_lowercase(),
+        cluster_id: input.cluster_id.trim().to_ascii_lowercase(),
+        correlation_id: input.correlation_id.trim().to_ascii_lowercase(),
+        observed_at_utc: input.observed_at_utc.clone(),
+        guardrail_mode,
+        reason_code: reason_code.code().to_string(),
+        liquidity_depth_usd,
+        inactivity_gap_seconds,
+        threshold_liquidity_depth_usd: FR41_LOW_LIQUIDITY_DEPTH_USD_THRESHOLD,
+        threshold_inactivity_pause_seconds: FR41_INACTIVITY_PAUSE_THRESHOLD_SECONDS,
+        threshold_overnight_gap_seconds: FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS,
+        normal_max_order_size_units,
+        capped_max_order_size_units,
+    })
+}
+
+pub fn validate_pretrade_participation_guardrail_evidence(
+    evidence: &PreTradeParticipationGuardrailEvidence,
+) -> Result<(), ParticipationGuardrailContractError> {
+    let mut field_errors = Vec::new();
+    validate_participation_guardrail_identifier_field(
+        &mut field_errors,
+        "event_id",
+        &evidence.event_id,
+    );
+    validate_participation_guardrail_identifier_field(
+        &mut field_errors,
+        "market_id",
+        &evidence.market_id,
+    );
+    validate_participation_guardrail_identifier_field(
+        &mut field_errors,
+        "cluster_id",
+        &evidence.cluster_id,
+    );
+    validate_participation_guardrail_identifier_field(
+        &mut field_errors,
+        "correlation_id",
+        &evidence.correlation_id,
+    );
+    validate_participation_guardrail_non_empty_field(
+        &mut field_errors,
+        "reason_code",
+        &evidence.reason_code,
+    );
+    validate_participation_guardrail_non_empty_field(
+        &mut field_errors,
+        "guardrail_mode",
+        &evidence.guardrail_mode,
+    );
+    validate_participation_guardrail_timestamp_field(
+        &mut field_errors,
+        "observed_at_utc",
+        &evidence.observed_at_utc,
+    );
+    validate_participation_guardrail_timestamp_field(
+        &mut field_errors,
+        "evaluated_at_utc",
+        &evidence.evaluated_at_utc,
+    );
+    validate_participation_guardrail_finite_field(
+        &mut field_errors,
+        "liquidity_depth_usd",
+        evidence.liquidity_depth_usd,
+        false,
+    );
+    validate_participation_guardrail_finite_field(
+        &mut field_errors,
+        "inactivity_gap_seconds",
+        evidence.inactivity_gap_seconds,
+        false,
+    );
+    validate_participation_guardrail_finite_field(
+        &mut field_errors,
+        "threshold_liquidity_depth_usd",
+        evidence.threshold_liquidity_depth_usd,
+        false,
+    );
+    validate_participation_guardrail_finite_field(
+        &mut field_errors,
+        "threshold_inactivity_pause_seconds",
+        evidence.threshold_inactivity_pause_seconds,
+        false,
+    );
+    validate_participation_guardrail_finite_field(
+        &mut field_errors,
+        "threshold_overnight_gap_seconds",
+        evidence.threshold_overnight_gap_seconds,
+        false,
+    );
+    if let Some(value) = evidence.normal_max_order_size_units {
+        validate_participation_guardrail_finite_field(
+            &mut field_errors,
+            "normal_max_order_size_units",
+            value,
+            true,
+        );
+    }
+    if let Some(value) = evidence.capped_max_order_size_units {
+        validate_participation_guardrail_finite_field(
+            &mut field_errors,
+            "capped_max_order_size_units",
+            value,
+            true,
+        );
+    }
+    if ParticipationGuardrailReasonCode::parse(&evidence.reason_code).is_err() {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field: "reason_code",
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: "reason_code must be a supported FR41 reason code".to_string(),
+        });
+    }
+    let mode = match ParticipationGuardrailMode::parse(&evidence.guardrail_mode) {
+        Ok(mode) => Some(mode),
+        Err(_) => {
+            field_errors.push(ParticipationGuardrailValidationIssue {
+                field: "guardrail_mode",
+                code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+                message: "guardrail_mode must be one of: pass, pause, size_cap, unavailable"
+                    .to_string(),
+            });
+            None
+        }
+    };
+    if evidence.observed_at_utc > evidence.evaluated_at_utc {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field: "evaluated_at_utc",
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: "evaluated_at_utc must be greater than or equal to observed_at_utc"
+                .to_string(),
+        });
+    }
+    if mode == Some(ParticipationGuardrailMode::SizeCap) {
+        if evidence.normal_max_order_size_units.is_none() {
+            field_errors.push(ParticipationGuardrailValidationIssue {
+                field: "normal_max_order_size_units",
+                code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+                message: "size_cap mode requires normal_max_order_size_units".to_string(),
+            });
+        }
+        if evidence.capped_max_order_size_units.is_none() {
+            field_errors.push(ParticipationGuardrailValidationIssue {
+                field: "capped_max_order_size_units",
+                code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+                message: "size_cap mode requires capped_max_order_size_units".to_string(),
+            });
+        }
+        if let (Some(normal), Some(capped)) = (
+            evidence.normal_max_order_size_units,
+            evidence.capped_max_order_size_units,
+        ) {
+            let expected_capped = normal * FR41_OVERNIGHT_CAP_FACTOR;
+            if (capped - expected_capped).abs() > 0.000_000_1 {
+                field_errors.push(ParticipationGuardrailValidationIssue {
+                    field: "capped_max_order_size_units",
+                    code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+                    message: format!(
+                        "capped_max_order_size_units must equal normal_max_order_size_units * {FR41_OVERNIGHT_CAP_FACTOR}"
+                    ),
+                });
+            }
+        }
+    }
+    if field_errors.is_empty() {
+        return Ok(());
+    }
+    Err(
+        ParticipationGuardrailContractError::invalid_payload_with_issues(
+            "FR41 participation guardrail evidence is invalid",
+            field_errors,
+        ),
+    )
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum PreTradeGateDimension {
@@ -3036,6 +3513,7 @@ pub enum PreTradeGateDimension {
     StrategyApproval,
     VenueEligibility,
     RewardPerRisk,
+    ParticipationGuardrail,
 }
 
 impl PreTradeGateDimension {
@@ -3050,6 +3528,7 @@ impl PreTradeGateDimension {
             Self::StrategyApproval => "strategy_approval",
             Self::VenueEligibility => "venue_eligibility",
             Self::RewardPerRisk => "reward_per_risk",
+            Self::ParticipationGuardrail => "participation_guardrail",
         }
     }
 
@@ -3064,6 +3543,7 @@ impl PreTradeGateDimension {
             "strategy_approval" => Ok(Self::StrategyApproval),
             "venue_eligibility" => Ok(Self::VenueEligibility),
             "reward_per_risk" => Ok(Self::RewardPerRisk),
+            "participation_guardrail" => Ok(Self::ParticipationGuardrail),
             _ => Err(PreTradeGateContractError::invalid_payload(format!(
                 "unknown pre-trade gate dimension `{value}`"
             ))),
@@ -3116,6 +3596,10 @@ pub enum PreTradeReasonCode {
     VenueIneligible,
     RewardRiskStateUnavailable,
     RewardRiskBelowThreshold,
+    ParticipationGuardrailUnavailable,
+    ParticipationGuardrailLowLiquidityPause,
+    ParticipationGuardrailInactivityPause,
+    ParticipationGuardrailOvernightCapExceeded,
     AdjudicationUnavailable,
     AdjudicationTimeout,
     PersistenceUnavailable,
@@ -3141,6 +3625,18 @@ impl PreTradeReasonCode {
             Self::VenueIneligible => "pretrade_venue_ineligible",
             Self::RewardRiskStateUnavailable => "pretrade_reward_risk_state_unavailable",
             Self::RewardRiskBelowThreshold => "pretrade_reward_risk_below_threshold",
+            Self::ParticipationGuardrailUnavailable => {
+                "pretrade_participation_guardrail_unavailable"
+            }
+            Self::ParticipationGuardrailLowLiquidityPause => {
+                "pretrade_participation_guardrail_low_liquidity_pause"
+            }
+            Self::ParticipationGuardrailInactivityPause => {
+                "pretrade_participation_guardrail_inactivity_pause"
+            }
+            Self::ParticipationGuardrailOvernightCapExceeded => {
+                "pretrade_participation_guardrail_overnight_cap_exceeded"
+            }
             Self::AdjudicationUnavailable => "pretrade_adjudication_unavailable",
             Self::AdjudicationTimeout => "pretrade_adjudication_timeout",
             Self::PersistenceUnavailable => "pretrade_persistence_unavailable",
@@ -3166,6 +3662,18 @@ impl PreTradeReasonCode {
             "pretrade_venue_ineligible" => Ok(Self::VenueIneligible),
             "pretrade_reward_risk_state_unavailable" => Ok(Self::RewardRiskStateUnavailable),
             "pretrade_reward_risk_below_threshold" => Ok(Self::RewardRiskBelowThreshold),
+            "pretrade_participation_guardrail_unavailable" => {
+                Ok(Self::ParticipationGuardrailUnavailable)
+            }
+            "pretrade_participation_guardrail_low_liquidity_pause" => {
+                Ok(Self::ParticipationGuardrailLowLiquidityPause)
+            }
+            "pretrade_participation_guardrail_inactivity_pause" => {
+                Ok(Self::ParticipationGuardrailInactivityPause)
+            }
+            "pretrade_participation_guardrail_overnight_cap_exceeded" => {
+                Ok(Self::ParticipationGuardrailOvernightCapExceeded)
+            }
             "pretrade_adjudication_unavailable" => Ok(Self::AdjudicationUnavailable),
             "pretrade_adjudication_timeout" => Ok(Self::AdjudicationTimeout),
             "pretrade_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
@@ -3220,7 +3728,7 @@ pub struct PreTradeGateResult {
     pub evaluated_at_utc: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PreTradeGateDecision {
     pub decision_id: String,
     pub intent_id: String,
@@ -3231,6 +3739,8 @@ pub struct PreTradeGateDecision {
     pub reason_code: String,
     pub protective_mode_active: bool,
     pub gate_results: Vec<PreTradeGateResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participation_guardrail: Option<PreTradeParticipationGuardrailEvidence>,
     pub correlation_id: String,
     pub evaluated_at_utc: String,
 }
@@ -3363,6 +3873,56 @@ pub fn validate_pretrade_gate_decision(
             field_errors.extend(error.field_errors);
         }
     }
+    if let Some(participation_guardrail) = decision.participation_guardrail.as_ref() {
+        if let Err(error) =
+            validate_pretrade_participation_guardrail_evidence(participation_guardrail)
+        {
+            field_errors.extend(error.field_errors.into_iter().map(|issue| {
+                PreTradeGateValidationIssue {
+                    field: issue.field,
+                    code: issue.code,
+                    message: issue.message,
+                }
+            }));
+        }
+        if normalize_pretrade_identifier(&participation_guardrail.market_id) != decision.market_id {
+            field_errors.push(PreTradeGateValidationIssue {
+                field: "participation_guardrail.market_id",
+                code: PreTradeReasonCode::InvalidPayload.code(),
+                message: "participation_guardrail.market_id must match decision market_id"
+                    .to_string(),
+            });
+        }
+        if normalize_pretrade_identifier(&participation_guardrail.cluster_id) != decision.cluster_id
+        {
+            field_errors.push(PreTradeGateValidationIssue {
+                field: "participation_guardrail.cluster_id",
+                code: PreTradeReasonCode::InvalidPayload.code(),
+                message: "participation_guardrail.cluster_id must match decision cluster_id"
+                    .to_string(),
+            });
+        }
+        if normalize_pretrade_identifier(&participation_guardrail.correlation_id)
+            != decision.correlation_id
+        {
+            field_errors.push(PreTradeGateValidationIssue {
+                field: "participation_guardrail.correlation_id",
+                code: PreTradeReasonCode::InvalidPayload.code(),
+                message:
+                    "participation_guardrail.correlation_id must match decision correlation_id"
+                        .to_string(),
+            });
+        }
+        if participation_guardrail.evaluated_at_utc != decision.evaluated_at_utc {
+            field_errors.push(PreTradeGateValidationIssue {
+                field: "participation_guardrail.evaluated_at_utc",
+                code: PreTradeReasonCode::InvalidPayload.code(),
+                message:
+                    "participation_guardrail.evaluated_at_utc must match decision evaluated_at_utc"
+                        .to_string(),
+            });
+        }
+    }
 
     let failed = decision
         .gate_results
@@ -3445,6 +4005,7 @@ pub fn adjudicate_pretrade_gate_results(
     correlation_id: &str,
     evaluated_at_utc: &str,
     gate_results: Vec<PreTradeGateResult>,
+    participation_guardrail: Option<PreTradeParticipationGuardrailEvidence>,
     protective_mode_active: bool,
 ) -> Result<PreTradeGateDecision, PreTradeGateContractError> {
     if gate_results.is_empty() {
@@ -3487,6 +4048,7 @@ pub fn adjudicate_pretrade_gate_results(
         reason_code,
         protective_mode_active,
         gate_results,
+        participation_guardrail,
         correlation_id: normalize_pretrade_identifier(correlation_id),
         evaluated_at_utc: evaluated_at_utc.to_string(),
     };
@@ -4890,6 +5452,131 @@ fn require_regime_shift_eligibility_state(
     }
 }
 
+fn validate_participation_guardrail_identifier_field(
+    field_errors: &mut Vec<ParticipationGuardrailValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field,
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+        return;
+    }
+    if !is_canonical_identifier(&normalized) {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field,
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: format!("{field} must contain 3-120 canonical characters"),
+        });
+    }
+}
+
+fn validate_participation_guardrail_timestamp_field(
+    field_errors: &mut Vec<ParticipationGuardrailValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field,
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
+fn validate_participation_guardrail_non_empty_field(
+    field_errors: &mut Vec<ParticipationGuardrailValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field,
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_participation_guardrail_finite_field(
+    field_errors: &mut Vec<ParticipationGuardrailValidationIssue>,
+    field: &'static str,
+    value: f64,
+    strictly_positive: bool,
+) {
+    if !value.is_finite() {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field,
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite"),
+        });
+        return;
+    }
+    if strictly_positive && value <= 0.0 {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field,
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be > 0"),
+        });
+    } else if !strictly_positive && value < 0.0 {
+        field_errors.push(ParticipationGuardrailValidationIssue {
+            field,
+            code: ParticipationGuardrailReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be >= 0"),
+        });
+    }
+}
+
+fn require_participation_guardrail_signal(
+    field_errors: &mut Vec<ParticipationGuardrailValidationIssue>,
+    field: &'static str,
+    value: Option<f64>,
+    strictly_positive: bool,
+) -> Option<f64> {
+    match value {
+        Some(value) if value.is_finite() && (!strictly_positive || value > 0.0) && value >= 0.0 => {
+            Some(value)
+        }
+        Some(value) if !value.is_finite() => {
+            field_errors.push(ParticipationGuardrailValidationIssue {
+                field,
+                code: ParticipationGuardrailReasonCode::DependencyUnavailable.code(),
+                message: format!("{field} must be finite"),
+            });
+            None
+        }
+        Some(_) if strictly_positive => {
+            field_errors.push(ParticipationGuardrailValidationIssue {
+                field,
+                code: ParticipationGuardrailReasonCode::DependencyUnavailable.code(),
+                message: format!("{field} must be > 0"),
+            });
+            None
+        }
+        Some(_) => {
+            field_errors.push(ParticipationGuardrailValidationIssue {
+                field,
+                code: ParticipationGuardrailReasonCode::DependencyUnavailable.code(),
+                message: format!("{field} must be >= 0"),
+            });
+            None
+        }
+        None => {
+            field_errors.push(ParticipationGuardrailValidationIssue {
+                field,
+                code: ParticipationGuardrailReasonCode::DependencyUnavailable.code(),
+                message: format!("{field} is required for FR41 evaluation"),
+            });
+            None
+        }
+    }
+}
+
 fn parse_utc_timestamp(value: &str) -> Result<OffsetDateTime, ()> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ())?;
     if parsed.offset() != UtcOffset::UTC {
@@ -5089,6 +5776,7 @@ mod tests {
             market_id: "market_yes_no_1".to_string(),
             cluster_id: "cluster_alpha".to_string(),
             liquidity_depth_usd: 700.0,
+            inactivity_gap_seconds: Some(300.0),
             spread_bps: 2.5,
             reward_score: 0.7,
             expected_reward_bps: Some(80.0),
@@ -5198,6 +5886,7 @@ mod tests {
             market_id: "market_yes_no_1".to_string(),
             cluster_id: "cluster_alpha".to_string(),
             liquidity_depth_usd: 700.0,
+            inactivity_gap_seconds: Some(300.0),
             spread_bps,
             reward_score: 0.7,
             expected_reward_bps: Some(80.0),
@@ -5971,6 +6660,137 @@ mod tests {
         }
     }
 
+    fn sample_fr41_input() -> ParticipationGuardrailEvaluationInput {
+        ParticipationGuardrailEvaluationInput {
+            market_id: "market_yes_no_1".to_string(),
+            cluster_id: "cluster_alpha".to_string(),
+            correlation_id: "corr-fr41-001".to_string(),
+            observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
+            liquidity_depth_usd: Some(12_500.0),
+            inactivity_gap_seconds: Some(300.0),
+            normal_max_order_size_units: Some(40.0),
+        }
+    }
+
+    #[test]
+    fn fr41_participation_low_liquidity_threshold_is_strictly_less_than_10k() {
+        let mut low_liquidity = sample_fr41_input();
+        low_liquidity.liquidity_depth_usd = Some(9_999.99);
+        let low_liquidity_outcome = evaluate_fr41_participation_guardrail(&low_liquidity)
+            .expect("depth below 10k should trigger low-liquidity pause");
+        assert_eq!(
+            low_liquidity_outcome.guardrail_mode,
+            ParticipationGuardrailMode::Pause
+        );
+        assert_eq!(
+            low_liquidity_outcome.reason_code,
+            ParticipationGuardrailReasonCode::LowLiquidityPause.code()
+        );
+
+        let mut boundary = sample_fr41_input();
+        boundary.liquidity_depth_usd = Some(10_000.0);
+        let boundary_outcome = evaluate_fr41_participation_guardrail(&boundary)
+            .expect("depth equality boundary should remain pass");
+        assert_eq!(
+            boundary_outcome.guardrail_mode,
+            ParticipationGuardrailMode::Pass
+        );
+        assert_eq!(
+            boundary_outcome.reason_code,
+            ParticipationGuardrailReasonCode::NoTrigger.code()
+        );
+    }
+
+    #[test]
+    fn fr41_participation_inactivity_pause_and_overnight_cap_boundaries_are_deterministic() {
+        let mut at_15_min_boundary = sample_fr41_input();
+        at_15_min_boundary.inactivity_gap_seconds = Some(900.0);
+        let at_15_min_outcome = evaluate_fr41_participation_guardrail(&at_15_min_boundary)
+            .expect("15 minute equality boundary should not trigger inactivity pause");
+        assert_eq!(
+            at_15_min_outcome.guardrail_mode,
+            ParticipationGuardrailMode::Pass
+        );
+
+        let mut pause_window = sample_fr41_input();
+        pause_window.inactivity_gap_seconds = Some(901.0);
+        let pause_outcome = evaluate_fr41_participation_guardrail(&pause_window)
+            .expect("inactivity above 15 minutes should pause participation");
+        assert_eq!(
+            pause_outcome.guardrail_mode,
+            ParticipationGuardrailMode::Pause
+        );
+        assert_eq!(
+            pause_outcome.reason_code,
+            ParticipationGuardrailReasonCode::InactivityPause.code()
+        );
+
+        let mut at_4h_boundary = sample_fr41_input();
+        at_4h_boundary.inactivity_gap_seconds = Some(14_400.0);
+        let at_4h_outcome = evaluate_fr41_participation_guardrail(&at_4h_boundary)
+            .expect("4h equality boundary should remain inactivity-pause window");
+        assert_eq!(
+            at_4h_outcome.guardrail_mode,
+            ParticipationGuardrailMode::Pause
+        );
+        assert_eq!(
+            at_4h_outcome.reason_code,
+            ParticipationGuardrailReasonCode::InactivityPause.code()
+        );
+
+        let mut overnight = sample_fr41_input();
+        overnight.inactivity_gap_seconds = Some(14_401.0);
+        let overnight_outcome = evaluate_fr41_participation_guardrail(&overnight)
+            .expect("inactivity above 4h should trigger 25% overnight size cap");
+        assert_eq!(
+            overnight_outcome.guardrail_mode,
+            ParticipationGuardrailMode::SizeCap
+        );
+        assert_eq!(
+            overnight_outcome.reason_code,
+            ParticipationGuardrailReasonCode::OvernightSizeCapActive.code()
+        );
+        assert_eq!(overnight_outcome.normal_max_order_size_units, Some(40.0));
+        assert_eq!(overnight_outcome.capped_max_order_size_units, Some(10.0));
+    }
+
+    #[test]
+    fn fr41_participation_precedence_prefers_low_liquidity_pause_over_overnight_size_cap() {
+        let mut input = sample_fr41_input();
+        input.liquidity_depth_usd = Some(9_000.0);
+        input.inactivity_gap_seconds = Some(15_000.0);
+        let outcome = evaluate_fr41_participation_guardrail(&input)
+            .expect("low-liquidity pause should supersede inactivity-derived cap");
+
+        assert_eq!(outcome.guardrail_mode, ParticipationGuardrailMode::Pause);
+        assert_eq!(
+            outcome.reason_code,
+            ParticipationGuardrailReasonCode::LowLiquidityPause.code()
+        );
+        assert_eq!(outcome.normal_max_order_size_units, None);
+        assert_eq!(outcome.capped_max_order_size_units, None);
+    }
+
+    #[test]
+    fn fr41_participation_fails_closed_when_overnight_baseline_is_missing() {
+        let mut input = sample_fr41_input();
+        input.inactivity_gap_seconds = Some(15_000.0);
+        input.normal_max_order_size_units = None;
+
+        let error = evaluate_fr41_participation_guardrail(&input)
+            .expect_err("missing overnight baseline should fail closed");
+        assert_eq!(
+            error.code,
+            ParticipationGuardrailReasonCode::DependencyUnavailable.code()
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "normal_max_order_size_units")
+        );
+    }
+
     #[test]
     fn pretrade_reason_code_parse_round_trip_is_deterministic() {
         let codes = [
@@ -5981,6 +6801,10 @@ mod tests {
             PreTradeReasonCode::DrawdownStopTriggered,
             PreTradeReasonCode::VenueIneligible,
             PreTradeReasonCode::RewardRiskBelowThreshold,
+            PreTradeReasonCode::ParticipationGuardrailUnavailable,
+            PreTradeReasonCode::ParticipationGuardrailLowLiquidityPause,
+            PreTradeReasonCode::ParticipationGuardrailInactivityPause,
+            PreTradeReasonCode::ParticipationGuardrailOvernightCapExceeded,
         ];
 
         for code in codes {
@@ -6039,6 +6863,7 @@ mod tests {
             " corr-pretrade-1 ",
             "2026-04-06T00:00:00Z",
             gate_results,
+            None,
             false,
         )
         .expect("all passing gates should produce allow decision");
@@ -6083,6 +6908,7 @@ mod tests {
             "corr-pretrade-2",
             "2026-04-06T00:00:01Z",
             gate_results,
+            None,
             false,
         )
         .expect("single failed gate should produce deny decision");
@@ -6145,6 +6971,7 @@ mod tests {
             "corr-pretrade-3",
             "2026-04-06T00:00:02Z",
             gate_results,
+            None,
             true,
         )
         .expect("drawdown stop boundary should deny with protective mode");
@@ -6175,6 +7002,7 @@ mod tests {
             "corr-pretrade-4",
             "2026-04-06T00:00:03Z",
             gate_results,
+            None,
             true,
         )
         .expect_err("protective mode must be restricted to drawdown-triggered denies");

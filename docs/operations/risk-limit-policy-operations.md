@@ -58,3 +58,8 @@ Critical increase detection is fail-closed:
    - correlation metadata.
 3. For activated critical increases, confirm immutable audit entries include matching `approval_reference`.
 4. Correlate control response `correlation_id` with audit retrieval paths before closing incident or change request.
+
+## Cross-runbook links
+
+1. FR41 participation guardrails and overnight cap operations: `docs/operations/low-liquidity-overnight-guardrails.md`
+2. Pre-trade pipeline sequencing and reason-code matrix: `docs/operations/pretrade-gate-pipeline.md`

@@ -47,10 +47,10 @@ use domain::reporting_schedule::{
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
-    MarketPolicyValidationIssue, MarketSnapshot, RegimeShiftReasonCode, RegimeShiftThresholds,
-    RewardRiskReasonCode, RewardRiskValidationIssue, RiskLimitReasonCode, RiskLimitScope,
-    RiskLimitValidationIssue, SafetyControlActionRecord, VenueEligibilityState,
-    evaluate_fr40_regime_shift,
+    MarketPolicyValidationIssue, MarketSnapshot, ParticipationGuardrailReasonCode,
+    RegimeShiftReasonCode, RegimeShiftThresholds, RewardRiskReasonCode, RewardRiskValidationIssue,
+    RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue, SafetyControlActionRecord,
+    VenueEligibilityState, evaluate_fr40_regime_shift,
 };
 use governance_service::allocation_policy::{
     AllocationPolicyMutationEvidence, EvaluateRebalanceDriftInput,
@@ -84,6 +84,7 @@ use persistence::postgres::incident_alerts::{
     load_recent_incident_alerts, update_incident_alert_status,
 };
 use persistence::postgres::incident_query_views::load_incident_forensics_timeline;
+use persistence::postgres::participation_guardrail_events::load_participation_guardrail_events;
 use persistence::postgres::regime_shift_alerts::{
     RegimeShiftAlertRecord, create_regime_shift_alert, load_regime_shift_alerts,
 };
@@ -209,6 +210,10 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/incidents/regime-shifts",
             get(list_regime_shift_alerts),
+        )
+        .route(
+            "/control/incidents/participation-guardrails",
+            get(list_participation_guardrail_events),
         )
         .route(
             "/control/incidents/regime-shifts/dispatch",
@@ -2093,6 +2098,143 @@ pub async fn list_regime_shift_alerts(
     )
 }
 
+pub async fn list_participation_guardrail_events(
+    State(state): State<ControlApiState>,
+    Query(query): Query<ParticipationGuardrailEventsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/incidents/participation-guardrails".to_string();
+    let authorization = match authorize_incident_alert_action(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "participation_guardrail_events_query",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let limit = match parse_alert_limit(query.limit) {
+        Ok(limit) => limit,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "participation_guardrail_events_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+    let dependency_state = match parse_incident_dependency_state(query.dependency_state.as_deref())
+    {
+        Ok(state) => state,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::InvalidPayload.code(),
+                error.message,
+                error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlertValidationIssue {
+                        field: issue.field,
+                        code: issue.code,
+                        message: issue.message,
+                    })
+                    .collect(),
+                "participation_guardrail_events_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    match dependency_state {
+        IncidentDependencyState::DependencyUnavailable => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::DependencyUnavailable.code(),
+                "participation guardrail dependencies are unavailable".to_string(),
+                Vec::new(),
+                "participation_guardrail_events_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::StaleEvidence => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::StaleEvidence.code(),
+                "participation guardrail evidence is stale".to_string(),
+                Vec::new(),
+                "participation_guardrail_events_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::Healthy => {}
+    }
+
+    let Some(pool) = state.attribution_pool.as_ref() else {
+        return incident_alert_service_error_response(
+            ParticipationGuardrailReasonCode::DependencyUnavailable.code(),
+            "participation guardrail evidence persistence dependency is unavailable".to_string(),
+            Vec::new(),
+            "participation_guardrail_events_query",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    };
+    let events = match load_participation_guardrail_events(
+        pool,
+        query.market_id.as_deref(),
+        query.reason_code.as_deref(),
+        query.correlation_id.as_deref(),
+        query.start_ts.as_deref(),
+        query.end_ts.as_deref(),
+        limit,
+    )
+    .await
+    {
+        Ok(events) => events
+            .into_iter()
+            .map(to_participation_guardrail_event_item)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlertValidationIssue {
+                        field: issue.field,
+                        code: issue.code,
+                        message: issue.message,
+                    })
+                    .collect(),
+                "participation_guardrail_events_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    participation_guardrail_query_response(
+        &state,
+        &actor,
+        events,
+        authorization.timestamp_utc.clone(),
+        endpoint,
+    )
+}
+
 pub async fn dispatch_regime_shift_alerts(
     State(state): State<ControlApiState>,
     Extension(actor): Extension<AuthenticatedActor>,
@@ -2234,6 +2376,7 @@ pub async fn dispatch_regime_shift_alerts(
         market_id: market_id.clone(),
         cluster_id: cluster_id.clone(),
         liquidity_depth_usd: payload.previous_liquidity_depth_usd.unwrap_or(0.0),
+        inactivity_gap_seconds: None,
         spread_bps: payload.previous_spread_bps,
         reward_score: 0.0,
         expected_reward_bps: None,
@@ -2251,6 +2394,7 @@ pub async fn dispatch_regime_shift_alerts(
         market_id: market_id.clone(),
         cluster_id: cluster_id.clone(),
         liquidity_depth_usd: payload.current_liquidity_depth_usd.unwrap_or(0.0),
+        inactivity_gap_seconds: None,
         spread_bps: payload.current_spread_bps,
         reward_score: 0.0,
         expected_reward_bps: None,
@@ -7009,6 +7153,28 @@ fn to_regime_shift_alert_item(alert: RegimeShiftAlertRecord) -> RegimeShiftAlert
     }
 }
 
+fn to_participation_guardrail_event_item(
+    event: domain::risk::PreTradeParticipationGuardrailEvidence,
+) -> ParticipationGuardrailEventItem {
+    ParticipationGuardrailEventItem {
+        event_id: event.event_id,
+        guardrail_mode: event.guardrail_mode,
+        reason_code: event.reason_code,
+        market_id: event.market_id,
+        cluster_id: event.cluster_id,
+        correlation_id: event.correlation_id,
+        observed_at_utc: event.observed_at_utc,
+        evaluated_at_utc: event.evaluated_at_utc,
+        liquidity_depth_usd: event.liquidity_depth_usd,
+        inactivity_gap_seconds: event.inactivity_gap_seconds,
+        threshold_liquidity_depth_usd: event.threshold_liquidity_depth_usd,
+        threshold_inactivity_pause_seconds: event.threshold_inactivity_pause_seconds,
+        threshold_overnight_gap_seconds: event.threshold_overnight_gap_seconds,
+        normal_max_order_size_units: event.normal_max_order_size_units,
+        capped_max_order_size_units: event.capped_max_order_size_units,
+    }
+}
+
 fn to_regime_shift_alert_dispatch_item(
     detection: &domain::risk::RegimeShiftDetection,
     simulation: &AlertDispatchSimulation,
@@ -7121,6 +7287,73 @@ fn regime_shift_alert_query_response(
             data_state: data_state.to_string(),
             recommended_next_action,
             alerts,
+        }),
+    )
+        .into_response()
+}
+
+fn participation_guardrail_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    events: Vec<ParticipationGuardrailEventItem>,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let data_state = if events.is_empty() { "empty" } else { "ready" };
+    let reason_code = if events.is_empty() {
+        AlertReasonCode::NoTrigger.code().to_string()
+    } else {
+        AlertReasonCode::Ready.code().to_string()
+    };
+    let recommended_next_action = if events.is_empty() {
+        "No FR41 participation guardrail events matched this query. Continue monitoring liquidity and inactivity windows."
+            .to_string()
+    } else {
+        "Review FR41 guardrail modes and reason codes, then confirm operational thresholds and execution-size controls."
+            .to_string()
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "participation_guardrail_events_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "event_count": events.len(),
+            "data_state": data_state,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "participation_guardrail_events_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(ParticipationGuardrailEventsQueryResponse {
+            status: "accepted",
+            action: "participation_guardrail_events_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            source: "control-api.participation-guardrails.v1".to_string(),
+            reason_code,
+            data_state: data_state.to_string(),
+            recommended_next_action,
+            events,
         }),
     )
         .into_response()
@@ -7410,6 +7643,9 @@ fn incident_alert_service_error_status(code: &str) -> StatusCode {
         code if code == AlertReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
         code if code == AlertReasonCode::NoTrigger.code() => StatusCode::BAD_REQUEST,
         code if code == RegimeShiftReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == ParticipationGuardrailReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
         code if code == AlertReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
         code if code == AlertReasonCode::DuplicateSuppressed.code() => StatusCode::CONFLICT,
         code if code == AlertReasonCode::DependencyUnavailable.code()
@@ -7419,14 +7655,19 @@ fn incident_alert_service_error_status(code: &str) -> StatusCode {
             || code == AlertReasonCode::DeliverySlaBreached.code()
             || code == RegimeShiftReasonCode::DependencyUnavailable.code()
             || code == RegimeShiftReasonCode::PersistenceUnavailable.code()
+            || code == ParticipationGuardrailReasonCode::DependencyUnavailable.code()
+            || code == ParticipationGuardrailReasonCode::PersistenceUnavailable.code()
             || code == "regime_shift_query_failed"
             || code == "regime_shift_row_decode_failed"
+            || code == "participation_guardrail_query_failed"
+            || code == "participation_guardrail_row_decode_failed"
             || code == "alert_query_failed"
             || code == "alert_row_decode_failed" =>
         {
             StatusCode::SERVICE_UNAVAILABLE
         }
         "regime_shift_constraint_violation" => StatusCode::CONFLICT,
+        "participation_guardrail_constraint_violation" => StatusCode::CONFLICT,
         "alert_constraint_violation" => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -8618,6 +8859,24 @@ pub struct RegimeShiftAlertsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ParticipationGuardrailEventsQuery {
+    #[serde(default)]
+    pub market_id: Option<String>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub start_ts: Option<String>,
+    #[serde(default)]
+    pub end_ts: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub dependency_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RegimeShiftAlertDispatchPayload {
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -9159,6 +9418,42 @@ pub struct RegimeShiftAlertItem {
     pub dispatch_latency_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_used: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParticipationGuardrailEventsQueryResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub data_state: String,
+    pub recommended_next_action: String,
+    pub events: Vec<ParticipationGuardrailEventItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParticipationGuardrailEventItem {
+    pub event_id: String,
+    pub guardrail_mode: String,
+    pub reason_code: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub correlation_id: String,
+    pub observed_at_utc: String,
+    pub evaluated_at_utc: String,
+    pub liquidity_depth_usd: f64,
+    pub inactivity_gap_seconds: f64,
+    pub threshold_liquidity_depth_usd: f64,
+    pub threshold_inactivity_pause_seconds: f64,
+    pub threshold_overnight_gap_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal_max_order_size_units: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_max_order_size_units: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -16264,6 +16559,71 @@ mod tests {
             payload["error_code"],
             RegimeShiftReasonCode::DependencyUnavailable.code()
         );
+    }
+
+    #[tokio::test]
+    async fn participation_guardrail_query_route_fails_closed_when_persistence_dependency_is_unavailable()
+     {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/participation-guardrails?market_id=market_yes_no_1&limit=10")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-participation-guardrail-query-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["action"], "participation_guardrail_events_query");
+        assert_eq!(
+            payload["error_code"],
+            ParticipationGuardrailReasonCode::DependencyUnavailable.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn participation_guardrail_query_route_returns_alert_unauthorized_for_denied_reads() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/participation-guardrails")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header(
+                        "x-correlation-id",
+                        "corr-participation-guardrail-denied-001",
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "alert_unauthorized");
+        assert_eq!(payload["action"], "participation_guardrail_events_query");
     }
 
     #[tokio::test]

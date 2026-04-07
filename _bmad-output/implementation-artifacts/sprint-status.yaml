@@ -1,5 +1,5 @@
 # generated: 2026-04-04T17:40:16Z
-# last_updated: 2026-04-07T03:19:51Z
+# last_updated: 2026-04-07T06:53:01Z
 # project: polymarket-ai
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-04T17:40:16Z
-last_updated: 2026-04-07T03:19:51Z
+last_updated: 2026-04-07T06:53:01Z
 project: polymarket-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -81,7 +81,7 @@ development_status:
   epic-5: in-progress
   5-1-implement-reward-per-risk-policy-configuration-and-scoring: done
   5-2-add-incentive-and-regime-shift-detection-alerts: done
-  5-3-enforce-low-liquidity-and-overnight-participation-guardrails: backlog
+  5-3-enforce-low-liquidity-and-overnight-participation-guardrails: done
   5-4-configure-core-satellite-market-stratification-policies: backlog
   epic-5-retrospective: optional
   epic-6: backlog

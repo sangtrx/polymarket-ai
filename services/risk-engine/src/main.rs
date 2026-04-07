@@ -18,6 +18,9 @@ use persistence::postgres::market_policy::{
     load_active_market_policy_profile, load_market_cluster_override,
 };
 use persistence::postgres::market_stream::load_latest_market_stream_health;
+use persistence::postgres::participation_guardrail_events::{
+    ParticipationGuardrailPersistenceError, create_participation_guardrail_event,
+};
 use persistence::postgres::pretrade_gate::{
     PreTradeGatePersistenceError, insert_pretrade_gate_decision,
 };
@@ -103,7 +106,13 @@ impl gates::PreTradeDecisionPersistencePort for PostgresPreTradeDecisionPersiste
         Box::pin(async move {
             insert_pretrade_gate_decision(&self.pool, decision)
                 .await
-                .map_err(map_pretrade_persistence_error)
+                .map_err(map_pretrade_persistence_error)?;
+            if let Some(evidence) = decision.participation_guardrail.as_ref() {
+                create_participation_guardrail_event(&self.pool, evidence)
+                    .await
+                    .map_err(map_participation_guardrail_persistence_error)?;
+            }
+            Ok(())
         })
     }
 }
@@ -115,6 +124,15 @@ fn map_pretrade_persistence_error(
         .map(|reason| reason.code())
         .unwrap_or(PreTradeReasonCode::PersistenceUnavailable.code());
     gates::PreTradeDecisionPersistenceError::new(normalized_code, error.to_string())
+}
+
+fn map_participation_guardrail_persistence_error(
+    error: ParticipationGuardrailPersistenceError,
+) -> gates::PreTradeDecisionPersistenceError {
+    gates::PreTradeDecisionPersistenceError::new(
+        PreTradeReasonCode::PersistenceUnavailable.code(),
+        error.to_string(),
+    )
 }
 
 async fn evaluate_runtime_order_intent_gate_with_limit_state<D>(
@@ -325,7 +343,9 @@ async fn hydrate_latest_limit_state(
     match load_active_risk_limit_profile_bundle(pool, &config.profile_key).await {
         Ok(Some(bundle)) => {
             runtime_limit_state.clear_state_unavailable();
+            let profile_key = bundle.profile.profile_key.clone();
             runtime_limit_state.upsert_active_profile(bundle.profile);
+            runtime_limit_state.upsert_inventory_rules(&profile_key, bundle.inventory_rules);
             match load_pending_risk_limit_profile_bundles(pool, Some(&config.profile_key)).await {
                 Ok(pending_bundles) => {
                     for pending in pending_bundles {
@@ -469,6 +489,7 @@ fn is_approved_recovery_resume_run(run: &RecoveryGateRunEvidence) -> bool {
 
 fn load_market_snapshot_from_env(config: &BootstrapRuntimeConfig) -> Option<MarketSnapshot> {
     let liquidity_depth_usd = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_LIQUIDITY_USD")?;
+    let inactivity_gap_seconds = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_INACTIVITY_GAP_SECONDS");
     let spread_bps = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_SPREAD_BPS")?;
     let projected_exposure_pct_nav = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_EXPOSURE_PCT_NAV")?;
     let observed_at_utc = std::env::var("RISK_ENGINE_BOOTSTRAP_MARKET_OBSERVED_AT_UTC")
@@ -528,6 +549,7 @@ fn load_market_snapshot_from_env(config: &BootstrapRuntimeConfig) -> Option<Mark
         market_id: config.market_id.clone(),
         cluster_id: config.cluster_id.clone(),
         liquidity_depth_usd,
+        inactivity_gap_seconds,
         spread_bps,
         reward_score,
         expected_reward_bps,

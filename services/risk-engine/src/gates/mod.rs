@@ -8,12 +8,15 @@ use crate::safe_state::{
 use domain::reconciliation::ReconciliationReasonCode;
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, EmergencyControlTriggerSource,
-    FreshnessGateReasonCode, MarketClusterOverride, MarketEligibilityOutcome, MarketPolicyProfile,
-    MarketPolicyReasonCode, MarketSnapshot, MarketStreamHealthStatus, PreTradeDecisionOutcome,
-    PreTradeGateDecision, PreTradeGateDimension, PreTradeGateResult, PreTradeReasonCode,
-    RegimeShiftContractError, RegimeShiftDetection, RewardRiskPolicy, UserStreamReasonCode,
-    adjudicate_pretrade_gate_results, assess_market_stream_health, compute_reward_per_risk_score,
-    drawdown_stop_triggered, evaluate_fr40_regime_shift, evaluate_market_eligibility,
+    FR41_INACTIVITY_PAUSE_THRESHOLD_SECONDS, FR41_LOW_LIQUIDITY_DEPTH_USD_THRESHOLD,
+    FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS, FreshnessGateReasonCode, MarketClusterOverride,
+    MarketEligibilityOutcome, MarketPolicyProfile, MarketPolicyReasonCode, MarketSnapshot,
+    MarketStreamHealthStatus, ParticipationGuardrailMode, ParticipationGuardrailReasonCode,
+    PreTradeDecisionOutcome, PreTradeGateDecision, PreTradeGateDimension, PreTradeGateResult,
+    PreTradeParticipationGuardrailEvidence, PreTradeReasonCode, RegimeShiftContractError,
+    RegimeShiftDetection, RewardRiskPolicy, UserStreamReasonCode, adjudicate_pretrade_gate_results,
+    assess_market_stream_health, compute_reward_per_risk_score, drawdown_stop_triggered,
+    evaluate_fr40_regime_shift, evaluate_fr41_participation_guardrail, evaluate_market_eligibility,
     reward_risk_score_input_from_snapshot, reward_risk_threshold_for_policy,
     validate_reward_risk_policy,
 };
@@ -728,13 +731,36 @@ where
         );
     }
 
-    finalize_pretrade_decision(
+    let (participation_guardrail_gate, participation_guardrail) =
+        evaluate_pretrade_participation_guardrail_gate(
+            runtime_policy_state,
+            runtime_limit_state,
+            intent,
+            profile_key,
+            &evaluated_at_utc,
+        );
+    let participation_guardrail_passed = participation_guardrail_gate.passed;
+    gate_results.push(participation_guardrail_gate);
+    if !participation_guardrail_passed {
+        return finalize_pretrade_decision_with_guardrail(
+            intent,
+            profile_key,
+            gate_results,
+            false,
+            safe_state_port,
+            &evaluated_at_utc,
+            participation_guardrail,
+        );
+    }
+
+    finalize_pretrade_decision_with_guardrail(
         intent,
         profile_key,
         gate_results,
         false,
         safe_state_port,
         &evaluated_at_utc,
+        participation_guardrail,
     )
 }
 
@@ -781,6 +807,26 @@ fn finalize_pretrade_decision<P: RuntimeSafeStateSignalPort>(
     safe_state_port: &P,
     evaluated_at_utc: &str,
 ) -> PreTradeGateDecision {
+    finalize_pretrade_decision_with_guardrail(
+        intent,
+        profile_key,
+        gate_results,
+        protective_mode_active,
+        safe_state_port,
+        evaluated_at_utc,
+        None,
+    )
+}
+
+fn finalize_pretrade_decision_with_guardrail<P: RuntimeSafeStateSignalPort>(
+    intent: &OrderIntent,
+    profile_key: &str,
+    gate_results: Vec<PreTradeGateResult>,
+    protective_mode_active: bool,
+    safe_state_port: &P,
+    evaluated_at_utc: &str,
+    participation_guardrail: Option<PreTradeParticipationGuardrailEvidence>,
+) -> PreTradeGateDecision {
     let intent_id = sanitize_identifier(&intent.intent_id, "unknown_intent");
     let market_id = sanitize_identifier(&intent.market_id, "unknown_market");
     let cluster_id = sanitize_identifier(&intent.cluster_id, "unknown_cluster");
@@ -796,6 +842,7 @@ fn finalize_pretrade_decision<P: RuntimeSafeStateSignalPort>(
         &correlation_id,
         &normalized_evaluated_at_utc,
         gate_results,
+        participation_guardrail,
         protective_mode_active,
     ) {
         Ok(decision) => decision,
@@ -873,6 +920,7 @@ fn build_fail_closed_pretrade_decision(
             PreTradeReasonCode::InvalidPayload,
             evaluated_at_utc,
         )],
+        participation_guardrail: None,
         correlation_id: correlation_id.to_string(),
         evaluated_at_utc: evaluated_at_utc.to_string(),
     }
@@ -1238,6 +1286,168 @@ fn evaluate_pretrade_reward_risk_gate<S: RuntimePolicyStateReader>(
     }
 }
 
+fn evaluate_pretrade_participation_guardrail_gate<S, L>(
+    runtime_policy_state: &S,
+    runtime_limit_state: &L,
+    intent: &OrderIntent,
+    profile_key: &str,
+    evaluated_at_utc: &str,
+) -> (
+    PreTradeGateResult,
+    Option<PreTradeParticipationGuardrailEvidence>,
+)
+where
+    S: RuntimePolicyStateReader,
+    L: RuntimeRiskLimitStateReader,
+{
+    let Some(snapshot) = runtime_policy_state.market_snapshot(&intent.market_id) else {
+        return (
+            build_pretrade_gate_result(
+                PreTradeGateDimension::ParticipationGuardrail,
+                false,
+                PreTradeReasonCode::ParticipationGuardrailUnavailable,
+                evaluated_at_utc,
+            ),
+            Some(build_unavailable_participation_guardrail_evidence(
+                intent,
+                evaluated_at_utc,
+                None,
+                None,
+                None,
+            )),
+        );
+    };
+
+    let normal_max_order_size_units = runtime_limit_state.normal_max_order_size_units(
+        profile_key,
+        &intent.market_id,
+        &intent.cluster_id,
+    );
+    let input = domain::risk::ParticipationGuardrailEvaluationInput {
+        market_id: intent.market_id.clone(),
+        cluster_id: intent.cluster_id.clone(),
+        correlation_id: intent.correlation_id.clone(),
+        observed_at_utc: snapshot.observed_at_utc.clone(),
+        liquidity_depth_usd: Some(snapshot.liquidity_depth_usd),
+        inactivity_gap_seconds: snapshot.inactivity_gap_seconds,
+        normal_max_order_size_units,
+    };
+
+    match evaluate_fr41_participation_guardrail(&input) {
+        Ok(outcome) => {
+            let evidence = PreTradeParticipationGuardrailEvidence {
+                event_id: format!(
+                    "fr41::{}::{}",
+                    sanitize_identifier(&intent.intent_id, "unknown_intent"),
+                    compact_timestamp_token(evaluated_at_utc)
+                ),
+                guardrail_mode: outcome.guardrail_mode.as_str().to_string(),
+                reason_code: outcome.reason_code.clone(),
+                market_id: outcome.market_id,
+                cluster_id: outcome.cluster_id,
+                correlation_id: outcome.correlation_id,
+                observed_at_utc: outcome.observed_at_utc,
+                evaluated_at_utc: evaluated_at_utc.to_string(),
+                liquidity_depth_usd: outcome.liquidity_depth_usd,
+                inactivity_gap_seconds: outcome.inactivity_gap_seconds,
+                threshold_liquidity_depth_usd: outcome.threshold_liquidity_depth_usd,
+                threshold_inactivity_pause_seconds: outcome.threshold_inactivity_pause_seconds,
+                threshold_overnight_gap_seconds: outcome.threshold_overnight_gap_seconds,
+                normal_max_order_size_units: outcome.normal_max_order_size_units,
+                capped_max_order_size_units: outcome.capped_max_order_size_units,
+            };
+            let gate_result = match outcome.guardrail_mode {
+                ParticipationGuardrailMode::Pass | ParticipationGuardrailMode::SizeCap => {
+                    build_pretrade_gate_result(
+                        PreTradeGateDimension::ParticipationGuardrail,
+                        true,
+                        PreTradeReasonCode::Pass,
+                        evaluated_at_utc,
+                    )
+                }
+                ParticipationGuardrailMode::Pause => build_pretrade_gate_result(
+                    PreTradeGateDimension::ParticipationGuardrail,
+                    false,
+                    map_participation_guardrail_pause_reason_to_pretrade(&outcome.reason_code),
+                    evaluated_at_utc,
+                ),
+                ParticipationGuardrailMode::Unavailable => build_pretrade_gate_result(
+                    PreTradeGateDimension::ParticipationGuardrail,
+                    false,
+                    PreTradeReasonCode::ParticipationGuardrailUnavailable,
+                    evaluated_at_utc,
+                ),
+            };
+            (gate_result, Some(evidence))
+        }
+        Err(error) => {
+            println!(
+                "risk-engine FR41 participation guardrail evaluation failed closed: {} ({})",
+                error.code, error.message
+            );
+            (
+                build_pretrade_gate_result(
+                    PreTradeGateDimension::ParticipationGuardrail,
+                    false,
+                    PreTradeReasonCode::ParticipationGuardrailUnavailable,
+                    evaluated_at_utc,
+                ),
+                Some(build_unavailable_participation_guardrail_evidence(
+                    intent,
+                    evaluated_at_utc,
+                    Some(snapshot.liquidity_depth_usd),
+                    snapshot.inactivity_gap_seconds,
+                    normal_max_order_size_units,
+                )),
+            )
+        }
+    }
+}
+
+fn map_participation_guardrail_pause_reason_to_pretrade(reason_code: &str) -> PreTradeReasonCode {
+    match ParticipationGuardrailReasonCode::parse(reason_code) {
+        Ok(ParticipationGuardrailReasonCode::LowLiquidityPause) => {
+            PreTradeReasonCode::ParticipationGuardrailLowLiquidityPause
+        }
+        Ok(ParticipationGuardrailReasonCode::InactivityPause) => {
+            PreTradeReasonCode::ParticipationGuardrailInactivityPause
+        }
+        _ => PreTradeReasonCode::ParticipationGuardrailUnavailable,
+    }
+}
+
+fn build_unavailable_participation_guardrail_evidence(
+    intent: &OrderIntent,
+    evaluated_at_utc: &str,
+    liquidity_depth_usd: Option<f64>,
+    inactivity_gap_seconds: Option<f64>,
+    normal_max_order_size_units: Option<f64>,
+) -> PreTradeParticipationGuardrailEvidence {
+    PreTradeParticipationGuardrailEvidence {
+        event_id: format!(
+            "fr41::{}::{}::unavailable",
+            sanitize_identifier(&intent.intent_id, "unknown_intent"),
+            compact_timestamp_token(evaluated_at_utc)
+        ),
+        guardrail_mode: ParticipationGuardrailMode::Unavailable.as_str().to_string(),
+        reason_code: ParticipationGuardrailReasonCode::DependencyUnavailable
+            .code()
+            .to_string(),
+        market_id: sanitize_identifier(&intent.market_id, "unknown_market"),
+        cluster_id: sanitize_identifier(&intent.cluster_id, "unknown_cluster"),
+        correlation_id: sanitize_identifier(&intent.correlation_id, "unknown_correlation"),
+        observed_at_utc: evaluated_at_utc.to_string(),
+        evaluated_at_utc: evaluated_at_utc.to_string(),
+        liquidity_depth_usd: liquidity_depth_usd.unwrap_or(0.0),
+        inactivity_gap_seconds: inactivity_gap_seconds.unwrap_or(0.0),
+        threshold_liquidity_depth_usd: FR41_LOW_LIQUIDITY_DEPTH_USD_THRESHOLD,
+        threshold_inactivity_pause_seconds: FR41_INACTIVITY_PAUSE_THRESHOLD_SECONDS,
+        threshold_overnight_gap_seconds: FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS,
+        normal_max_order_size_units,
+        capped_max_order_size_units: None,
+    }
+}
+
 fn map_pretrade_reason_to_emergency_signal(
     decision: &PreTradeGateDecision,
 ) -> Option<EmergencySafeStateSignal> {
@@ -1260,7 +1470,8 @@ fn map_pretrade_reason_to_emergency_signal(
         | PreTradeReasonCode::RiskLimitStateUnavailable
         | PreTradeReasonCode::StrategyApprovalUnavailable
         | PreTradeReasonCode::VenueEligibilityUnavailable
-        | PreTradeReasonCode::RewardRiskStateUnavailable => (
+        | PreTradeReasonCode::RewardRiskStateUnavailable
+        | PreTradeReasonCode::ParticipationGuardrailUnavailable => (
             EmergencyControlTriggerSource::ControlUncertainty,
             EmergencyControlReasonCode::ControlUncertaintyTriggered.code(),
         ),
@@ -1317,6 +1528,7 @@ fn emit_pretrade_gate_telemetry(decision: &PreTradeGateDecision) {
         correlation_id: &decision.correlation_id,
         timestamp_utc: &decision.evaluated_at_utc,
         gate_results: &decision.gate_results,
+        participation_guardrail: decision.participation_guardrail.as_ref(),
     };
     println!(
         "{}",
@@ -1357,6 +1569,8 @@ struct PreTradeGateTelemetryEvent<'a> {
     correlation_id: &'a str,
     timestamp_utc: &'a str,
     gate_results: &'a [PreTradeGateResult],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    participation_guardrail: Option<&'a PreTradeParticipationGuardrailEvidence>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1378,10 +1592,11 @@ mod tests {
     use crate::limits::InMemoryRiskLimitState;
     use crate::safe_state::InMemorySafeStateSignals;
     use domain::risk::{
-        EmergencyControlReasonCode, EmergencyControlTriggerSource, MarketPolicyProfile,
-        MarketSnapshot, PreTradeDecisionOutcome, PreTradeGateDimension, PreTradeReasonCode,
-        RegimeShiftReasonCode, RewardRiskPolicy, RiskLimitProfileStatus, RiskLimitProfileVersion,
-        RiskLimitReasonCode, RiskLimitScope, RiskScopeLimit, VenueEligibilityState,
+        EmergencyControlReasonCode, EmergencyControlTriggerSource, InventoryLimitRule,
+        MarketPolicyProfile, MarketSnapshot, ParticipationGuardrailReasonCode,
+        PreTradeDecisionOutcome, PreTradeGateDimension, PreTradeReasonCode, RegimeShiftReasonCode,
+        RewardRiskPolicy, RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode,
+        RiskLimitScope, RiskScopeLimit, VenueEligibilityState,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -1464,6 +1679,26 @@ mod tests {
         }
     }
 
+    fn sample_inventory_rule(
+        scope: RiskLimitScope,
+        scope_id: &str,
+        max_order_size_units: f64,
+    ) -> InventoryLimitRule {
+        InventoryLimitRule {
+            rule_id: format!("rule::{scope_id}"),
+            profile_key: "default".to_string(),
+            profile_version: 1,
+            scope,
+            scope_id: scope_id.to_string(),
+            max_position_units: 200.0,
+            max_order_size_units,
+            max_concentration_pct_nav: 30.0,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-risk-limit-001".to_string(),
+            updated_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
     fn sample_market_policy_profile() -> MarketPolicyProfile {
         MarketPolicyProfile {
             profile_id: "policy_cluster_alpha".to_string(),
@@ -1483,7 +1718,8 @@ mod tests {
         MarketSnapshot {
             market_id: "market_yes_no_1".to_string(),
             cluster_id: "cluster_alpha".to_string(),
-            liquidity_depth_usd: 1200.0,
+            liquidity_depth_usd: 12_500.0,
+            inactivity_gap_seconds: Some(300.0),
             spread_bps: 2.0,
             reward_score: 0.8,
             expected_reward_bps: Some(1.8),
@@ -1899,6 +2135,182 @@ mod tests {
 
         assert!(decision.allowed);
         assert_eq!(decision.reason_code, PreTradeReasonCode::Pass.code());
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_participation_guardrail_low_liquidity_pause_denies() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        let mut snapshot = sample_market_snapshot();
+        snapshot.liquidity_depth_usd = 9_999.0;
+        snapshot.inactivity_gap_seconds = Some(600.0);
+        runtime_state.upsert_market_snapshot(snapshot);
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::ParticipationGuardrailLowLiquidityPause.code()
+        );
+        let guardrail_gate = decision
+            .gate_results
+            .iter()
+            .find(|result| result.gate == PreTradeGateDimension::ParticipationGuardrail)
+            .expect("FR41 gate result should be present");
+        assert!(!guardrail_gate.passed);
+        assert_eq!(
+            guardrail_gate.reason_code,
+            PreTradeReasonCode::ParticipationGuardrailLowLiquidityPause.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_participation_guardrail_overnight_cap_preserves_allow_semantics()
+     {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        let mut snapshot = sample_market_snapshot();
+        snapshot.liquidity_depth_usd = 12_500.0;
+        snapshot.inactivity_gap_seconds = Some(15_000.0);
+        runtime_state.upsert_market_snapshot(snapshot);
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        limit_state.upsert_inventory_rules(
+            "default",
+            vec![sample_inventory_rule(
+                RiskLimitScope::Market,
+                "market::market_yes_no_1",
+                40.0,
+            )],
+        );
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Allow);
+        assert_eq!(decision.reason_code, PreTradeReasonCode::Pass.code());
+        let reward_risk_index = decision
+            .gate_results
+            .iter()
+            .position(|result| result.gate == PreTradeGateDimension::RewardPerRisk)
+            .expect("reward-risk gate must be present");
+        let guardrail_index = decision
+            .gate_results
+            .iter()
+            .position(|result| result.gate == PreTradeGateDimension::ParticipationGuardrail)
+            .expect("FR41 gate must be present");
+        assert!(
+            guardrail_index > reward_risk_index,
+            "FR41 gate should execute after reward-risk gate"
+        );
+        let evidence = decision
+            .participation_guardrail
+            .as_ref()
+            .expect("allow decision should include FR41 evidence");
+        assert_eq!(evidence.guardrail_mode, "size_cap");
+        assert_eq!(
+            evidence.reason_code,
+            ParticipationGuardrailReasonCode::OvernightSizeCapActive.code()
+        );
+        assert_eq!(evidence.normal_max_order_size_units, Some(40.0));
+        assert_eq!(evidence.capped_max_order_size_units, Some(10.0));
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_participation_guardrail_missing_dependency_fails_closed_and_signals_control_uncertainty()
+     {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        let mut snapshot = sample_market_snapshot();
+        snapshot.inactivity_gap_seconds = None;
+        runtime_state.upsert_market_snapshot(snapshot);
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        let safe_state_signals = InMemorySafeStateSignals::default();
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state_and_safe_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+            &safe_state_signals,
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::ParticipationGuardrailUnavailable.code()
+        );
+        let emergency_signal = safe_state_signals
+            .latest_emergency_signal()
+            .expect("missing FR41 dependencies should publish control-uncertainty signal");
+        assert_eq!(
+            emergency_signal.reason_code,
+            EmergencyControlReasonCode::ControlUncertaintyTriggered.code()
+        );
+        assert_eq!(
+            emergency_signal.trigger_source,
+            EmergencyControlTriggerSource::ControlUncertainty
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_participation_guardrail_missing_matching_baseline_fails_closed()
+     {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        let mut snapshot = sample_market_snapshot();
+        snapshot.liquidity_depth_usd = 12_500.0;
+        snapshot.inactivity_gap_seconds = Some(15_000.0);
+        runtime_state.upsert_market_snapshot(snapshot);
+
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        limit_state.upsert_inventory_rules(
+            "default",
+            vec![
+                sample_inventory_rule(RiskLimitScope::Market, "market::unrelated_market", 40.0),
+                sample_inventory_rule(
+                    RiskLimitScope::Strategy,
+                    "strategy::unrelated_cluster",
+                    32.0,
+                ),
+            ],
+        );
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::ParticipationGuardrailUnavailable.code()
+        );
+        let evidence = decision
+            .participation_guardrail
+            .as_ref()
+            .expect("deny decision should include FR41 unavailable evidence");
+        assert_eq!(evidence.guardrail_mode, "unavailable");
+        assert_eq!(
+            evidence.reason_code,
+            ParticipationGuardrailReasonCode::DependencyUnavailable.code()
+        );
     }
 
     #[test]

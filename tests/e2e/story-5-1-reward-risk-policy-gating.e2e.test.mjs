@@ -37,7 +37,7 @@ test("Story 5.1 reward-risk unavailable-state denials remain fail-closed and eme
   assert.match(gates, /PreTradeReasonCode::RewardRiskStateUnavailable/);
   assert.match(
     gates,
-    /PreTradeReasonCode::RewardRiskStateUnavailable => \(\s*EmergencyControlTriggerSource::ControlUncertainty,\s*EmergencyControlReasonCode::ControlUncertaintyTriggered\.code\(\)/s,
+    /PreTradeReasonCode::RewardRiskStateUnavailable(?:\s*\|\s*PreTradeReasonCode::ParticipationGuardrailUnavailable)?\s*=>\s*\(\s*EmergencyControlTriggerSource::ControlUncertainty,\s*EmergencyControlReasonCode::ControlUncertaintyTriggered\.code\(\)/s,
   );
 });
 

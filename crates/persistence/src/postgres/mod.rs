@@ -11,6 +11,7 @@ pub mod incident_query_views;
 pub mod market_policy;
 pub mod market_stream;
 pub mod orders;
+pub mod participation_guardrail_events;
 pub mod pretrade_gate;
 pub mod rbac;
 pub mod reconciliation;

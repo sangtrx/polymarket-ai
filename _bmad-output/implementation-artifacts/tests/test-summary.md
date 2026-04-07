@@ -677,3 +677,35 @@
 - `npm run --silent rust:test` ✅
 - `npm run --silent test` ✅
 - `npm run --silent qa:test:story-5-2` ✅ (re-run after API/E2E actionability-field coverage refresh)
+
+---
+
+## Story 5.3 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/risk.rs` (`risk::tests::fr41_`) — validates FR41 strict threshold boundaries (`<10k`, `>15m`, `>4h`), deterministic precedence (pause over cap), and fail-closed baseline dependency behavior.
+- [x] `crates/persistence/src/postgres/participation_guardrail_events.rs` (`postgres::participation_guardrail_events::tests::`) — validates migration schema-scope isolation, deterministic index/sort contracts, canonical filter validation, and machine-readable adapter validation errors.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::participation_guardrail_`) — validates authenticated FR41 evidence-query route fail-closed persistence dependency behavior and unauthorized-denial contract continuity.
+- [x] `services/risk-engine/src/gates/mod.rs` (`gates::tests::order_intent_gate_with_limit_state_participation_guardrail_`) — validates FR41 pre-trade gate composition/order, low-liquidity deny semantics, overnight cap evidence emission, and fail-closed control-uncertainty emergency signaling.
+- [x] `services/execution-engine/src/orders/mod.rs` (`orders::tests::submit_order_size_cap_`) — validates capped-mode submit rejection above FR41 cap threshold with zero submit side effects.
+- [x] `tests/api/story-5-3-participation-guardrails-api.test.mjs` — validates FR41 control-api route wiring, deterministic filter/evidence response contracts, machine-readable status mapping for validation/persistence failures, and deterministic accepted-envelope semantics.
+- [x] `tests/e2e/story-5-3-participation-guardrails-gating.e2e.test.mjs` — validates FR41 risk-engine/execution seam composition, strict threshold/precedence contracts (`pause` vs `size_cap`), and runbook/cross-link continuity.
+
+### Coverage
+
+- Story 5.3 now has deterministic automated coverage for:
+  - FR41 low-liquidity and inactivity threshold strict-boundary semantics,
+  - FR41 overnight-cap baseline dependency and 25% cap math evidence,
+  - pre-trade pipeline composition and deterministic gate ordering semantics with Story 2.8 + 5.1 continuity,
+  - execution submit-path cap enforcement with explicit machine-readable denial reason and no lifecycle side effects,
+  - control-plane authenticated evidence retrieval contract and machine-readable error taxonomy mapping,
+  - Story 5.3 API/E2E static regression coverage for route contracts, cap-enforcement seams, and operations runbook continuity.
+- Automated Story 5.3 regression inventory in this QA refresh: **26 Story-5.3 tests passing** (`domain: 4`, `persistence: 8`, `control-api: 2`, `risk-engine: 3`, `execution-engine: 1`, `api/e2e: 8`).
+
+### Execution Result
+
+- `npm run --silent qa:test:story-5-3` ✅
+- `npm run --silent rust:build` ✅
+- `npm run --silent test` ✅
+- `node --test tests/api/story-5-3*.test.mjs tests/e2e/story-5-3*.test.mjs` ✅ (post-refresh API/E2E rerun)

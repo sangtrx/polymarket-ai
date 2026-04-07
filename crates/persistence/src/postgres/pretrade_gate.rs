@@ -1,7 +1,7 @@
 use domain::risk::{
     PreTradeDecisionOutcome, PreTradeGateContractError, PreTradeGateDecision,
-    PreTradeGateValidationIssue, PreTradeReasonCode, normalize_pretrade_identifier,
-    validate_pretrade_gate_decision,
+    PreTradeGateValidationIssue, PreTradeParticipationGuardrailEvidence, PreTradeReasonCode,
+    normalize_pretrade_identifier, validate_pretrade_gate_decision,
 };
 use serde_json::json;
 use sqlx::{PgExecutor, Row};
@@ -39,6 +39,7 @@ const LOAD_LATEST_PRETRADE_GATE_DECISION_BY_INTENT_SQL: &str = r#"
         protective_mode_active,
         gate_results,
         correlation_id,
+        evidence,
         to_char(evaluated_at_utc AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS evaluated_at_utc
     FROM pretrade_gate_decisions
     WHERE intent_id = $1
@@ -58,6 +59,7 @@ const LOAD_LATEST_PRETRADE_GATE_DECISION_BY_CORRELATION_SQL: &str = r#"
         protective_mode_active,
         gate_results,
         correlation_id,
+        evidence,
         to_char(evaluated_at_utc AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS evaluated_at_utc
     FROM pretrade_gate_decisions
     WHERE correlation_id = $1
@@ -77,6 +79,7 @@ const LOAD_LATEST_PRETRADE_GATE_DECISION_FOR_MARKET_SQL: &str = r#"
         protective_mode_active,
         gate_results,
         correlation_id,
+        evidence,
         to_char(evaluated_at_utc AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS evaluated_at_utc
     FROM pretrade_gate_decisions
     WHERE market_id = $1
@@ -162,6 +165,7 @@ where
         "protective_mode_active": decision.protective_mode_active,
         "evaluated_gate_count": decision.gate_results.len(),
         "failed_gate_count": failed_gate_count,
+        "participation_guardrail": decision.participation_guardrail,
     });
 
     let result = sqlx::query(INSERT_PRETRADE_GATE_DECISION_SQL)
@@ -270,6 +274,10 @@ fn decode_pretrade_gate_decision_row(
             Vec::new(),
         )
     })?;
+    let evidence_raw: serde_json::Value = row
+        .try_get("evidence")
+        .map_err(|error| PreTradeGatePersistenceError::row_decode_failure("evidence", error))?;
+    let participation_guardrail = decode_participation_guardrail_evidence(&evidence_raw)?;
 
     let decision = PreTradeGateDecision {
         decision_id: row.try_get("decision_id").map_err(|error| {
@@ -293,6 +301,7 @@ fn decode_pretrade_gate_decision_row(
             PreTradeGatePersistenceError::row_decode_failure("protective_mode_active", error)
         })?,
         gate_results,
+        participation_guardrail,
         correlation_id: row.try_get("correlation_id").map_err(|error| {
             PreTradeGatePersistenceError::row_decode_failure("correlation_id", error)
         })?,
@@ -303,6 +312,25 @@ fn decode_pretrade_gate_decision_row(
 
     validate_pretrade_gate_decision(&decision).map_err(map_contract_error)?;
     Ok(decision)
+}
+
+fn decode_participation_guardrail_evidence(
+    evidence: &serde_json::Value,
+) -> Result<Option<PreTradeParticipationGuardrailEvidence>, PreTradeGatePersistenceError> {
+    let Some(value) = evidence.get("participation_guardrail") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| {
+            PreTradeGatePersistenceError::invalid_payload(
+                format!("unable to parse evidence.participation_guardrail payload: {error}"),
+                Vec::new(),
+            )
+        })
 }
 
 fn normalize_lookup_identifier(
@@ -389,6 +417,7 @@ mod tests {
                 false,
                 PreTradeReasonCode::FreshnessStateUnavailable,
             )],
+            participation_guardrail: None,
             correlation_id: "corr_pretrade_0001".to_string(),
             evaluated_at_utc: "2026-04-06T08:16:00Z".to_string(),
         }

@@ -21,6 +21,8 @@ The risk engine evaluates gates in this strict order and stops on first failure:
 6. `drawdown_stop`
 7. `strategy_approval`
 8. `venue_eligibility`
+9. `reward_per_risk`
+10. `participation_guardrail`
 
 This ordering is deterministic and is enforced in `services/risk-engine/src/gates/mod.rs`.
 
@@ -36,6 +38,8 @@ This ordering is deterministic and is enforced in `services/risk-engine/src/gate
 | Drawdown stop | `pretrade_gate_pass` | `pretrade_drawdown_state_unavailable` | `pretrade_drawdown_stop_triggered` |
 | Strategy approval | `pretrade_gate_pass` | `pretrade_strategy_approval_unavailable` | `pretrade_strategy_approval_required` |
 | Venue eligibility | `pretrade_gate_pass` | `pretrade_venue_eligibility_unavailable` | `pretrade_venue_ineligible` |
+| Reward-per-risk | `pretrade_gate_pass` | `pretrade_reward_risk_state_unavailable` | `pretrade_reward_risk_below_threshold` |
+| Participation guardrail (FR41) | `pretrade_gate_pass` | `pretrade_participation_guardrail_unavailable` | `pretrade_participation_guardrail_low_liquidity_pause` / `pretrade_participation_guardrail_inactivity_pause` |
 
 ## Fail-Closed Expectations
 
@@ -99,3 +103,8 @@ During incident recovery:
 1. Use this runbook to validate gate health inputs and decision evidence.
 2. Keep submit flow blocked until gate reason codes return to healthy pass conditions.
 3. Execute Story 2.9 emergency-control procedures for control-plane actions (kill-switch/escalation/resume governance).
+
+## Cross-runbook links
+
+1. FR41 participation guardrails: `docs/operations/low-liquidity-overnight-guardrails.md`
+2. FR39 reward-per-risk policy operations: `docs/operations/reward-risk-policy-operations.md`
