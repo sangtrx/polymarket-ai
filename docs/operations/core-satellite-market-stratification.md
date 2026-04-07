@@ -92,3 +92,4 @@ LIMIT 20;
 4. Reward-per-risk policy operations: `docs/operations/reward-risk-policy-operations.md`
 5. Incentive regime-shift alerts: `docs/operations/incentive-regime-shift-alerts.md`
 6. Pre-trade gate pipeline operations: `docs/operations/pretrade-gate-pipeline.md`
+7. Alpha hypothesis registry operations (FR6): `docs/operations/alpha-hypothesis-registry.md`

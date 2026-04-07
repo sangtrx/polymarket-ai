@@ -7,5 +7,9 @@ authors.workspace = true
 
 [dependencies]
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 common = { path = "../../crates/common" }
 domain = { path = "../../crates/domain" }
+persistence = { path = "../../crates/persistence" }

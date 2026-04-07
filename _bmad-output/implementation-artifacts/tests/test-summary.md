@@ -741,3 +741,35 @@
 - `npm run --silent qa:test:story-5-4` ✅
 - `npm run --silent test` ✅
 - `source "$HOME/.cargo/env" && node --test tests/api/story-5-4*.test.mjs tests/e2e/story-5-4*.test.mjs && npm run --silent qa:test:story-5-4` ✅ (2026-04-07 QA automation rerun)
+
+---
+
+## Story 6.1 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::`) — validates FR6 metadata completeness, canonical identifier normalization, strict UTC timestamp handling, training-window boundary determinism, and explicit risk-assumption validation behavior.
+- [x] `crates/persistence/src/postgres/alpha_hypotheses.rs` (`postgres::alpha_hypotheses::tests::`) — validates schema-scope isolation (`alpha_hypotheses` only), canonical constraints/indexes, deterministic lookup ordering, and machine-readable persistence error mapping behavior.
+- [x] `services/research-gateway/src/validation/hypothesis_registry.rs` (`validation::hypothesis_registry::tests::`) — validates authorized-role enforcement, dataset-snapshot unresolved/unavailable fail-closed outcomes, deterministic register/update reason codes, and read-path not-found handling.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::alpha_hypothesis_`) — validates authenticated register/read route responses, machine-readable evidence envelopes, validation field-error surfacing, unauthorized-role denials, and deterministic `400/403/409/503/500` status mapping continuity.
+- [x] `tests/api/story-6-1-alpha-hypothesis-registry-api.test.mjs` — validates Story 6.1 route wiring, payload/evidence contract fields, state/startup dependency wiring, and dataset-registry seam/reason-code coverage.
+- [x] `tests/e2e/story-6-1-alpha-hypothesis-registry.e2e.test.mjs` — validates migration scope constraints, runbook FR6/failure-playbook contract coverage, cross-runbook continuity links, and Story 6.1 QA command wiring.
+
+### Coverage
+
+- Story 6.1 now has deterministic automated coverage for:
+  - FR6 required-field validation and field-level machine-readable diagnostics,
+  - dataset-snapshot reference gating with explicit fail-closed unresolved/unavailable contracts,
+  - canonical identifier normalization and strict training-window boundary enforcement (`start < end`),
+  - idempotent/update persistence semantics for repeated canonical `hypothesis_id`,
+  - authenticated control-plane register/read route behavior with deterministic status mapping and evidence continuity,
+  - Story 6.1 API/E2E static regression coverage for migration scope, operator runbook contracts, and cross-runbook traceability.
+- Automated Story 6.1 regression inventory in this QA refresh: **33 Story-6.1 tests passing** (`domain: 6`, `persistence: 6`, `research-gateway: 6`, `control-api: 6`, `api/e2e: 9`).
+
+### Execution Result
+
+- `npm run --silent qa:test:story-6-1` ✅
+- `npm run --silent bootstrap:test` ✅
+- `npm run --silent test` ✅
+- `npm run --silent rust:build` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-1` ✅ (2026-04-07 16:57:57 QA automation rerun)

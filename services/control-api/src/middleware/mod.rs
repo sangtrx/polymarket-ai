@@ -24,6 +24,9 @@ use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportS
 use reporting_service::exports::workflows::{
     ReportExportOrchestrator, ReportExportWorkflowService,
 };
+use research_gateway::validation::hypothesis_registry::{
+    HypothesisRegistryOrchestrator, HypothesisRegistryService,
+};
 use serde::Serialize;
 use serde_json::json;
 use sqlx::PgPool;
@@ -228,6 +231,7 @@ pub struct ControlApiState {
     pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
     pub report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
     pub report_export_orchestrator: Arc<dyn ReportExportOrchestrator>,
+    pub research_hypothesis_orchestrator: Arc<dyn HypothesisRegistryOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
@@ -338,6 +342,7 @@ impl ControlApiState {
             safety_control_orchestrator,
             report_schedule_orchestrator,
             report_export_orchestrator: Arc::new(ReportExportWorkflowService::default()),
+            research_hypothesis_orchestrator: Arc::new(HypothesisRegistryService::default()),
             recovery_orchestrator,
             attribution_pool: None,
         }
@@ -367,6 +372,15 @@ impl ControlApiState {
         report_export_orchestrator: Arc<dyn ReportExportOrchestrator>,
     ) -> Self {
         self.report_export_orchestrator = report_export_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_research_hypothesis_orchestrator(
+        mut self,
+        research_hypothesis_orchestrator: Arc<dyn HypothesisRegistryOrchestrator>,
+    ) -> Self {
+        self.research_hypothesis_orchestrator = research_hypothesis_orchestrator;
         self
     }
 

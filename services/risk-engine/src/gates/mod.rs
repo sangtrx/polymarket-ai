@@ -109,7 +109,11 @@ pub trait RuntimePolicyStateReader: Send + Sync {
     fn strategy_approval_state(&self) -> Option<RuntimeStrategyApprovalState>;
     fn market_snapshot(&self, market_id: &str) -> Option<MarketSnapshot>;
     fn market_policy_profile(&self, cluster_id: &str) -> Option<MarketPolicyProfile>;
-    fn market_bucket_profile(&self, market_id: &str, cluster_id: &str) -> Option<MarketBucketProfile>;
+    fn market_bucket_profile(
+        &self,
+        market_id: &str,
+        cluster_id: &str,
+    ) -> Option<MarketBucketProfile>;
     fn reward_risk_policy(&self, policy_key: &str) -> Option<RewardRiskPolicy>;
 }
 
@@ -612,7 +616,8 @@ fn resolve_pretrade_policy_context<S: RuntimePolicyStateReader>(
     intent: &OrderIntent,
     evaluated_at_utc: &str,
 ) -> Result<ResolvedPretradePolicyContext, PreTradeGateResult> {
-    let Some(profile) = runtime_policy_state.market_bucket_profile(&intent.market_id, &intent.cluster_id)
+    let Some(profile) =
+        runtime_policy_state.market_bucket_profile(&intent.market_id, &intent.cluster_id)
     else {
         return Err(build_pretrade_gate_result(
             PreTradeGateDimension::ExposureLimitState,
@@ -622,19 +627,16 @@ fn resolve_pretrade_policy_context<S: RuntimePolicyStateReader>(
         ));
     };
 
-    let resolved = resolve_market_bucket_policy_links(
-        &intent.market_id,
-        &intent.cluster_id,
-        &[profile],
-    )
-    .map_err(|_| {
-        build_pretrade_gate_result(
-            PreTradeGateDimension::ExposureLimitState,
-            false,
-            PreTradeReasonCode::StratificationStateUnavailable,
-            evaluated_at_utc,
-        )
-    })?;
+    let resolved =
+        resolve_market_bucket_policy_links(&intent.market_id, &intent.cluster_id, &[profile])
+            .map_err(|_| {
+                build_pretrade_gate_result(
+                    PreTradeGateDimension::ExposureLimitState,
+                    false,
+                    PreTradeReasonCode::StratificationStateUnavailable,
+                    evaluated_at_utc,
+                )
+            })?;
 
     Ok(ResolvedPretradePolicyContext {
         risk_policy_key: resolved.risk_policy_key,
@@ -713,8 +715,11 @@ where
         &evaluated_at_utc,
     );
 
-    let exposure_gate =
-        evaluate_pretrade_exposure_limit_gate(runtime_limit_state, &effective_profile_key, &evaluated_at_utc);
+    let exposure_gate = evaluate_pretrade_exposure_limit_gate(
+        runtime_limit_state,
+        &effective_profile_key,
+        &evaluated_at_utc,
+    );
     let exposure_passed = exposure_gate.passed;
     gate_results.push(exposure_gate);
     if !exposure_passed {

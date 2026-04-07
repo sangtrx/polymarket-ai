@@ -1,11 +1,13 @@
 use domain::risk::{
     MarketBucketProfile, MarketBucketReasonCode, MarketBucketValidationIssue,
-    MarketClusterOverride, MarketPolicyProfile, MarketPolicyReasonCode, MarketPolicyValidationIssue,
-    canonical_market_bucket_profile_id, canonicalize_market_bucket_profile,
-    validate_market_cluster_override, validate_market_policy_profile,
+    MarketClusterOverride, MarketPolicyProfile, MarketPolicyReasonCode,
+    MarketPolicyValidationIssue, canonical_market_bucket_profile_id,
+    canonicalize_market_bucket_profile, validate_market_cluster_override,
+    validate_market_policy_profile,
 };
 use persistence::postgres::market_bucket_profiles::{
-    MarketBucketPersistenceError, load_active_market_bucket_profile as pg_load_active_bucket_profile,
+    MarketBucketPersistenceError,
+    load_active_market_bucket_profile as pg_load_active_bucket_profile,
     upsert_market_bucket_profile as pg_upsert_market_bucket_profile,
 };
 use persistence::postgres::market_policy::{
@@ -67,7 +69,9 @@ impl Display for MarketPolicyServiceError {
 
 impl Error for MarketPolicyServiceError {}
 
-fn map_market_policy_persistence_error(error: MarketPolicyPersistenceError) -> MarketPolicyServiceError {
+fn map_market_policy_persistence_error(
+    error: MarketPolicyPersistenceError,
+) -> MarketPolicyServiceError {
     match error.code {
         "market_policy_query_failed" | "market_policy_row_decode_failed" => {
             MarketPolicyServiceError::persistence_unavailable(error.message)
@@ -80,7 +84,9 @@ fn map_market_policy_persistence_error(error: MarketPolicyPersistenceError) -> M
     }
 }
 
-fn map_market_bucket_persistence_error(error: MarketBucketPersistenceError) -> MarketPolicyServiceError {
+fn map_market_bucket_persistence_error(
+    error: MarketBucketPersistenceError,
+) -> MarketPolicyServiceError {
     match error.code {
         "market_bucket_query_failed" | "market_bucket_row_decode_failed" => {
             MarketPolicyServiceError::persistence_unavailable(error.message)
@@ -658,7 +664,10 @@ impl MarketPolicyOrchestrator for MarketPolicyService {
             ("cluster_id", input.cluster_id.as_str()),
             ("bucket_type", input.bucket_type.as_str()),
             ("risk_policy_key", input.risk_policy_key.as_str()),
-            ("allocation_policy_key", input.allocation_policy_key.as_str()),
+            (
+                "allocation_policy_key",
+                input.allocation_policy_key.as_str(),
+            ),
             ("correlation_id", input.correlation_id.as_str()),
             ("updated_at_utc", input.updated_at_utc.as_str()),
         ] {
@@ -688,27 +697,28 @@ impl MarketPolicyOrchestrator for MarketPolicyService {
             correlation_id: input.correlation_id.clone(),
             updated_at_utc: input.updated_at_utc.clone(),
         };
-        let canonical_profile = match canonicalize_market_bucket_profile(&profile).map_err(|error| {
-            MarketPolicyServiceError {
-                code: error.code,
-                message: error.message,
-                field_errors: map_bucket_validation_issues(error.field_errors),
-            }
-        }) {
-            Ok(profile) => profile,
-            Err(error) => {
-                emit_market_policy_telemetry(
-                    "market_bucket_profile_update_v1",
-                    "deny",
-                    &input.actor_id,
-                    &normalized_cluster_id,
-                    error.code,
-                    &input.correlation_id,
-                    &input.updated_at_utc,
-                );
-                return Err(error);
-            }
-        };
+        let canonical_profile =
+            match canonicalize_market_bucket_profile(&profile).map_err(|error| {
+                MarketPolicyServiceError {
+                    code: error.code,
+                    message: error.message,
+                    field_errors: map_bucket_validation_issues(error.field_errors),
+                }
+            }) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    emit_market_policy_telemetry(
+                        "market_bucket_profile_update_v1",
+                        "deny",
+                        &input.actor_id,
+                        &normalized_cluster_id,
+                        error.code,
+                        &input.correlation_id,
+                        &input.updated_at_utc,
+                    );
+                    return Err(error);
+                }
+            };
 
         let _lock = self.lock_operations().inspect_err(|error| {
             emit_market_policy_telemetry(
@@ -1046,9 +1056,7 @@ impl MarketPolicyRepositoryPort for PostgresMarketPolicyRepository {
         cluster_id: &str,
     ) -> Result<Option<MarketBucketProfile>, MarketPolicyServiceError> {
         self.run_market_bucket_with_runtime(pg_load_active_bucket_profile(
-            &self.pool,
-            market_id,
-            cluster_id,
+            &self.pool, market_id, cluster_id,
         ))
     }
 
@@ -1454,7 +1462,10 @@ mod tests {
             .upsert_market_bucket_profile(bucket_profile_input())
             .expect("bucket profile update should succeed");
 
-        assert_eq!(evidence.profile_id, "bucket::market_yes_no_1::cluster_alpha");
+        assert_eq!(
+            evidence.profile_id,
+            "bucket::market_yes_no_1::cluster_alpha"
+        );
         assert_eq!(evidence.bucket_type, "core");
         assert_eq!(evidence.risk_policy_key, "core-risk-default");
         assert_eq!(evidence.allocation_policy_key, "core-allocation-default");
@@ -1475,7 +1486,10 @@ mod tests {
             .read_market_bucket_profile(read_bucket_profile_input())
             .expect("bucket profile read should succeed");
 
-        assert_eq!(evidence.profile_id, "bucket::market_yes_no_1::cluster_alpha");
+        assert_eq!(
+            evidence.profile_id,
+            "bucket::market_yes_no_1::cluster_alpha"
+        );
         assert_eq!(evidence.market_id, "market_yes_no_1");
         assert_eq!(evidence.cluster_id, "cluster_alpha");
         assert_eq!(
@@ -1491,7 +1505,10 @@ mod tests {
         let error = service
             .read_market_bucket_profile(read_bucket_profile_input())
             .expect_err("missing mapping should fail closed");
-        assert_eq!(error.code, MarketBucketReasonCode::MappingUnavailable.code());
+        assert_eq!(
+            error.code,
+            MarketBucketReasonCode::MappingUnavailable.code()
+        );
         assert!(
             error
                 .field_errors

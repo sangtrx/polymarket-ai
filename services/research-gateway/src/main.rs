@@ -1,6 +1,3 @@
-mod promotion;
-mod validation;
-
 use common::time::timestamp_utc;
 
 #[tokio::main]

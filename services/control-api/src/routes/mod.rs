@@ -45,6 +45,7 @@ use domain::reporting_schedule::{
     ReportRunRecord, ReportingScheduleReasonCode, ReportingScheduleValidationIssue,
     parse_utc_timestamp,
 };
+use domain::research::AlphaHypothesisReasonCode;
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
     MarketPolicyReasonCode, MarketPolicyValidationIssue, MarketSnapshot,
@@ -99,6 +100,10 @@ use reporting_service::exports::scheduling::{
 use reporting_service::exports::workflows::{
     GetExportArtifactInput, ListExportArtifactsInput, QueryExportJobInput, ReportExportJobEvidence,
     TriggerIncidentExportInput, TriggerOnDemandExportInput,
+};
+use research_gateway::validation::hypothesis_registry::{
+    AlphaHypothesisEvidence, HypothesisRegistryServiceError, ReadAlphaHypothesisInput,
+    UpsertAlphaHypothesisInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -177,6 +182,15 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/reward-risk/policies/{policy_key}",
             post(upsert_reward_risk_policy).get(read_reward_risk_policy),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
+    let research_registry_routes = Router::new()
+        .route(
+            "/control/research/alpha-hypotheses/{hypothesis_id}",
+            post(register_alpha_hypothesis).get(read_alpha_hypothesis),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -327,6 +341,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(market_policy_routes)
         .merge(risk_limit_routes)
         .merge(reward_risk_routes)
+        .merge(research_registry_routes)
         .merge(allocation_policy_routes)
         .merge(attribution_routes)
         .merge(incident_forensics_routes)
@@ -818,16 +833,16 @@ pub async fn read_market_bucket_profile(
         Err(response) => return *response,
     };
 
-    let decision = match state
-        .market_policy_orchestrator
-        .read_market_bucket_profile(ReadMarketBucketProfileInput {
+    let decision = match state.market_policy_orchestrator.read_market_bucket_profile(
+        ReadMarketBucketProfileInput {
             actor_id: actor.actor_id.clone(),
             actor_role: actor.role.clone(),
             market_id,
             cluster_id,
             correlation_id: actor.correlation_id.clone(),
             queried_at_utc: authorization.timestamp_utc.clone(),
-        }) {
+        },
+    ) {
         Ok(decision) => decision,
         Err(error) => {
             return market_policy_service_error_response(
@@ -1101,6 +1116,99 @@ pub async fn read_reward_risk_policy(
         endpoint,
         "GET",
         "reward_risk_policy_read",
+    )
+}
+
+pub async fn register_alpha_hypothesis(
+    State(state): State<ControlApiState>,
+    Path(hypothesis_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<AlphaHypothesisRegistrationPayload>,
+) -> Response {
+    let endpoint = format!("/control/research/alpha-hypotheses/{hypothesis_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let evidence = match state
+        .research_hypothesis_orchestrator
+        .upsert_alpha_hypothesis(UpsertAlphaHypothesisInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            hypothesis_id,
+            feature_set_version: payload.feature_set_version,
+            target_regime: payload.target_regime,
+            expected_edge_source: payload.expected_edge_source,
+            training_window_start_utc: payload.training_window_start_utc,
+            training_window_end_utc: payload.training_window_end_utc,
+            risk_assumptions: payload.risk_assumptions,
+            correlation_id: actor.correlation_id.clone(),
+            updated_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return alpha_hypothesis_service_error_response(
+                &state,
+                error,
+                "alpha_hypothesis_register",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    alpha_hypothesis_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "alpha_hypothesis_register",
+    )
+}
+
+pub async fn read_alpha_hypothesis(
+    State(state): State<ControlApiState>,
+    Path(hypothesis_id): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/alpha-hypotheses/{hypothesis_id}");
+    let authorization = match authorize_alpha_hypothesis_read(&state, &actor, &endpoint) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let evidence = match state
+        .research_hypothesis_orchestrator
+        .read_alpha_hypothesis(ReadAlphaHypothesisInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            hypothesis_id,
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return alpha_hypothesis_service_error_response(
+                &state,
+                error,
+                "alpha_hypothesis_read",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    alpha_hypothesis_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "alpha_hypothesis_read",
     )
 }
 
@@ -5322,6 +5430,57 @@ fn authorize_critical_action(
     ))
 }
 
+fn authorize_alpha_hypothesis_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(alpha_hypothesis_service_error_response(
+        state,
+        HypothesisRegistryServiceError {
+            code: AlphaHypothesisReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: Vec::new(),
+        },
+        "alpha_hypothesis_read",
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+    )))
+}
+
 fn authorize_attribution_read(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -6460,6 +6619,182 @@ fn reward_risk_service_error_status(code: &str) -> StatusCode {
         code if code == RewardRiskReasonCode::PersistenceUnavailable.code()
             || code == "reward_risk_query_failed"
             || code == "reward_risk_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn alpha_hypothesis_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: AlphaHypothesisEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "hypothesis_id": evidence.hypothesis_id,
+            "feature_set_version": evidence.feature_set_version,
+            "target_regime": evidence.target_regime,
+            "expected_edge_source": evidence.expected_edge_source,
+            "training_window_start_utc": evidence.training_window_start_utc,
+            "training_window_end_utc": evidence.training_window_end_utc,
+        }),
+        approval_reference: None,
+        timestamp: evidence.updated_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: evidence.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: evidence.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            evidence.correlation_id.clone(),
+            evidence.updated_at_utc,
+        );
+    }
+
+    (
+        if http_method == "GET" {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        axum::Json(AlphaHypothesisDecisionResponse {
+            status: "accepted",
+            error_code: None,
+            message: None,
+            hypothesis_id: evidence.hypothesis_id,
+            feature_set_version: evidence.feature_set_version,
+            target_regime: evidence.target_regime,
+            expected_edge_source: evidence.expected_edge_source,
+            training_window_start_utc: evidence.training_window_start_utc,
+            training_window_end_utc: evidence.training_window_end_utc,
+            risk_assumptions: evidence.risk_assumptions,
+            actor_id: evidence.actor_id,
+            role: actor.role.clone(),
+            reason_code: evidence.reason_code,
+            correlation_id: evidence.correlation_id,
+            timestamp_utc: evidence.updated_at_utc,
+            security_signal: None,
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_hypothesis_service_error_response(
+    state: &ControlApiState,
+    error: HypothesisRegistryServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "error_code": error.code,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == AlphaHypothesisReasonCode::UnauthorizedRole.code() {
+        Some(AlphaHypothesisSecuritySignal {
+            name: if action.ends_with("_read") {
+                "unauthorized_alpha_hypothesis_read_attempt_v1"
+            } else {
+                "unauthorized_alpha_hypothesis_mutation_attempt_v1"
+            },
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        alpha_hypothesis_service_error_status(error.code),
+        axum::Json(AlphaHypothesisServiceErrorResponse {
+            error_code: error.code,
+            message: error.message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: error
+                .field_errors
+                .into_iter()
+                .map(|issue| AlphaHypothesisFieldError {
+                    field: issue.field,
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+            security_signal,
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_hypothesis_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == AlphaHypothesisReasonCode::InvalidPayload.code()
+            || code == AlphaHypothesisReasonCode::InvalidTrainingWindow.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        code if code == AlphaHypothesisReasonCode::UnauthorizedRole.code() => StatusCode::FORBIDDEN,
+        "alpha_hypothesis_constraint_violation" => StatusCode::CONFLICT,
+        code if code == AlphaHypothesisReasonCode::DatasetSnapshotUnresolved.code()
+            || code == AlphaHypothesisReasonCode::NotFound.code() =>
+        {
+            StatusCode::CONFLICT
+        }
+        code if code == AlphaHypothesisReasonCode::DatasetSnapshotUnavailable.code()
+            || code == AlphaHypothesisReasonCode::PersistenceUnavailable.code()
+            || code == "alpha_hypothesis_query_failed"
+            || code == "alpha_hypothesis_row_decode_failed" =>
         {
             StatusCode::SERVICE_UNAVAILABLE
         }
@@ -9207,6 +9542,16 @@ pub struct RewardRiskPolicyPayload {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AlphaHypothesisRegistrationPayload {
+    pub feature_set_version: String,
+    pub target_regime: String,
+    pub expected_edge_source: String,
+    pub training_window_start_utc: String,
+    pub training_window_end_utc: String,
+    pub risk_assumptions: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
@@ -9993,6 +10338,60 @@ pub struct RewardRiskSecuritySignal {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AlphaHypothesisDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub hypothesis_id: String,
+    pub feature_set_version: String,
+    pub target_regime: String,
+    pub expected_edge_source: String,
+    pub training_window_start_utc: String,
+    pub training_window_end_utc: String,
+    pub risk_assumptions: serde_json::Value,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<AlphaHypothesisSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHypothesisServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<AlphaHypothesisFieldError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<AlphaHypothesisSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHypothesisFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaHypothesisSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
 pub struct EmergencyControlDecisionResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10513,6 +10912,7 @@ mod tests {
         ReportingExportJobState, ReportingExportReasonCode, ReportingExportTriggerSource,
     };
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
+    use domain::research::{AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue};
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
         EmergencyControlTriggerSource, MarketBucketReasonCode, MarketPolicyValidationIssue,
@@ -10563,6 +10963,10 @@ mod tests {
         DispatchWeeklyExportInput, GetExportArtifactInput, ListExportArtifactsInput,
         QueryExportJobInput, ReportExportJobEvidence, ReportExportOrchestrator,
         ReportExportWorkflowError, TriggerIncidentExportInput, TriggerOnDemandExportInput,
+    };
+    use research_gateway::validation::hypothesis_registry::{
+        AlphaHypothesisEvidence, HypothesisRegistryOrchestrator, HypothesisRegistryServiceError,
+        ReadAlphaHypothesisInput, UpsertAlphaHypothesisInput,
     };
     use std::sync::{Arc, Mutex};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -11325,6 +11729,86 @@ mod tests {
                 correlation_id: input.correlation_id,
                 updated_at_utc: input.queried_at_utc,
                 default_threshold_applied: false,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StubHypothesisRegistryOrchestrator {
+        upsert_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        read_missing: bool,
+    }
+
+    impl HypothesisRegistryOrchestrator for StubHypothesisRegistryOrchestrator {
+        fn upsert_alpha_hypothesis(
+            &self,
+            input: UpsertAlphaHypothesisInput,
+        ) -> Result<AlphaHypothesisEvidence, HypothesisRegistryServiceError> {
+            if let Some((code, message)) = self.upsert_error {
+                return Err(HypothesisRegistryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: if code == AlphaHypothesisReasonCode::InvalidPayload.code() {
+                        vec![AlphaHypothesisValidationIssue {
+                            field: "training_window".to_string(),
+                            code: AlphaHypothesisReasonCode::InvalidTrainingWindow.code(),
+                            message: "training window must satisfy start < end".to_string(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+
+            Ok(AlphaHypothesisEvidence {
+                hypothesis_id: input.hypothesis_id.trim().to_ascii_lowercase(),
+                feature_set_version: input.feature_set_version.trim().to_ascii_lowercase(),
+                target_regime: input.target_regime.trim().to_ascii_lowercase(),
+                expected_edge_source: input.expected_edge_source.trim().to_ascii_lowercase(),
+                training_window_start_utc: input.training_window_start_utc,
+                training_window_end_utc: input.training_window_end_utc,
+                risk_assumptions: input.risk_assumptions,
+                actor_id: input.actor_id,
+                reason_code: AlphaHypothesisReasonCode::Registered.code().to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.updated_at_utc,
+            })
+        }
+
+        fn read_alpha_hypothesis(
+            &self,
+            input: ReadAlphaHypothesisInput,
+        ) -> Result<AlphaHypothesisEvidence, HypothesisRegistryServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(HypothesisRegistryServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            if self.read_missing {
+                return Err(HypothesisRegistryServiceError {
+                    code: AlphaHypothesisReasonCode::NotFound.code(),
+                    message: "alpha hypothesis was not found".to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            Ok(AlphaHypothesisEvidence {
+                hypothesis_id: input.hypothesis_id.trim().to_ascii_lowercase(),
+                feature_set_version: "dataset::v1".to_string(),
+                target_regime: "overnight".to_string(),
+                expected_edge_source: "liquidity_dislocation".to_string(),
+                training_window_start_utc: "2026-04-01T00:00:00Z".to_string(),
+                training_window_end_utc: "2026-04-02T00:00:00Z".to_string(),
+                risk_assumptions: serde_json::json!({
+                    "max_drawdown_pct": 2.5
+                }),
+                actor_id: input.actor_id,
+                reason_code: AlphaHypothesisReasonCode::Read.code().to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.queried_at_utc,
             })
         }
     }
@@ -12123,6 +12607,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_reward_risk_orchestrator(reward_risk_orchestrator),
+        )
+    }
+
+    fn test_app_with_hypothesis_registry_orchestrator(
+        hypothesis_registry_orchestrator: Arc<dyn HypothesisRegistryOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_hypothesis_orchestrator(hypothesis_registry_orchestrator),
         )
     }
 
@@ -15323,10 +15829,7 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["bucket_type"], "satellite");
         assert_eq!(payload["reason_code"], "market_bucket_profile_read");
-        assert_eq!(
-            payload["risk_policy_key"],
-            "satellite-risk-default"
-        );
+        assert_eq!(payload["risk_policy_key"], "satellite-risk-default");
         assert_eq!(
             payload["allocation_policy_key"],
             "satellite-allocation-default"
@@ -15366,6 +15869,298 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "market_bucket_mapping_unavailable");
         assert_eq!(payload["action"], "market_bucket_profile_read");
+    }
+
+    #[tokio::test]
+    async fn alpha_hypothesis_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-hypotheses/alpha::mean-reversion")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-hypothesis-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "feature_set_version":"dataset::v1",
+                            "target_regime":"overnight",
+                            "expected_edge_source":"liquidity_dislocation",
+                            "training_window_start_utc":"2026-04-01T00:00:00Z",
+                            "training_window_end_utc":"2026-04-02T00:00:00Z",
+                            "risk_assumptions":{"max_drawdown_pct":2.5}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn alpha_hypothesis_register_route_returns_machine_readable_evidence() {
+        let app = test_app_with_hypothesis_registry_orchestrator(Arc::new(
+            StubHypothesisRegistryOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-hypotheses/Alpha::Mean-Reversion")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-hypothesis-upsert-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "feature_set_version":"Dataset::V1",
+                            "target_regime":"Overnight",
+                            "expected_edge_source":"Liquidity_Dislocation",
+                            "training_window_start_utc":"2026-04-01T00:00:00Z",
+                            "training_window_end_utc":"2026-04-02T00:00:00Z",
+                            "risk_assumptions":{"max_drawdown_pct":2.5}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["hypothesis_id"], "alpha::mean-reversion");
+        assert_eq!(payload["feature_set_version"], "dataset::v1");
+        assert_eq!(payload["target_regime"], "overnight");
+        assert_eq!(payload["reason_code"], "alpha_hypothesis_registered");
+        assert!(payload["error_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn alpha_hypothesis_read_route_returns_machine_readable_evidence() {
+        let app = test_app_with_hypothesis_registry_orchestrator(Arc::new(
+            StubHypothesisRegistryOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-hypotheses/alpha::mean-reversion")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-hypothesis-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["reason_code"], "alpha_hypothesis_read");
+        assert_eq!(payload["hypothesis_id"], "alpha::mean-reversion");
+    }
+
+    #[tokio::test]
+    async fn alpha_hypothesis_read_route_allows_read_only_analytics_role() {
+        let app = test_app_with_hypothesis_registry_orchestrator(Arc::new(
+            StubHypothesisRegistryOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-hypotheses/alpha::mean-reversion")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-hypothesis-read-only-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["reason_code"], "alpha_hypothesis_read");
+        assert_eq!(payload["role"], "read_only_analytics");
+    }
+
+    #[tokio::test]
+    async fn alpha_hypothesis_register_route_surfaces_validation_field_errors() {
+        let app = test_app_with_hypothesis_registry_orchestrator(Arc::new(
+            StubHypothesisRegistryOrchestrator {
+                upsert_error: Some((
+                    AlphaHypothesisReasonCode::InvalidPayload.code(),
+                    "invalid training window",
+                )),
+                ..Default::default()
+            },
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-hypotheses/alpha::mean-reversion")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-hypothesis-invalid-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "feature_set_version":"dataset::v1",
+                            "target_regime":"overnight",
+                            "expected_edge_source":"liquidity_dislocation",
+                            "training_window_start_utc":"2026-04-01T00:00:00Z",
+                            "training_window_end_utc":"2026-04-01T00:00:00Z",
+                            "risk_assumptions":{"max_drawdown_pct":2.5}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "alpha_hypothesis_invalid_payload");
+        assert_eq!(payload["action"], "alpha_hypothesis_register");
+        assert_eq!(payload["field_errors"][0]["field"], "training_window");
+    }
+
+    #[tokio::test]
+    async fn alpha_hypothesis_read_route_maps_not_found_to_conflict() {
+        let app = test_app_with_hypothesis_registry_orchestrator(Arc::new(
+            StubHypothesisRegistryOrchestrator {
+                read_missing: true,
+                ..Default::default()
+            },
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-hypotheses/alpha::missing")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-hypothesis-missing-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "alpha_hypothesis_not_found");
+        assert_eq!(payload["action"], "alpha_hypothesis_read");
+    }
+
+    #[tokio::test]
+    async fn alpha_hypothesis_register_route_maps_dataset_registry_unavailable_to_503() {
+        let app = test_app_with_hypothesis_registry_orchestrator(Arc::new(
+            StubHypothesisRegistryOrchestrator {
+                upsert_error: Some((
+                    AlphaHypothesisReasonCode::DatasetSnapshotUnavailable.code(),
+                    "dataset registry unavailable",
+                )),
+                ..Default::default()
+            },
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-hypotheses/alpha::mean-reversion")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header(
+                        "x-correlation-id",
+                        "corr-alpha-hypothesis-registry-down-001",
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "feature_set_version":"dataset::v1",
+                            "target_regime":"overnight",
+                            "expected_edge_source":"liquidity_dislocation",
+                            "training_window_start_utc":"2026-04-01T00:00:00Z",
+                            "training_window_end_utc":"2026-04-02T00:00:00Z",
+                            "risk_assumptions":{"max_drawdown_pct":2.5}
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error_code"],
+            "alpha_hypothesis_dataset_snapshot_unavailable"
+        );
+        assert_eq!(payload["action"], "alpha_hypothesis_register");
     }
 
     #[tokio::test]

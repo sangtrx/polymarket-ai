@@ -16,6 +16,7 @@ common = { path = "../../crates/common" }
 domain = { path = "../../crates/domain" }
 governance-service = { path = "../governance-service" }
 reporting-service = { path = "../reporting-service" }
+research-gateway = { path = "../research-gateway" }
 persistence = { path = "../../crates/persistence" }
 
 [dev-dependencies]

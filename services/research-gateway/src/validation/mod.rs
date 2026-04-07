@@ -1,1 +1,1 @@
-// Validation workflows begin in Story 6.2.
+pub mod hypothesis_registry;

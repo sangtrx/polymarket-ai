@@ -1488,7 +1488,8 @@ pub fn resolve_market_bucket_policy_links(
             continue;
         }
         let canonical = canonicalize_market_bucket_profile(profile)?;
-        if canonical.market_id == normalized_market_id && canonical.cluster_id == normalized_cluster_id
+        if canonical.market_id == normalized_market_id
+            && canonical.cluster_id == normalized_cluster_id
         {
             matches.push(canonical);
         }
@@ -6188,14 +6189,14 @@ mod tests {
         profile.risk_policy_key = " Core-Risk-Default ".to_string();
         profile.allocation_policy_key = " Core-Allocation-Default ".to_string();
 
-        let resolved = resolve_market_bucket_policy_links(
-            "MARKET_YES_NO_1",
-            "cluster_alpha",
-            &[profile],
-        )
-        .expect("active canonical mapping should resolve");
+        let resolved =
+            resolve_market_bucket_policy_links("MARKET_YES_NO_1", "cluster_alpha", &[profile])
+                .expect("active canonical mapping should resolve");
 
-        assert_eq!(resolved.profile_id, "bucket::market_yes_no_1::cluster_alpha");
+        assert_eq!(
+            resolved.profile_id,
+            "bucket::market_yes_no_1::cluster_alpha"
+        );
         assert_eq!(resolved.market_id, "market_yes_no_1");
         assert_eq!(resolved.cluster_id, "cluster_alpha");
         assert_eq!(resolved.bucket_type, "core");
@@ -6208,7 +6209,10 @@ mod tests {
         let error = resolve_market_bucket_policy_links("market_yes_no_1", "cluster_alpha", &[])
             .expect_err("missing mapping should fail closed");
 
-        assert_eq!(error.code, MarketBucketReasonCode::MappingUnavailable.code());
+        assert_eq!(
+            error.code,
+            MarketBucketReasonCode::MappingUnavailable.code()
+        );
         assert!(
             error
                 .field_errors
@@ -6224,12 +6228,9 @@ mod tests {
         let mut right = sample_bucket_profile();
         right.profile_id = "bucket::market_yes_no_1::cluster_alpha::v2".to_string();
 
-        let error = resolve_market_bucket_policy_links(
-            "market_yes_no_1",
-            "cluster_alpha",
-            &[left, right],
-        )
-        .expect_err("duplicate active mappings must be deterministic conflict");
+        let error =
+            resolve_market_bucket_policy_links("market_yes_no_1", "cluster_alpha", &[left, right])
+                .expect_err("duplicate active mappings must be deterministic conflict");
 
         assert_eq!(error.code, MarketBucketReasonCode::MappingConflict.code());
     }

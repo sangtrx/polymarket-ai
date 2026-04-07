@@ -12,7 +12,10 @@ test("Story 5.4 pre-trade pipeline resolves stratified policy links before expos
 
   assert.match(gates, /resolve_pretrade_policy_context\(runtime_policy_state, intent, &evaluated_at_utc\)/);
   assert.match(gates, /let effective_profile_key = policy_context\.risk_policy_key;/);
-  assert.match(gates, /evaluate_pretrade_exposure_limit_gate\(runtime_limit_state, &effective_profile_key, &evaluated_at_utc\)/);
+  assert.match(
+    gates,
+    /evaluate_pretrade_exposure_limit_gate\(\s*runtime_limit_state,\s*&effective_profile_key,\s*&evaluated_at_utc,\s*\)/s,
+  );
   assert.match(gates, /evaluate_pretrade_reward_risk_gate\(runtime_policy_state, intent, &effective_profile_key\)/);
   assert.match(
     gates,

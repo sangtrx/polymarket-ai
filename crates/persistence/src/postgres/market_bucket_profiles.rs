@@ -199,7 +199,9 @@ where
             MarketBucketPersistenceError::query_failure("list_active_market_bucket_profiles", error)
         })?;
 
-    rows.into_iter().map(decode_market_bucket_profile_row).collect()
+    rows.into_iter()
+        .map(decode_market_bucket_profile_row)
+        .collect()
 }
 
 fn decode_market_bucket_profile_row(
@@ -244,7 +246,8 @@ fn decode_market_bucket_profile_row(
 fn validate_profile_for_persistence(
     profile: &MarketBucketProfile,
 ) -> Result<MarketBucketProfile, MarketBucketPersistenceError> {
-    let canonical_profile = canonicalize_market_bucket_profile(profile).map_err(map_contract_error)?;
+    let canonical_profile =
+        canonicalize_market_bucket_profile(profile).map_err(map_contract_error)?;
     parse_utc_timestamp(&canonical_profile.updated_at_utc)?;
     Ok(canonical_profile)
 }
@@ -335,9 +338,13 @@ mod tests {
     #[test]
     fn migration_creates_expected_market_bucket_schema_scope() {
         assert!(
-            MARKET_BUCKET_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS market_bucket_profiles")
+            MARKET_BUCKET_MIGRATION_SQL
+                .contains("CREATE TABLE IF NOT EXISTS market_bucket_profiles")
         );
-        assert!(!MARKET_BUCKET_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS market_policy_profiles"));
+        assert!(
+            !MARKET_BUCKET_MIGRATION_SQL
+                .contains("CREATE TABLE IF NOT EXISTS market_policy_profiles")
+        );
     }
 
     #[test]
@@ -378,7 +385,10 @@ mod tests {
         let canonical = validate_profile_for_persistence(&profile)
             .expect("canonical formatting should be produced for persisted profiles");
 
-        assert_eq!(canonical.profile_id, "bucket::market_yes_no_1::cluster_alpha");
+        assert_eq!(
+            canonical.profile_id,
+            "bucket::market_yes_no_1::cluster_alpha"
+        );
         assert_eq!(canonical.market_id, "market_yes_no_1");
         assert_eq!(canonical.cluster_id, "cluster_alpha");
         assert_eq!(canonical.risk_policy_key, "core-risk-default");

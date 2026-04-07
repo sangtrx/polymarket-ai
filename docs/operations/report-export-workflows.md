@@ -57,3 +57,4 @@ Runbook links:
 
 - Recurring scheduler operations: `docs/operations/recurring-report-scheduling.md`
 - Severity alert delivery: `docs/operations/severity-alert-delivery.md`
+- Alpha hypothesis registry operations (FR6): `docs/operations/alpha-hypothesis-registry.md`

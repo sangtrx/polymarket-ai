@@ -2,6 +2,7 @@ mod gates;
 mod limits;
 mod safe_state;
 
+use crate::gates::RuntimePolicyStateReader;
 use common::time::timestamp_utc;
 use domain::reconciliation::ReconciliationReasonCode;
 use domain::recovery::{
@@ -34,7 +35,6 @@ use persistence::postgres::safety_controls::load_current_effective_safety_mode;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::future::Future;
 use std::pin::Pin;
-use crate::gates::RuntimePolicyStateReader;
 
 #[tokio::main]
 async fn main() {
