@@ -63,3 +63,4 @@ Critical increase detection is fail-closed:
 
 1. FR41 participation guardrails and overnight cap operations: `docs/operations/low-liquidity-overnight-guardrails.md`
 2. Pre-trade pipeline sequencing and reason-code matrix: `docs/operations/pretrade-gate-pipeline.md`
+3. Core/satellite market stratification operations (FR42): `docs/operations/core-satellite-market-stratification.md`

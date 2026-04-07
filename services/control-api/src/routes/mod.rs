@@ -46,11 +46,12 @@ use domain::reporting_schedule::{
     parse_utc_timestamp,
 };
 use domain::risk::{
-    EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
-    MarketPolicyValidationIssue, MarketSnapshot, ParticipationGuardrailReasonCode,
-    RegimeShiftReasonCode, RegimeShiftThresholds, RewardRiskReasonCode, RewardRiskValidationIssue,
-    RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue, SafetyControlActionRecord,
-    VenueEligibilityState, evaluate_fr40_regime_shift,
+    EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
+    MarketPolicyReasonCode, MarketPolicyValidationIssue, MarketSnapshot,
+    ParticipationGuardrailReasonCode, RegimeShiftReasonCode, RegimeShiftThresholds,
+    RewardRiskReasonCode, RewardRiskValidationIssue, RiskLimitReasonCode, RiskLimitScope,
+    RiskLimitValidationIssue, SafetyControlActionRecord, VenueEligibilityState,
+    evaluate_fr40_regime_shift,
 };
 use governance_service::allocation_policy::{
     AllocationPolicyMutationEvidence, EvaluateRebalanceDriftInput,
@@ -64,7 +65,10 @@ use governance_service::audit::AuditAppendError;
 use governance_service::credentials::{
     TriggerEmergencyRotationInput, TriggerScheduledRotationInput,
 };
-use governance_service::market_policy::{ToggleMarketClusterInput, UpsertMarketPolicyProfileInput};
+use governance_service::market_policy::{
+    ReadMarketBucketProfileInput, ToggleMarketClusterInput, UpsertMarketBucketProfileInput,
+    UpsertMarketPolicyProfileInput,
+};
 use governance_service::recovery::{
     EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput, ExecuteRestoreRehearsalInput,
     QueryRecoveryGateRunInput, QueryRestoreRehearsalByRunIdInput, QueryRestoreRehearsalsInput,
@@ -143,6 +147,10 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/market-policy/profiles/{cluster_id}",
             post(update_market_policy_profile),
+        )
+        .route(
+            "/control/market-policy/buckets/{market_id}/{cluster_id}",
+            post(update_market_bucket_profile).get(read_market_bucket_profile),
         )
         .route(
             "/control/market-policy/clusters/{cluster_id}/toggle",
@@ -755,6 +763,86 @@ pub async fn toggle_market_policy_cluster(
         };
 
     market_policy_cluster_toggle_response(&state, &actor, decision, endpoint)
+}
+
+pub async fn update_market_bucket_profile(
+    State(state): State<ControlApiState>,
+    Path((market_id, cluster_id)): Path<(String, String)>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<MarketBucketProfilePayload>,
+) -> Response {
+    let endpoint = format!("/control/market-policy/buckets/{market_id}/{cluster_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision = match state
+        .market_policy_orchestrator
+        .upsert_market_bucket_profile(UpsertMarketBucketProfileInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            market_id,
+            cluster_id,
+            bucket_type: payload.bucket_type,
+            risk_policy_key: payload.risk_policy_key,
+            allocation_policy_key: payload.allocation_policy_key,
+            correlation_id: actor.correlation_id.clone(),
+            updated_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return market_policy_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "market_bucket_profile_update",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    market_bucket_profile_response(&state, &actor, decision, endpoint, "POST")
+}
+
+pub async fn read_market_bucket_profile(
+    State(state): State<ControlApiState>,
+    Path((market_id, cluster_id)): Path<(String, String)>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/market-policy/buckets/{market_id}/{cluster_id}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let decision = match state
+        .market_policy_orchestrator
+        .read_market_bucket_profile(ReadMarketBucketProfileInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            market_id,
+            cluster_id,
+            correlation_id: actor.correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return market_policy_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "market_bucket_profile_read",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    market_bucket_profile_response(&state, &actor, decision, endpoint, "GET")
 }
 
 pub async fn upsert_risk_limit_profile(
@@ -5858,6 +5946,76 @@ fn market_policy_cluster_toggle_response(
         .into_response()
 }
 
+fn market_bucket_profile_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    decision: governance_service::market_policy::MarketBucketProfileEvidence,
+    endpoint: String,
+    http_method: &'static str,
+) -> Response {
+    let action_type = if http_method == "GET" {
+        "market_bucket_profile_read"
+    } else {
+        "market_bucket_profile_update"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action_type.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "profile_id": decision.profile_id,
+            "market_id": decision.market_id,
+            "cluster_id": decision.cluster_id,
+            "bucket_type": decision.bucket_type,
+            "risk_policy_key": decision.risk_policy_key,
+            "allocation_policy_key": decision.allocation_policy_key,
+            "is_active": decision.is_active,
+        }),
+        approval_reference: None,
+        timestamp: decision.updated_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: decision.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: decision.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action_type.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.updated_at_utc,
+        );
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(MarketBucketProfileDecisionResponse {
+            status: "accepted",
+            error_code: None,
+            message: None,
+            profile_id: decision.profile_id,
+            market_id: decision.market_id,
+            cluster_id: decision.cluster_id,
+            bucket_type: decision.bucket_type,
+            risk_policy_key: decision.risk_policy_key,
+            allocation_policy_key: decision.allocation_policy_key,
+            is_active: decision.is_active,
+            actor_id: decision.actor_id,
+            role: actor.role.clone(),
+            reason_code: decision.reason_code,
+            correlation_id: decision.correlation_id,
+            timestamp_utc: decision.updated_at_utc,
+            security_signal: None,
+        }),
+    )
+        .into_response()
+}
+
 fn market_policy_service_error_response(
     error_code: &'static str,
     message: String,
@@ -5907,15 +6065,26 @@ fn market_policy_service_error_status(code: &str) -> StatusCode {
     match code {
         code if code == MarketPolicyReasonCode::InvalidPayload.code()
             || code == MarketPolicyReasonCode::InvalidClusterId.code()
-            || code == MarketPolicyReasonCode::InvalidThreshold.code() =>
+            || code == MarketPolicyReasonCode::InvalidThreshold.code()
+            || code == MarketBucketReasonCode::InvalidPayload.code()
+            || code == MarketBucketReasonCode::UnsupportedBucketType.code() =>
         {
             StatusCode::BAD_REQUEST
         }
         "market_policy_unauthorized_role" => StatusCode::FORBIDDEN,
-        "market_policy_constraint_violation" => StatusCode::CONFLICT,
+        "market_policy_constraint_violation" | "market_bucket_constraint_violation" => {
+            StatusCode::CONFLICT
+        }
+        code if code == MarketBucketReasonCode::MappingConflict.code() => StatusCode::CONFLICT,
+        code if code == MarketBucketReasonCode::MappingUnavailable.code() => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         code if code == MarketPolicyReasonCode::PersistenceUnavailable.code()
             || code == "market_policy_query_failed"
-            || code == "market_policy_row_decode_failed" =>
+            || code == "market_policy_row_decode_failed"
+            || code == MarketBucketReasonCode::PersistenceUnavailable.code()
+            || code == "market_bucket_query_failed"
+            || code == "market_bucket_row_decode_failed" =>
         {
             StatusCode::SERVICE_UNAVAILABLE
         }
@@ -8754,6 +8923,13 @@ pub struct MarketPolicyProfilePayload {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct MarketBucketProfilePayload {
+    pub bucket_type: String,
+    pub risk_policy_key: String,
+    pub allocation_policy_key: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct MarketClusterTogglePayload {
     pub is_enabled: bool,
     pub reason_code: Option<String>,
@@ -9169,6 +9345,29 @@ pub struct MarketPolicyClusterToggleDecisionResponse {
     pub message: Option<String>,
     pub cluster_id: String,
     pub is_enabled: bool,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<MarketPolicySecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarketBucketProfileDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub profile_id: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub bucket_type: String,
+    pub risk_policy_key: String,
+    pub allocation_policy_key: String,
+    pub is_active: bool,
     pub actor_id: String,
     pub role: String,
     pub reason_code: String,
@@ -10316,7 +10515,8 @@ mod tests {
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
-        EmergencyControlTriggerSource, REWARD_RISK_DEFAULT_THRESHOLD,
+        EmergencyControlTriggerSource, MarketBucketReasonCode, MarketPolicyValidationIssue,
+        REWARD_RISK_DEFAULT_THRESHOLD,
     };
     use governance_service::{
         allocation_policy::{
@@ -10329,8 +10529,10 @@ mod tests {
         audit::{AuditAppendError, PrivilegedAuditAppender},
         credentials::CredentialRotationService,
         market_policy::{
-            MarketClusterToggleEvidence, MarketPolicyOrchestrator, MarketPolicyProfileEvidence,
-            MarketPolicyServiceError, ToggleMarketClusterInput, UpsertMarketPolicyProfileInput,
+            MarketBucketProfileEvidence, MarketClusterToggleEvidence, MarketPolicyOrchestrator,
+            MarketPolicyProfileEvidence, MarketPolicyServiceError, ReadMarketBucketProfileInput,
+            ToggleMarketClusterInput, UpsertMarketBucketProfileInput,
+            UpsertMarketPolicyProfileInput,
         },
         recovery::{
             EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput,
@@ -10832,6 +11034,9 @@ mod tests {
     struct StubMarketPolicyOrchestrator {
         profile_error: Option<(&'static str, &'static str)>,
         toggle_error: Option<(&'static str, &'static str)>,
+        bucket_upsert_error: Option<(&'static str, &'static str)>,
+        bucket_read_error: Option<(&'static str, &'static str)>,
+        bucket_read_missing: bool,
     }
 
     impl MarketPolicyOrchestrator for StubMarketPolicyOrchestrator {
@@ -10889,6 +11094,81 @@ mod tests {
                     .reason_code
                     .unwrap_or_else(|| default_reason.to_string()),
                 updated_at_utc: input.updated_at_utc,
+            })
+        }
+
+        fn upsert_market_bucket_profile(
+            &self,
+            input: UpsertMarketBucketProfileInput,
+        ) -> Result<MarketBucketProfileEvidence, MarketPolicyServiceError> {
+            if let Some((code, message)) = self.bucket_upsert_error {
+                return Err(MarketPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            Ok(MarketBucketProfileEvidence {
+                profile_id: format!(
+                    "bucket::{}::{}",
+                    input.market_id.trim().to_lowercase(),
+                    input.cluster_id.trim().to_lowercase()
+                ),
+                market_id: input.market_id.trim().to_lowercase(),
+                cluster_id: input.cluster_id.trim().to_lowercase(),
+                bucket_type: input.bucket_type.trim().to_lowercase(),
+                risk_policy_key: input.risk_policy_key.trim().to_lowercase(),
+                allocation_policy_key: input.allocation_policy_key.trim().to_lowercase(),
+                is_active: true,
+                actor_id: input.actor_id,
+                correlation_id: input.correlation_id,
+                reason_code: MarketBucketReasonCode::ProfileUpdated.code().to_string(),
+                updated_at_utc: input.updated_at_utc,
+            })
+        }
+
+        fn read_market_bucket_profile(
+            &self,
+            input: ReadMarketBucketProfileInput,
+        ) -> Result<MarketBucketProfileEvidence, MarketPolicyServiceError> {
+            if let Some((code, message)) = self.bucket_read_error {
+                return Err(MarketPolicyServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+            if self.bucket_read_missing {
+                return Err(MarketPolicyServiceError {
+                    code: MarketBucketReasonCode::MappingUnavailable.code(),
+                    message: "no active market bucket mapping exists".to_string(),
+                    field_errors: vec![MarketPolicyValidationIssue {
+                        field: "market_id",
+                        code: MarketBucketReasonCode::MappingUnavailable.code(),
+                        message:
+                            "no active market bucket mapping exists for this market/cluster pair"
+                                .to_string(),
+                    }],
+                });
+            }
+
+            Ok(MarketBucketProfileEvidence {
+                profile_id: format!(
+                    "bucket::{}::{}",
+                    input.market_id.trim().to_lowercase(),
+                    input.cluster_id.trim().to_lowercase()
+                ),
+                market_id: input.market_id.trim().to_lowercase(),
+                cluster_id: input.cluster_id.trim().to_lowercase(),
+                bucket_type: "core".to_string(),
+                risk_policy_key: "core-risk-default".to_string(),
+                allocation_policy_key: "core-allocation-default".to_string(),
+                is_active: true,
+                actor_id: input.actor_id,
+                correlation_id: input.correlation_id,
+                reason_code: MarketBucketReasonCode::ProfileRead.code().to_string(),
+                updated_at_utc: input.queried_at_utc,
             })
         }
     }
@@ -14827,6 +15107,265 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "market_policy_constraint_violation");
         assert_eq!(payload["action"], "market_policy_cluster_toggle");
+    }
+
+    #[tokio::test]
+    async fn market_bucket_profile_route_reuses_authorization_guard_for_unauthorized_role() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/buckets/market_yes_no_1/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("reader-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-bucket-authz-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "bucket_type":"core",
+                            "risk_policy_key":"core-risk-default",
+                            "allocation_policy_key":"core-allocation-default"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "authorization_denied");
+        assert_eq!(payload["action"], "execute_control_plane_action");
+    }
+
+    #[tokio::test]
+    async fn market_bucket_profile_route_returns_machine_readable_success_evidence() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/buckets/market_yes_no_1/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-bucket-accept-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "bucket_type":"core",
+                            "risk_policy_key":"core-risk-default",
+                            "allocation_policy_key":"core-allocation-default"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["profile_id"],
+            "bucket::market_yes_no_1::cluster_alpha"
+        );
+        assert_eq!(payload["bucket_type"], "core");
+        assert_eq!(payload["risk_policy_key"], "core-risk-default");
+        assert_eq!(payload["allocation_policy_key"], "core-allocation-default");
+        assert_eq!(payload["reason_code"], "market_bucket_profile_updated");
+        assert!(payload["error_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn market_bucket_profile_route_rejects_invalid_bucket_payload_with_field_errors() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/buckets/market_yes_no_1/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-bucket-invalid-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "bucket_type":"growth",
+                            "risk_policy_key":"core-risk-default",
+                            "allocation_policy_key":"core-allocation-default"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "market_bucket_invalid_payload");
+        assert_eq!(payload["action"], "market_bucket_profile_update");
+        assert_eq!(payload["field_errors"][0]["field"], "bucket_type");
+    }
+
+    #[tokio::test]
+    async fn market_bucket_profile_route_surfaces_conflict_machine_error() {
+        let app =
+            test_app_with_market_policy_orchestrator(Arc::new(StubMarketPolicyOrchestrator {
+                bucket_upsert_error: Some((
+                    "market_bucket_constraint_violation",
+                    "active bucket profile already exists",
+                )),
+                ..Default::default()
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/buckets/market_yes_no_1/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-bucket-conflict-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "bucket_type":"core",
+                            "risk_policy_key":"core-risk-default",
+                            "allocation_policy_key":"core-allocation-default"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "market_bucket_constraint_violation");
+        assert_eq!(payload["action"], "market_bucket_profile_update");
+    }
+
+    #[tokio::test]
+    async fn market_bucket_profile_read_route_returns_machine_readable_profile() {
+        let app = test_app();
+        let write_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/buckets/market_yes_no_1/cluster_alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-bucket-read-write-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "bucket_type":"satellite",
+                            "risk_policy_key":"satellite-risk-default",
+                            "allocation_policy_key":"satellite-allocation-default"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(write_response.status(), StatusCode::ACCEPTED);
+
+        let read_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/buckets/market_yes_no_1/cluster_alpha")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-bucket-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(read_response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["bucket_type"], "satellite");
+        assert_eq!(payload["reason_code"], "market_bucket_profile_read");
+        assert_eq!(
+            payload["risk_policy_key"],
+            "satellite-risk-default"
+        );
+        assert_eq!(
+            payload["allocation_policy_key"],
+            "satellite-allocation-default"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_bucket_profile_read_route_surfaces_mapping_unavailable_fail_closed() {
+        let app =
+            test_app_with_market_policy_orchestrator(Arc::new(StubMarketPolicyOrchestrator {
+                bucket_read_missing: true,
+                ..Default::default()
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/market-policy/buckets/market_yes_no_1/cluster_alpha")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-market-bucket-read-missing-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "market_bucket_mapping_unavailable");
+        assert_eq!(payload["action"], "market_bucket_profile_read");
     }
 
     #[tokio::test]

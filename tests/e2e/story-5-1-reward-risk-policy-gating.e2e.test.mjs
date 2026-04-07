@@ -11,7 +11,7 @@ test("Story 5.1 pre-trade pipeline composes reward-risk checks after venue eligi
   const gates = read("services/risk-engine/src/gates/mod.rs");
 
   assert.match(gates, /evaluate_pretrade_venue_eligibility_gate\(runtime_policy_state, intent\)/);
-  assert.match(gates, /evaluate_pretrade_reward_risk_gate\(runtime_policy_state, intent, profile_key\)/);
+  assert.match(gates, /evaluate_pretrade_reward_risk_gate\(runtime_policy_state, intent, &effective_profile_key\)/);
   assert.match(gates, /let reward_risk_passed = reward_risk_gate\.passed/);
   assert.match(gates, /gate_results\.push\(reward_risk_gate\)/);
   assert.match(

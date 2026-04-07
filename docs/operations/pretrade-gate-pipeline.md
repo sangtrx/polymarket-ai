@@ -108,3 +108,4 @@ During incident recovery:
 
 1. FR41 participation guardrails: `docs/operations/low-liquidity-overnight-guardrails.md`
 2. FR39 reward-per-risk policy operations: `docs/operations/reward-risk-policy-operations.md`
+3. FR42 core/satellite market stratification operations: `docs/operations/core-satellite-market-stratification.md`

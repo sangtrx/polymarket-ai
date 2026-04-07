@@ -438,6 +438,30 @@ pub struct MarketPolicyProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MarketBucketProfile {
+    pub profile_id: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub bucket_type: String,
+    pub risk_policy_key: String,
+    pub allocation_policy_key: String,
+    pub is_active: bool,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedMarketPolicyLinks {
+    pub profile_id: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub bucket_type: String,
+    pub risk_policy_key: String,
+    pub allocation_policy_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketClusterOverride {
     pub cluster_id: String,
     pub is_enabled: bool,
@@ -1107,6 +1131,138 @@ impl MarketPolicyReasonCode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketBucketType {
+    Core,
+    Satellite,
+}
+
+impl MarketBucketType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Satellite => "satellite",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MarketBucketContractError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "core" => Ok(Self::Core),
+            "satellite" => Ok(Self::Satellite),
+            _ => Err(MarketBucketContractError::invalid_payload_with_issues(
+                format!("unsupported bucket_type `{value}`"),
+                vec![MarketBucketValidationIssue {
+                    field: "bucket_type",
+                    code: MarketBucketReasonCode::UnsupportedBucketType.code(),
+                    message: "bucket_type must be one of: core, satellite".to_string(),
+                }],
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketBucketReasonCode {
+    MappingResolved,
+    MappingUnavailable,
+    MappingConflict,
+    InvalidPayload,
+    UnsupportedBucketType,
+    ProfileUpdated,
+    ProfileRead,
+    PersistenceUnavailable,
+}
+
+impl MarketBucketReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MappingResolved => "market_bucket_mapping_resolved",
+            Self::MappingUnavailable => "market_bucket_mapping_unavailable",
+            Self::MappingConflict => "market_bucket_mapping_conflict",
+            Self::InvalidPayload => "market_bucket_invalid_payload",
+            Self::UnsupportedBucketType => "market_bucket_unsupported_bucket_type",
+            Self::ProfileUpdated => "market_bucket_profile_updated",
+            Self::ProfileRead => "market_bucket_profile_read",
+            Self::PersistenceUnavailable => "market_bucket_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MarketBucketContractError> {
+        match value {
+            "market_bucket_mapping_resolved" => Ok(Self::MappingResolved),
+            "market_bucket_mapping_unavailable" => Ok(Self::MappingUnavailable),
+            "market_bucket_mapping_conflict" => Ok(Self::MappingConflict),
+            "market_bucket_invalid_payload" => Ok(Self::InvalidPayload),
+            "market_bucket_unsupported_bucket_type" => Ok(Self::UnsupportedBucketType),
+            "market_bucket_profile_updated" => Ok(Self::ProfileUpdated),
+            "market_bucket_profile_read" => Ok(Self::ProfileRead),
+            "market_bucket_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(MarketBucketContractError::invalid_payload(format!(
+                "unknown market bucket reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MarketBucketValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MarketBucketContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<MarketBucketValidationIssue>,
+}
+
+impl MarketBucketContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: MarketBucketReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<MarketBucketValidationIssue>,
+    ) -> Self {
+        Self {
+            code: MarketBucketReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+
+    pub fn mapping_unavailable_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<MarketBucketValidationIssue>,
+    ) -> Self {
+        Self {
+            code: MarketBucketReasonCode::MappingUnavailable.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+
+    pub fn mapping_conflict_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<MarketBucketValidationIssue>,
+    ) -> Self {
+        Self {
+            code: MarketBucketReasonCode::MappingConflict.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketEligibilityDecision {
     pub market_id: String,
@@ -1225,6 +1381,154 @@ pub fn validate_market_policy_profile(
     }
 
     Ok(())
+}
+
+pub fn normalize_market_bucket_identifier(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+pub fn canonical_market_bucket_profile_id(market_id: &str, cluster_id: &str) -> String {
+    format!(
+        "bucket::{}::{}",
+        normalize_market_bucket_identifier(market_id),
+        normalize_market_bucket_identifier(cluster_id)
+    )
+}
+
+pub fn validate_market_bucket_profile(
+    profile: &MarketBucketProfile,
+) -> Result<(), MarketBucketContractError> {
+    let mut field_errors = Vec::new();
+    validate_market_bucket_non_empty_field(&mut field_errors, "profile_id", &profile.profile_id);
+    validate_market_bucket_non_empty_field(&mut field_errors, "market_id", &profile.market_id);
+    validate_market_bucket_non_empty_field(&mut field_errors, "cluster_id", &profile.cluster_id);
+    validate_market_bucket_non_empty_field(&mut field_errors, "bucket_type", &profile.bucket_type);
+    validate_market_bucket_non_empty_field(
+        &mut field_errors,
+        "risk_policy_key",
+        &profile.risk_policy_key,
+    );
+    validate_market_bucket_non_empty_field(
+        &mut field_errors,
+        "allocation_policy_key",
+        &profile.allocation_policy_key,
+    );
+    validate_market_bucket_non_empty_field(&mut field_errors, "actor_id", &profile.actor_id);
+    validate_market_bucket_non_empty_field(
+        &mut field_errors,
+        "correlation_id",
+        &profile.correlation_id,
+    );
+    validate_market_bucket_timestamp_field(
+        &mut field_errors,
+        "updated_at_utc",
+        &profile.updated_at_utc,
+    );
+    if let Err(error) = MarketBucketType::parse(&profile.bucket_type) {
+        field_errors.extend(error.field_errors);
+    }
+
+    if !field_errors.is_empty() {
+        return Err(MarketBucketContractError::invalid_payload_with_issues(
+            "market bucket profile payload is invalid",
+            field_errors,
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn canonicalize_market_bucket_profile(
+    profile: &MarketBucketProfile,
+) -> Result<MarketBucketProfile, MarketBucketContractError> {
+    validate_market_bucket_profile(profile)?;
+    let bucket_type = MarketBucketType::parse(&profile.bucket_type)?;
+    Ok(MarketBucketProfile {
+        profile_id: normalize_market_bucket_identifier(&profile.profile_id),
+        market_id: normalize_market_bucket_identifier(&profile.market_id),
+        cluster_id: normalize_market_bucket_identifier(&profile.cluster_id),
+        bucket_type: bucket_type.as_str().to_string(),
+        risk_policy_key: normalize_market_bucket_identifier(&profile.risk_policy_key),
+        allocation_policy_key: normalize_market_bucket_identifier(&profile.allocation_policy_key),
+        is_active: profile.is_active,
+        actor_id: normalize_market_bucket_identifier(&profile.actor_id),
+        correlation_id: normalize_market_bucket_identifier(&profile.correlation_id),
+        updated_at_utc: profile.updated_at_utc.clone(),
+    })
+}
+
+pub fn resolve_market_bucket_policy_links(
+    market_id: &str,
+    cluster_id: &str,
+    profiles: &[MarketBucketProfile],
+) -> Result<ResolvedMarketPolicyLinks, MarketBucketContractError> {
+    let normalized_market_id = normalize_market_bucket_identifier(market_id);
+    let normalized_cluster_id = normalize_market_bucket_identifier(cluster_id);
+    if normalized_market_id.is_empty() || normalized_cluster_id.is_empty() {
+        return Err(MarketBucketContractError::invalid_payload_with_issues(
+            "market_id and cluster_id are required to resolve market bucket policy links",
+            vec![
+                MarketBucketValidationIssue {
+                    field: "market_id",
+                    code: MarketBucketReasonCode::InvalidPayload.code(),
+                    message: "market_id cannot be blank".to_string(),
+                },
+                MarketBucketValidationIssue {
+                    field: "cluster_id",
+                    code: MarketBucketReasonCode::InvalidPayload.code(),
+                    message: "cluster_id cannot be blank".to_string(),
+                },
+            ],
+        ));
+    }
+
+    let mut matches = Vec::new();
+    for profile in profiles {
+        if !profile.is_active {
+            continue;
+        }
+        let canonical = canonicalize_market_bucket_profile(profile)?;
+        if canonical.market_id == normalized_market_id && canonical.cluster_id == normalized_cluster_id
+        {
+            matches.push(canonical);
+        }
+    }
+
+    match matches.len() {
+        0 => Err(MarketBucketContractError::mapping_unavailable_with_issues(
+            "no active market bucket mapping exists for the requested market/cluster",
+            vec![MarketBucketValidationIssue {
+                field: "market_id",
+                code: MarketBucketReasonCode::MappingUnavailable.code(),
+                message: format!(
+                    "no active mapping for market_id `{normalized_market_id}` and cluster_id `{normalized_cluster_id}`"
+                ),
+            }],
+        )),
+        1 => {
+            let profile = matches
+                .pop()
+                .expect("single-element vector should contain profile");
+            Ok(ResolvedMarketPolicyLinks {
+                profile_id: profile.profile_id,
+                market_id: profile.market_id,
+                cluster_id: profile.cluster_id,
+                bucket_type: profile.bucket_type,
+                risk_policy_key: profile.risk_policy_key,
+                allocation_policy_key: profile.allocation_policy_key,
+            })
+        }
+        _ => Err(MarketBucketContractError::mapping_conflict_with_issues(
+            "multiple active market bucket mappings exist for the requested market/cluster",
+            vec![MarketBucketValidationIssue {
+                field: "profile_id",
+                code: MarketBucketReasonCode::MappingConflict.code(),
+                message: format!(
+                    "expected one active mapping for market_id `{normalized_market_id}` and cluster_id `{normalized_cluster_id}`"
+                ),
+            }],
+        )),
+    }
 }
 
 pub fn validate_market_cluster_override(
@@ -3586,6 +3890,7 @@ pub enum PreTradeReasonCode {
     StreamHealthStateUnavailable,
     StreamHealthDegraded,
     RiskLimitStateUnavailable,
+    StratificationStateUnavailable,
     ReconciliationCriticalHalt,
     UserStreamAuthExpired,
     DrawdownStateUnavailable,
@@ -3615,6 +3920,7 @@ impl PreTradeReasonCode {
             Self::StreamHealthStateUnavailable => "pretrade_stream_health_state_unavailable",
             Self::StreamHealthDegraded => "pretrade_stream_health_degraded",
             Self::RiskLimitStateUnavailable => "pretrade_risk_limit_state_unavailable",
+            Self::StratificationStateUnavailable => "pretrade_stratification_state_unavailable",
             Self::ReconciliationCriticalHalt => "pretrade_reconciliation_critical_halt",
             Self::UserStreamAuthExpired => "pretrade_user_stream_auth_expired",
             Self::DrawdownStateUnavailable => "pretrade_drawdown_state_unavailable",
@@ -3652,6 +3958,7 @@ impl PreTradeReasonCode {
             "pretrade_stream_health_state_unavailable" => Ok(Self::StreamHealthStateUnavailable),
             "pretrade_stream_health_degraded" => Ok(Self::StreamHealthDegraded),
             "pretrade_risk_limit_state_unavailable" => Ok(Self::RiskLimitStateUnavailable),
+            "pretrade_stratification_state_unavailable" => Ok(Self::StratificationStateUnavailable),
             "pretrade_reconciliation_critical_halt" => Ok(Self::ReconciliationCriticalHalt),
             "pretrade_user_stream_auth_expired" => Ok(Self::UserStreamAuthExpired),
             "pretrade_drawdown_state_unavailable" => Ok(Self::DrawdownStateUnavailable),
@@ -5113,6 +5420,34 @@ fn validate_non_empty_field(
     }
 }
 
+fn validate_market_bucket_non_empty_field(
+    field_errors: &mut Vec<MarketBucketValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(MarketBucketValidationIssue {
+            field,
+            code: MarketBucketReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_market_bucket_timestamp_field(
+    field_errors: &mut Vec<MarketBucketValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(MarketBucketValidationIssue {
+            field,
+            code: MarketBucketReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
 fn validate_non_negative_threshold(
     field_errors: &mut Vec<MarketPolicyValidationIssue>,
     field: &'static str,
@@ -5787,6 +6122,116 @@ mod tests {
             projected_exposure_pct_nav: 12.0,
             observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
         }
+    }
+
+    fn sample_bucket_profile() -> MarketBucketProfile {
+        MarketBucketProfile {
+            profile_id: "bucket::market_yes_no_1::cluster_alpha".to_string(),
+            market_id: "market_yes_no_1".to_string(),
+            cluster_id: "cluster_alpha".to_string(),
+            bucket_type: "core".to_string(),
+            risk_policy_key: "core-risk-default".to_string(),
+            allocation_policy_key: "core-allocation-default".to_string(),
+            is_active: true,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-bucket-001".to_string(),
+            updated_at_utc: "2026-04-07T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn market_bucket_type_parse_accepts_core_and_satellite_only() {
+        let core = MarketBucketType::parse(" core ")
+            .expect("core should parse after canonical normalization");
+        let satellite = MarketBucketType::parse("SATELLITE")
+            .expect("satellite should parse after canonical normalization");
+
+        assert_eq!(core, MarketBucketType::Core);
+        assert_eq!(satellite, MarketBucketType::Satellite);
+        assert!(MarketBucketType::parse("hedged").is_err());
+    }
+
+    #[test]
+    fn market_bucket_profile_validation_rejects_unknown_bucket_type() {
+        let mut profile = sample_bucket_profile();
+        profile.bucket_type = "growth".to_string();
+        let error = validate_market_bucket_profile(&profile)
+            .expect_err("unsupported bucket type should fail validation");
+
+        assert_eq!(error.code, MarketBucketReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "bucket_type")
+        );
+    }
+
+    #[test]
+    fn market_bucket_profile_validation_accepts_core_satellite_boundaries() {
+        let core = sample_bucket_profile();
+        assert!(validate_market_bucket_profile(&core).is_ok());
+
+        let mut satellite = sample_bucket_profile();
+        satellite.profile_id = "bucket::market_yes_no_2::cluster_alpha".to_string();
+        satellite.market_id = "market_yes_no_2".to_string();
+        satellite.bucket_type = "satellite".to_string();
+        assert!(validate_market_bucket_profile(&satellite).is_ok());
+    }
+
+    #[test]
+    fn resolve_market_bucket_policy_links_returns_canonical_active_mapping() {
+        let mut profile = sample_bucket_profile();
+        profile.profile_id = " Bucket::Market_Yes_No_1::Cluster_Alpha ".to_string();
+        profile.market_id = " Market_Yes_No_1 ".to_string();
+        profile.cluster_id = " Cluster_Alpha ".to_string();
+        profile.risk_policy_key = " Core-Risk-Default ".to_string();
+        profile.allocation_policy_key = " Core-Allocation-Default ".to_string();
+
+        let resolved = resolve_market_bucket_policy_links(
+            "MARKET_YES_NO_1",
+            "cluster_alpha",
+            &[profile],
+        )
+        .expect("active canonical mapping should resolve");
+
+        assert_eq!(resolved.profile_id, "bucket::market_yes_no_1::cluster_alpha");
+        assert_eq!(resolved.market_id, "market_yes_no_1");
+        assert_eq!(resolved.cluster_id, "cluster_alpha");
+        assert_eq!(resolved.bucket_type, "core");
+        assert_eq!(resolved.risk_policy_key, "core-risk-default");
+        assert_eq!(resolved.allocation_policy_key, "core-allocation-default");
+    }
+
+    #[test]
+    fn resolve_market_bucket_policy_links_fails_closed_when_mapping_missing() {
+        let error = resolve_market_bucket_policy_links("market_yes_no_1", "cluster_alpha", &[])
+            .expect_err("missing mapping should fail closed");
+
+        assert_eq!(error.code, MarketBucketReasonCode::MappingUnavailable.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "market_id")
+        );
+    }
+
+    #[test]
+    fn resolve_market_bucket_policy_links_rejects_duplicate_active_mappings() {
+        let mut left = sample_bucket_profile();
+        left.profile_id = "bucket::market_yes_no_1::cluster_alpha::v1".to_string();
+        let mut right = sample_bucket_profile();
+        right.profile_id = "bucket::market_yes_no_1::cluster_alpha::v2".to_string();
+
+        let error = resolve_market_bucket_policy_links(
+            "market_yes_no_1",
+            "cluster_alpha",
+            &[left, right],
+        )
+        .expect_err("duplicate active mappings must be deterministic conflict");
+
+        assert_eq!(error.code, MarketBucketReasonCode::MappingConflict.code());
     }
 
     #[test]
@@ -6798,6 +7243,7 @@ mod tests {
             PreTradeReasonCode::FreshnessStaleBreach,
             PreTradeReasonCode::StreamHealthDegraded,
             PreTradeReasonCode::RiskLimitStateUnavailable,
+            PreTradeReasonCode::StratificationStateUnavailable,
             PreTradeReasonCode::DrawdownStopTriggered,
             PreTradeReasonCode::VenueIneligible,
             PreTradeReasonCode::RewardRiskBelowThreshold,

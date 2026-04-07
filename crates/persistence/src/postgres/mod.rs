@@ -8,6 +8,7 @@ pub mod export_jobs;
 pub mod freshness_gate;
 pub mod incident_alerts;
 pub mod incident_query_views;
+pub mod market_bucket_profiles;
 pub mod market_policy;
 pub mod market_stream;
 pub mod orders;

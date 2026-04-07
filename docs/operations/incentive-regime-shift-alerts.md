@@ -74,3 +74,4 @@ Rows are ordered by `observed_at DESC, alert_id ASC` for stable operator triage.
 2. Severity alert delivery and fallback: `docs/operations/severity-alert-delivery.md`
 3. Incident forensics timeline: `docs/operations/incident-search-causal-timeline-forensics.md`
 4. FR41 participation guardrails: `docs/operations/low-liquidity-overnight-guardrails.md`
+5. Core/satellite market stratification operations (FR42): `docs/operations/core-satellite-market-stratification.md`

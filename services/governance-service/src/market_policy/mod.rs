@@ -1,6 +1,12 @@
 use domain::risk::{
-    MarketClusterOverride, MarketPolicyProfile, MarketPolicyReasonCode,
-    MarketPolicyValidationIssue, validate_market_cluster_override, validate_market_policy_profile,
+    MarketBucketProfile, MarketBucketReasonCode, MarketBucketValidationIssue,
+    MarketClusterOverride, MarketPolicyProfile, MarketPolicyReasonCode, MarketPolicyValidationIssue,
+    canonical_market_bucket_profile_id, canonicalize_market_bucket_profile,
+    validate_market_cluster_override, validate_market_policy_profile,
+};
+use persistence::postgres::market_bucket_profiles::{
+    MarketBucketPersistenceError, load_active_market_bucket_profile as pg_load_active_bucket_profile,
+    upsert_market_bucket_profile as pg_upsert_market_bucket_profile,
 };
 use persistence::postgres::market_policy::{
     MarketPolicyPersistenceError, load_active_market_policy_profile as pg_load_active_profile,
@@ -61,7 +67,7 @@ impl Display for MarketPolicyServiceError {
 
 impl Error for MarketPolicyServiceError {}
 
-fn map_persistence_error(error: MarketPolicyPersistenceError) -> MarketPolicyServiceError {
+fn map_market_policy_persistence_error(error: MarketPolicyPersistenceError) -> MarketPolicyServiceError {
     match error.code {
         "market_policy_query_failed" | "market_policy_row_decode_failed" => {
             MarketPolicyServiceError::persistence_unavailable(error.message)
@@ -72,6 +78,32 @@ fn map_persistence_error(error: MarketPolicyPersistenceError) -> MarketPolicySer
             field_errors: error.field_errors,
         },
     }
+}
+
+fn map_market_bucket_persistence_error(error: MarketBucketPersistenceError) -> MarketPolicyServiceError {
+    match error.code {
+        "market_bucket_query_failed" | "market_bucket_row_decode_failed" => {
+            MarketPolicyServiceError::persistence_unavailable(error.message)
+        }
+        _ => MarketPolicyServiceError {
+            code: error.code,
+            message: error.message,
+            field_errors: map_bucket_validation_issues(error.field_errors),
+        },
+    }
+}
+
+fn map_bucket_validation_issues(
+    field_errors: Vec<MarketBucketValidationIssue>,
+) -> Vec<MarketPolicyValidationIssue> {
+    field_errors
+        .into_iter()
+        .map(|issue| MarketPolicyValidationIssue {
+            field: issue.field,
+            code: issue.code,
+            message: issue.message,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +128,29 @@ pub struct ToggleMarketClusterInput {
     pub reason_code: Option<String>,
     pub correlation_id: String,
     pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMarketBucketProfileInput {
+    pub actor_id: String,
+    pub actor_role: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub bucket_type: String,
+    pub risk_policy_key: String,
+    pub allocation_policy_key: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadMarketBucketProfileInput {
+    pub actor_id: String,
+    pub actor_role: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub correlation_id: String,
+    pub queried_at_utc: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -123,8 +178,27 @@ pub struct MarketClusterToggleEvidence {
     pub updated_at_utc: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MarketBucketProfileEvidence {
+    pub profile_id: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub bucket_type: String,
+    pub risk_policy_key: String,
+    pub allocation_policy_key: String,
+    pub is_active: bool,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub reason_code: String,
+    pub updated_at_utc: String,
+}
+
 pub trait MarketPolicyRepositoryPort: Send + Sync {
     fn upsert_profile(&self, profile: MarketPolicyProfile) -> Result<(), MarketPolicyServiceError>;
+    fn upsert_bucket_profile(
+        &self,
+        profile: MarketBucketProfile,
+    ) -> Result<(), MarketPolicyServiceError>;
     fn upsert_cluster_override(
         &self,
         cluster_override: MarketClusterOverride,
@@ -133,6 +207,11 @@ pub trait MarketPolicyRepositoryPort: Send + Sync {
         &self,
         cluster_id: &str,
     ) -> Result<Option<MarketPolicyProfile>, MarketPolicyServiceError>;
+    fn load_active_bucket_profile(
+        &self,
+        market_id: &str,
+        cluster_id: &str,
+    ) -> Result<Option<MarketBucketProfile>, MarketPolicyServiceError>;
     fn load_cluster_override(
         &self,
         cluster_id: &str,
@@ -148,6 +227,14 @@ pub trait MarketPolicyOrchestrator: Send + Sync {
         &self,
         input: ToggleMarketClusterInput,
     ) -> Result<MarketClusterToggleEvidence, MarketPolicyServiceError>;
+    fn upsert_market_bucket_profile(
+        &self,
+        input: UpsertMarketBucketProfileInput,
+    ) -> Result<MarketBucketProfileEvidence, MarketPolicyServiceError>;
+    fn read_market_bucket_profile(
+        &self,
+        input: ReadMarketBucketProfileInput,
+    ) -> Result<MarketBucketProfileEvidence, MarketPolicyServiceError>;
 }
 
 #[derive(Clone)]
@@ -546,6 +633,243 @@ impl MarketPolicyOrchestrator for MarketPolicyService {
             updated_at_utc: cluster_override.updated_at_utc,
         })
     }
+
+    fn upsert_market_bucket_profile(
+        &self,
+        input: UpsertMarketBucketProfileInput,
+    ) -> Result<MarketBucketProfileEvidence, MarketPolicyServiceError> {
+        let normalized_market_id = normalize_market_bucket_identifier(&input.market_id);
+        let normalized_cluster_id = normalize_market_bucket_identifier(&input.cluster_id);
+        if let Err(error) = validate_market_policy_role(&input.actor_role) {
+            emit_market_policy_telemetry(
+                "market_bucket_profile_update_v1",
+                "deny",
+                &input.actor_id,
+                &normalized_cluster_id,
+                error.code,
+                &input.correlation_id,
+                &input.updated_at_utc,
+            );
+            return Err(error);
+        }
+        for (field, value) in [
+            ("actor_id", input.actor_id.as_str()),
+            ("market_id", input.market_id.as_str()),
+            ("cluster_id", input.cluster_id.as_str()),
+            ("bucket_type", input.bucket_type.as_str()),
+            ("risk_policy_key", input.risk_policy_key.as_str()),
+            ("allocation_policy_key", input.allocation_policy_key.as_str()),
+            ("correlation_id", input.correlation_id.as_str()),
+            ("updated_at_utc", input.updated_at_utc.as_str()),
+        ] {
+            if let Err(error) = validate_non_empty(field, value) {
+                emit_market_policy_telemetry(
+                    "market_bucket_profile_update_v1",
+                    "deny",
+                    &input.actor_id,
+                    &normalized_cluster_id,
+                    error.code,
+                    &input.correlation_id,
+                    &input.updated_at_utc,
+                );
+                return Err(error);
+            }
+        }
+
+        let profile = MarketBucketProfile {
+            profile_id: canonical_market_bucket_profile_id(&input.market_id, &input.cluster_id),
+            market_id: normalized_market_id,
+            cluster_id: normalized_cluster_id.clone(),
+            bucket_type: input.bucket_type.clone(),
+            risk_policy_key: input.risk_policy_key.clone(),
+            allocation_policy_key: input.allocation_policy_key.clone(),
+            is_active: true,
+            actor_id: input.actor_id.clone(),
+            correlation_id: input.correlation_id.clone(),
+            updated_at_utc: input.updated_at_utc.clone(),
+        };
+        let canonical_profile = match canonicalize_market_bucket_profile(&profile).map_err(|error| {
+            MarketPolicyServiceError {
+                code: error.code,
+                message: error.message,
+                field_errors: map_bucket_validation_issues(error.field_errors),
+            }
+        }) {
+            Ok(profile) => profile,
+            Err(error) => {
+                emit_market_policy_telemetry(
+                    "market_bucket_profile_update_v1",
+                    "deny",
+                    &input.actor_id,
+                    &normalized_cluster_id,
+                    error.code,
+                    &input.correlation_id,
+                    &input.updated_at_utc,
+                );
+                return Err(error);
+            }
+        };
+
+        let _lock = self.lock_operations().inspect_err(|error| {
+            emit_market_policy_telemetry(
+                "market_bucket_profile_update_v1",
+                "deny",
+                &input.actor_id,
+                &normalized_cluster_id,
+                error.code,
+                &input.correlation_id,
+                &input.updated_at_utc,
+            );
+        })?;
+        self.repository
+            .upsert_bucket_profile(canonical_profile.clone())
+            .inspect_err(|error| {
+                emit_market_policy_telemetry(
+                    "market_bucket_profile_update_v1",
+                    "deny",
+                    &input.actor_id,
+                    &normalized_cluster_id,
+                    error.code,
+                    &input.correlation_id,
+                    &input.updated_at_utc,
+                );
+            })?;
+
+        emit_market_policy_telemetry(
+            "market_bucket_profile_update_v1",
+            "allow",
+            &input.actor_id,
+            &canonical_profile.cluster_id,
+            MarketBucketReasonCode::ProfileUpdated.code(),
+            &input.correlation_id,
+            &input.updated_at_utc,
+        );
+
+        Ok(MarketBucketProfileEvidence {
+            profile_id: canonical_profile.profile_id,
+            market_id: canonical_profile.market_id,
+            cluster_id: canonical_profile.cluster_id,
+            bucket_type: canonical_profile.bucket_type,
+            risk_policy_key: canonical_profile.risk_policy_key,
+            allocation_policy_key: canonical_profile.allocation_policy_key,
+            is_active: canonical_profile.is_active,
+            actor_id: canonical_profile.actor_id,
+            correlation_id: canonical_profile.correlation_id,
+            reason_code: MarketBucketReasonCode::ProfileUpdated.code().to_string(),
+            updated_at_utc: canonical_profile.updated_at_utc,
+        })
+    }
+
+    fn read_market_bucket_profile(
+        &self,
+        input: ReadMarketBucketProfileInput,
+    ) -> Result<MarketBucketProfileEvidence, MarketPolicyServiceError> {
+        let normalized_cluster_id = normalize_market_bucket_identifier(&input.cluster_id);
+        if let Err(error) = validate_market_policy_role(&input.actor_role) {
+            emit_market_policy_telemetry(
+                "market_bucket_profile_read_v1",
+                "deny",
+                &input.actor_id,
+                &normalized_cluster_id,
+                error.code,
+                &input.correlation_id,
+                &input.queried_at_utc,
+            );
+            return Err(error);
+        }
+        for (field, value) in [
+            ("actor_id", input.actor_id.as_str()),
+            ("market_id", input.market_id.as_str()),
+            ("cluster_id", input.cluster_id.as_str()),
+            ("correlation_id", input.correlation_id.as_str()),
+            ("queried_at_utc", input.queried_at_utc.as_str()),
+        ] {
+            if let Err(error) = validate_non_empty(field, value) {
+                emit_market_policy_telemetry(
+                    "market_bucket_profile_read_v1",
+                    "deny",
+                    &input.actor_id,
+                    &normalized_cluster_id,
+                    error.code,
+                    &input.correlation_id,
+                    &input.queried_at_utc,
+                );
+                return Err(error);
+            }
+        }
+
+        let maybe_profile = self
+            .repository
+            .load_active_bucket_profile(&input.market_id, &input.cluster_id)
+            .inspect_err(|error| {
+                emit_market_policy_telemetry(
+                    "market_bucket_profile_read_v1",
+                    "deny",
+                    &input.actor_id,
+                    &normalized_cluster_id,
+                    error.code,
+                    &input.correlation_id,
+                    &input.queried_at_utc,
+                );
+            })?;
+        let profile = match maybe_profile {
+            Some(profile) => profile,
+            None => {
+                emit_market_policy_telemetry(
+                    "market_bucket_profile_read_v1",
+                    "deny",
+                    &input.actor_id,
+                    &normalized_cluster_id,
+                    MarketBucketReasonCode::MappingUnavailable.code(),
+                    &input.correlation_id,
+                    &input.queried_at_utc,
+                );
+                return Err(MarketPolicyServiceError {
+                    code: MarketBucketReasonCode::MappingUnavailable.code(),
+                    message: "no active market bucket profile found for market/cluster".to_string(),
+                    field_errors: vec![MarketPolicyValidationIssue {
+                        field: "market_id",
+                        code: MarketBucketReasonCode::MappingUnavailable.code(),
+                        message:
+                            "no active market bucket mapping exists for this market/cluster pair"
+                                .to_string(),
+                    }],
+                });
+            }
+        };
+
+        let canonical_profile = canonicalize_market_bucket_profile(&profile).map_err(|error| {
+            MarketPolicyServiceError {
+                code: error.code,
+                message: error.message,
+                field_errors: map_bucket_validation_issues(error.field_errors),
+            }
+        })?;
+
+        emit_market_policy_telemetry(
+            "market_bucket_profile_read_v1",
+            "allow",
+            &input.actor_id,
+            &canonical_profile.cluster_id,
+            MarketBucketReasonCode::ProfileRead.code(),
+            &input.correlation_id,
+            &input.queried_at_utc,
+        );
+
+        Ok(MarketBucketProfileEvidence {
+            profile_id: canonical_profile.profile_id,
+            market_id: canonical_profile.market_id,
+            cluster_id: canonical_profile.cluster_id,
+            bucket_type: canonical_profile.bucket_type,
+            risk_policy_key: canonical_profile.risk_policy_key,
+            allocation_policy_key: canonical_profile.allocation_policy_key,
+            is_active: canonical_profile.is_active,
+            actor_id: input.actor_id,
+            correlation_id: input.correlation_id,
+            reason_code: MarketBucketReasonCode::ProfileRead.code().to_string(),
+            updated_at_utc: input.queried_at_utc,
+        })
+    }
 }
 
 fn validate_market_policy_role(role: &str) -> Result<(), MarketPolicyServiceError> {
@@ -570,6 +894,10 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), MarketPoli
 }
 
 fn normalize_cluster_id(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn normalize_market_bucket_identifier(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
@@ -651,7 +979,7 @@ impl PostgresMarketPolicyRepository {
     {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future))
-                .map_err(map_persistence_error),
+                .map_err(map_market_policy_persistence_error),
             Err(_) => tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -661,7 +989,27 @@ impl PostgresMarketPolicyRepository {
                     ))
                 })?
                 .block_on(future)
-                .map_err(map_persistence_error),
+                .map_err(map_market_policy_persistence_error),
+        }
+    }
+
+    fn run_market_bucket_with_runtime<F, T>(&self, future: F) -> Result<T, MarketPolicyServiceError>
+    where
+        F: Future<Output = Result<T, MarketBucketPersistenceError>>,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future))
+                .map_err(map_market_bucket_persistence_error),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    MarketPolicyServiceError::persistence_unavailable(format!(
+                        "failed to initialize async runtime: {error}"
+                    ))
+                })?
+                .block_on(future)
+                .map_err(map_market_bucket_persistence_error),
         }
     }
 }
@@ -669,6 +1017,13 @@ impl PostgresMarketPolicyRepository {
 impl MarketPolicyRepositoryPort for PostgresMarketPolicyRepository {
     fn upsert_profile(&self, profile: MarketPolicyProfile) -> Result<(), MarketPolicyServiceError> {
         self.run_with_runtime(pg_upsert_profile(&self.pool, &profile))
+    }
+
+    fn upsert_bucket_profile(
+        &self,
+        profile: MarketBucketProfile,
+    ) -> Result<(), MarketPolicyServiceError> {
+        self.run_market_bucket_with_runtime(pg_upsert_market_bucket_profile(&self.pool, &profile))
     }
 
     fn upsert_cluster_override(
@@ -685,6 +1040,18 @@ impl MarketPolicyRepositoryPort for PostgresMarketPolicyRepository {
         self.run_with_runtime(pg_load_active_profile(&self.pool, cluster_id))
     }
 
+    fn load_active_bucket_profile(
+        &self,
+        market_id: &str,
+        cluster_id: &str,
+    ) -> Result<Option<MarketBucketProfile>, MarketPolicyServiceError> {
+        self.run_market_bucket_with_runtime(pg_load_active_bucket_profile(
+            &self.pool,
+            market_id,
+            cluster_id,
+        ))
+    }
+
     fn load_cluster_override(
         &self,
         cluster_id: &str,
@@ -696,6 +1063,7 @@ impl MarketPolicyRepositoryPort for PostgresMarketPolicyRepository {
 #[derive(Debug, Default)]
 pub struct InMemoryMarketPolicyRepository {
     profiles: Mutex<BTreeMap<String, MarketPolicyProfile>>,
+    bucket_profiles: Mutex<BTreeMap<String, MarketBucketProfile>>,
     overrides: Mutex<BTreeMap<String, MarketClusterOverride>>,
 }
 
@@ -735,6 +1103,51 @@ impl MarketPolicyRepositoryPort for InMemoryMarketPolicyRepository {
         Ok(())
     }
 
+    fn upsert_bucket_profile(
+        &self,
+        profile: MarketBucketProfile,
+    ) -> Result<(), MarketPolicyServiceError> {
+        let mut profiles = self
+            .bucket_profiles
+            .lock()
+            .expect("in-memory market bucket profiles lock should not be poisoned");
+        let normalized_market = profile.market_id.trim().to_ascii_lowercase();
+        let normalized_cluster = profile.cluster_id.trim().to_ascii_lowercase();
+
+        if profile.is_active
+            && profiles.values().any(|existing| {
+                existing.profile_id != profile.profile_id
+                    && existing.is_active
+                    && existing
+                        .market_id
+                        .trim()
+                        .eq_ignore_ascii_case(&normalized_market)
+                    && existing
+                        .cluster_id
+                        .trim()
+                        .eq_ignore_ascii_case(&normalized_cluster)
+            })
+        {
+            return Err(MarketPolicyServiceError {
+                code: "market_bucket_constraint_violation",
+                message: format!(
+                    "active market bucket profile already exists for market `{}` cluster `{}`",
+                    profile.market_id, profile.cluster_id
+                ),
+                field_errors: vec![MarketPolicyValidationIssue {
+                    field: "market_id",
+                    code: "market_bucket_constraint_violation",
+                    message:
+                        "only one active bucket profile is allowed per market and cluster at a time"
+                            .to_string(),
+                }],
+            });
+        }
+
+        profiles.insert(profile.profile_id.clone(), profile);
+        Ok(())
+    }
+
     fn upsert_cluster_override(
         &self,
         cluster_override: MarketClusterOverride,
@@ -763,6 +1176,39 @@ impl MarketPolicyRepositoryPort for InMemoryMarketPolicyRepository {
             .values()
             .filter(|profile| {
                 profile.is_active
+                    && profile
+                        .cluster_id
+                        .trim()
+                        .eq_ignore_ascii_case(&normalized_cluster)
+            })
+            .max_by(|left, right| {
+                left.updated_at_utc
+                    .cmp(&right.updated_at_utc)
+                    .then(left.profile_id.cmp(&right.profile_id))
+            })
+            .cloned();
+        Ok(selected)
+    }
+
+    fn load_active_bucket_profile(
+        &self,
+        market_id: &str,
+        cluster_id: &str,
+    ) -> Result<Option<MarketBucketProfile>, MarketPolicyServiceError> {
+        let profiles = self
+            .bucket_profiles
+            .lock()
+            .expect("in-memory market bucket profiles lock should not be poisoned");
+        let normalized_market = market_id.trim().to_ascii_lowercase();
+        let normalized_cluster = cluster_id.trim().to_ascii_lowercase();
+        let selected = profiles
+            .values()
+            .filter(|profile| {
+                profile.is_active
+                    && profile
+                        .market_id
+                        .trim()
+                        .eq_ignore_ascii_case(&normalized_market)
                     && profile
                         .cluster_id
                         .trim()
@@ -822,6 +1268,31 @@ mod tests {
             ),
             correlation_id: "corr-toggle-001".to_string(),
             updated_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
+    fn bucket_profile_input() -> UpsertMarketBucketProfileInput {
+        UpsertMarketBucketProfileInput {
+            actor_id: "ops-1".to_string(),
+            actor_role: "operational_control".to_string(),
+            market_id: "market_yes_no_1".to_string(),
+            cluster_id: "cluster_alpha".to_string(),
+            bucket_type: "core".to_string(),
+            risk_policy_key: "core-risk-default".to_string(),
+            allocation_policy_key: "core-allocation-default".to_string(),
+            correlation_id: "corr-bucket-001".to_string(),
+            updated_at_utc: "2026-04-07T00:00:00Z".to_string(),
+        }
+    }
+
+    fn read_bucket_profile_input() -> ReadMarketBucketProfileInput {
+        ReadMarketBucketProfileInput {
+            actor_id: "ops-1".to_string(),
+            actor_role: "operational_control".to_string(),
+            market_id: "market_yes_no_1".to_string(),
+            cluster_id: "cluster_alpha".to_string(),
+            correlation_id: "corr-bucket-read-001".to_string(),
+            queried_at_utc: "2026-04-07T00:05:00Z".to_string(),
         }
     }
 
@@ -956,5 +1427,76 @@ mod tests {
             .expect("profile lookup should succeed")
             .expect("cluster profile should remain present");
         assert_eq!(persisted.max_exposure_pct_nav, 20.0);
+    }
+
+    #[test]
+    fn bucket_profile_update_rejects_unsupported_bucket_type() {
+        let service = MarketPolicyService::default();
+        let mut input = bucket_profile_input();
+        input.bucket_type = "growth".to_string();
+
+        let error = service
+            .upsert_market_bucket_profile(input)
+            .expect_err("unsupported bucket type should fail validation");
+        assert_eq!(error.code, MarketBucketReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "bucket_type")
+        );
+    }
+
+    #[test]
+    fn bucket_profile_update_returns_machine_readable_success_evidence() {
+        let service = MarketPolicyService::default();
+        let evidence = service
+            .upsert_market_bucket_profile(bucket_profile_input())
+            .expect("bucket profile update should succeed");
+
+        assert_eq!(evidence.profile_id, "bucket::market_yes_no_1::cluster_alpha");
+        assert_eq!(evidence.bucket_type, "core");
+        assert_eq!(evidence.risk_policy_key, "core-risk-default");
+        assert_eq!(evidence.allocation_policy_key, "core-allocation-default");
+        assert_eq!(
+            evidence.reason_code,
+            MarketBucketReasonCode::ProfileUpdated.code()
+        );
+    }
+
+    #[test]
+    fn bucket_profile_read_returns_profile_for_market_cluster_mapping() {
+        let service = MarketPolicyService::default();
+        service
+            .upsert_market_bucket_profile(bucket_profile_input())
+            .expect("bucket profile should seed read path");
+
+        let evidence = service
+            .read_market_bucket_profile(read_bucket_profile_input())
+            .expect("bucket profile read should succeed");
+
+        assert_eq!(evidence.profile_id, "bucket::market_yes_no_1::cluster_alpha");
+        assert_eq!(evidence.market_id, "market_yes_no_1");
+        assert_eq!(evidence.cluster_id, "cluster_alpha");
+        assert_eq!(
+            evidence.reason_code,
+            MarketBucketReasonCode::ProfileRead.code()
+        );
+    }
+
+    #[test]
+    fn bucket_profile_read_fails_closed_when_mapping_missing() {
+        let service = MarketPolicyService::default();
+
+        let error = service
+            .read_market_bucket_profile(read_bucket_profile_input())
+            .expect_err("missing mapping should fail closed");
+        assert_eq!(error.code, MarketBucketReasonCode::MappingUnavailable.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.code == MarketBucketReasonCode::MappingUnavailable.code())
+        );
     }
 }

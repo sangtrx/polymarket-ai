@@ -62,3 +62,9 @@ Critical increase behavior is fail-closed:
    Remediation: fail closed, recover policy persistence state, then re-evaluate drift.
 4. **Persistence unavailable** (`rebalance_persistence_unavailable`, HTTP 503)  
    Remediation: escalate platform on-call and retry once dependency health is restored.
+
+## Cross-runbook links
+
+1. Risk-limit policy operations: `docs/operations/risk-limit-policy-operations.md`
+2. Pre-trade gate pipeline operations: `docs/operations/pretrade-gate-pipeline.md`
+3. Core/satellite market stratification operations (FR42): `docs/operations/core-satellite-market-stratification.md`

@@ -62,3 +62,4 @@ Operational guardrails:
 
 1. Incentive regime-shift alerts (FR40): `docs/operations/incentive-regime-shift-alerts.md`
 2. Severity alert delivery and fallback (Story 3.6): `docs/operations/severity-alert-delivery.md`
+3. Core/satellite market stratification operations (FR42): `docs/operations/core-satellite-market-stratification.md`

@@ -709,3 +709,35 @@
 - `npm run --silent rust:build` ✅
 - `npm run --silent test` ✅
 - `node --test tests/api/story-5-3*.test.mjs tests/e2e/story-5-3*.test.mjs` ✅ (post-refresh API/E2E rerun)
+
+---
+
+## Story 5.4 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/risk.rs` (`risk::tests::market_bucket_`, `risk::tests::resolve_market_bucket_policy_links_`) — validates canonical `core`/`satellite` parsing, deterministic identifier normalization, active-link resolution semantics, mapping-missing fail-closed behavior, and duplicate-active conflict handling.
+- [x] `crates/persistence/src/postgres/market_bucket_profiles.rs` (`postgres::market_bucket_profiles::tests::`) — validates migration scope isolation (`market_bucket_profiles` only), canonical constraints, active uniqueness guarantees, deterministic active-lookup ordering, and adapter validation/decode error taxonomy.
+- [x] `services/governance-service/src/market_policy/mod.rs` (`market_policy::tests::bucket_profile_`) — validates authorized bucket-profile upsert/read orchestration, unsupported bucket rejection, mapping-unavailable fail-closed reads, and machine-readable evidence continuity.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::market_bucket_profile_`) — validates authenticated FR42 mutation/read route behavior, invalid payload rejection with field-level diagnostics, unauthorized-role denial reuse, conflict mapping, and mapping-unavailable fail-closed response handling.
+- [x] `services/risk-engine/src/gates/mod.rs` (`gates::tests::order_intent_gate_with_limit_state_resolves_bucket_risk_policy_key_before_reward_risk_gate`, `gates::tests::order_intent_gate_with_limit_state_fails_closed_when_market_bucket_mapping_is_unavailable`) — validates stratified effective-profile-key resolution before downstream gates and explicit stratification-unavailable fail-closed denies.
+- [x] `tests/api/story-5-4-market-bucket-stratification-api.test.mjs` — validates FR42 control-api route discoverability, payload/response contract fields, deterministic machine-readable status mapping (including explicit unknown-code internal-error fallback), governance normalization/evidence seams, and deterministic route-to-orchestrator input wiring of market/cluster/bucket/policy-link fields.
+- [x] `tests/e2e/story-5-4-market-bucket-stratification-gating.e2e.test.mjs` — validates risk-engine stratification pipeline composition, unavailable-state control-uncertainty compatibility, migration schema-scope boundaries, and FR42 runbook/cross-link operator continuity.
+- [x] `tests/e2e/story-5-1-reward-risk-policy-gating.e2e.test.mjs` — refreshed Story 5.1 static assertion to account for FR42 effective policy-key resolution (`&effective_profile_key`) while preserving reward-risk gate ordering contract coverage.
+
+### Coverage
+
+- Story 5.4 now has deterministic automated coverage for:
+  - FR42 market-bucket canonical contract validation (`core`/`satellite`) and normalized identifier semantics across domain/governance/control/persistence seams,
+  - active mapping persistence constraints and conflict/fail-closed behavior with deterministic retrieval ordering,
+  - authenticated mutation/read route envelopes with explicit machine-readable error/status mapping (`400/403/409/503/500`),
+  - risk-engine pre-trade composition that resolves stratified policy links before exposure/reward-risk/FR41 paths and denies on stratification-unavailable state,
+  - operator runbook continuity and cross-runbook traceability for stratified routing and fail-closed remediation.
+- Automated Story 5.4 regression inventory in this QA refresh: **35 Story-5.4 tests passing** (`domain: 6`, `persistence: 7`, `governance: 4`, `control-api: 6`, `risk-engine: 2`, `api/e2e: 10`).
+
+### Execution Result
+
+- `node --test tests/api/story-5-4*.test.mjs tests/e2e/story-5-4*.test.mjs` ✅
+- `npm run --silent qa:test:story-5-4` ✅
+- `npm run --silent test` ✅
+- `source "$HOME/.cargo/env" && node --test tests/api/story-5-4*.test.mjs tests/e2e/story-5-4*.test.mjs && npm run --silent qa:test:story-5-4` ✅ (2026-04-07 QA automation rerun)

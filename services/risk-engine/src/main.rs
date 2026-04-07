@@ -14,6 +14,7 @@ use domain::risk::{
     compute_reward_per_risk_score,
 };
 use persistence::postgres::freshness_gate::load_latest_freshness_gate_event;
+use persistence::postgres::market_bucket_profiles::load_active_market_bucket_profile;
 use persistence::postgres::market_policy::{
     load_active_market_policy_profile, load_market_cluster_override,
 };
@@ -33,6 +34,7 @@ use persistence::postgres::safety_controls::load_current_effective_safety_mode;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::future::Future;
 use std::pin::Pin;
+use crate::gates::RuntimePolicyStateReader;
 
 #[tokio::main]
 async fn main() {
@@ -267,8 +269,9 @@ async fn hydrate_runtime_state_from_sources(
     let pool = connect_postgres_from_env().await?;
     hydrate_latest_freshness_state(runtime_policy_state, &pool).await;
     hydrate_latest_stream_health_state(runtime_policy_state, &pool, config).await;
-    hydrate_latest_limit_state(runtime_limit_state, &pool, config).await;
     hydrate_latest_market_policy_state(runtime_policy_state, &pool, config).await;
+    hydrate_latest_market_bucket_state(runtime_policy_state, &pool, config).await;
+    hydrate_latest_limit_state(runtime_policy_state, runtime_limit_state, &pool, config).await;
     hydrate_latest_reward_risk_state(runtime_policy_state, &pool, config).await;
     hydrate_latest_safety_mode_state(runtime_policy_state, &pool).await;
     Some(pool)
@@ -336,17 +339,19 @@ async fn hydrate_latest_stream_health_state(
 }
 
 async fn hydrate_latest_limit_state(
+    runtime_policy_state: &gates::InMemoryRuntimePolicyState,
     runtime_limit_state: &limits::InMemoryRiskLimitState,
     pool: &PgPool,
     config: &BootstrapRuntimeConfig,
 ) {
-    match load_active_risk_limit_profile_bundle(pool, &config.profile_key).await {
+    let resolved_profile_key = resolved_runtime_profile_key(runtime_policy_state, config);
+    match load_active_risk_limit_profile_bundle(pool, &resolved_profile_key).await {
         Ok(Some(bundle)) => {
             runtime_limit_state.clear_state_unavailable();
             let profile_key = bundle.profile.profile_key.clone();
             runtime_limit_state.upsert_active_profile(bundle.profile);
             runtime_limit_state.upsert_inventory_rules(&profile_key, bundle.inventory_rules);
-            match load_pending_risk_limit_profile_bundles(pool, Some(&config.profile_key)).await {
+            match load_pending_risk_limit_profile_bundles(pool, Some(&resolved_profile_key)).await {
                 Ok(pending_bundles) => {
                     for pending in pending_bundles {
                         runtime_limit_state.upsert_pending_profile(pending.profile);
@@ -389,16 +394,41 @@ async fn hydrate_latest_market_policy_state(
     }
 }
 
+fn resolved_runtime_profile_key(
+    runtime_policy_state: &gates::InMemoryRuntimePolicyState,
+    config: &BootstrapRuntimeConfig,
+) -> String {
+    runtime_policy_state
+        .market_bucket_profile(&config.market_id, &config.cluster_id)
+        .map(|profile| profile.risk_policy_key)
+        .unwrap_or_else(|| config.profile_key.clone())
+}
+
 async fn hydrate_latest_reward_risk_state(
     runtime_policy_state: &gates::InMemoryRuntimePolicyState,
     pool: &PgPool,
     config: &BootstrapRuntimeConfig,
 ) {
-    match load_reward_risk_policy(pool, &config.profile_key).await {
+    let resolved_profile_key = resolved_runtime_profile_key(runtime_policy_state, config);
+    match load_reward_risk_policy(pool, &resolved_profile_key).await {
         Ok(Some(policy)) => runtime_policy_state.upsert_reward_risk_policy(policy),
         Ok(None) => {}
         Err(error) => {
             println!("risk-engine bootstrap could not hydrate reward-risk policy: {error}");
+        }
+    }
+}
+
+async fn hydrate_latest_market_bucket_state(
+    runtime_policy_state: &gates::InMemoryRuntimePolicyState,
+    pool: &PgPool,
+    config: &BootstrapRuntimeConfig,
+) {
+    match load_active_market_bucket_profile(pool, &config.market_id, &config.cluster_id).await {
+        Ok(Some(profile)) => runtime_policy_state.upsert_market_bucket_profile(profile),
+        Ok(None) => {}
+        Err(error) => {
+            println!("risk-engine bootstrap could not hydrate market bucket profile: {error}");
         }
     }
 }

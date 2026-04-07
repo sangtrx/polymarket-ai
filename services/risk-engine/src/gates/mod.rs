@@ -9,16 +9,17 @@ use domain::reconciliation::ReconciliationReasonCode;
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, EmergencyControlTriggerSource,
     FR41_INACTIVITY_PAUSE_THRESHOLD_SECONDS, FR41_LOW_LIQUIDITY_DEPTH_USD_THRESHOLD,
-    FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS, FreshnessGateReasonCode, MarketClusterOverride,
-    MarketEligibilityOutcome, MarketPolicyProfile, MarketPolicyReasonCode, MarketSnapshot,
-    MarketStreamHealthStatus, ParticipationGuardrailMode, ParticipationGuardrailReasonCode,
-    PreTradeDecisionOutcome, PreTradeGateDecision, PreTradeGateDimension, PreTradeGateResult,
-    PreTradeParticipationGuardrailEvidence, PreTradeReasonCode, RegimeShiftContractError,
-    RegimeShiftDetection, RewardRiskPolicy, UserStreamReasonCode, adjudicate_pretrade_gate_results,
-    assess_market_stream_health, compute_reward_per_risk_score, drawdown_stop_triggered,
-    evaluate_fr40_regime_shift, evaluate_fr41_participation_guardrail, evaluate_market_eligibility,
-    reward_risk_score_input_from_snapshot, reward_risk_threshold_for_policy,
-    validate_reward_risk_policy,
+    FR41_OVERNIGHT_CAP_THRESHOLD_SECONDS, FreshnessGateReasonCode, MarketBucketProfile,
+    MarketClusterOverride, MarketEligibilityOutcome, MarketPolicyProfile, MarketPolicyReasonCode,
+    MarketSnapshot, MarketStreamHealthStatus, ParticipationGuardrailMode,
+    ParticipationGuardrailReasonCode, PreTradeDecisionOutcome, PreTradeGateDecision,
+    PreTradeGateDimension, PreTradeGateResult, PreTradeParticipationGuardrailEvidence,
+    PreTradeReasonCode, RegimeShiftContractError, RegimeShiftDetection, RewardRiskPolicy,
+    UserStreamReasonCode, adjudicate_pretrade_gate_results, assess_market_stream_health,
+    compute_reward_per_risk_score, drawdown_stop_triggered, evaluate_fr40_regime_shift,
+    evaluate_fr41_participation_guardrail, evaluate_market_eligibility,
+    resolve_market_bucket_policy_links, reward_risk_score_input_from_snapshot,
+    reward_risk_threshold_for_policy, validate_reward_risk_policy,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -108,6 +109,7 @@ pub trait RuntimePolicyStateReader: Send + Sync {
     fn strategy_approval_state(&self) -> Option<RuntimeStrategyApprovalState>;
     fn market_snapshot(&self, market_id: &str) -> Option<MarketSnapshot>;
     fn market_policy_profile(&self, cluster_id: &str) -> Option<MarketPolicyProfile>;
+    fn market_bucket_profile(&self, market_id: &str, cluster_id: &str) -> Option<MarketBucketProfile>;
     fn reward_risk_policy(&self, policy_key: &str) -> Option<RewardRiskPolicy>;
 }
 
@@ -124,6 +126,7 @@ pub struct InMemoryRuntimePolicyState {
     strategy_approval_state: Arc<RwLock<Option<RuntimeStrategyApprovalState>>>,
     market_snapshots: Arc<RwLock<BTreeMap<String, MarketSnapshot>>>,
     market_policy_profiles: Arc<RwLock<BTreeMap<String, MarketPolicyProfile>>>,
+    market_bucket_profiles: Arc<RwLock<BTreeMap<String, MarketBucketProfile>>>,
     reward_risk_policies: Arc<RwLock<BTreeMap<String, RewardRiskPolicy>>>,
     regime_shift_detections: Arc<RwLock<Vec<RegimeShiftDetection>>>,
     regime_shift_error: Arc<RwLock<Option<RegimeShiftContractError>>>,
@@ -272,6 +275,14 @@ impl InMemoryRuntimePolicyState {
             .insert(profile.cluster_id.trim().to_ascii_lowercase(), profile);
     }
 
+    pub fn upsert_market_bucket_profile(&self, profile: MarketBucketProfile) {
+        let key = market_bucket_map_key(&profile.market_id, &profile.cluster_id);
+        self.market_bucket_profiles
+            .write()
+            .expect("market bucket runtime map should not be poisoned")
+            .insert(key, profile);
+    }
+
     pub fn upsert_reward_risk_policy(&self, policy: RewardRiskPolicy) {
         self.reward_risk_policies
             .write()
@@ -386,6 +397,18 @@ impl RuntimePolicyStateReader for InMemoryRuntimePolicyState {
             .read()
             .expect("market policy runtime map should not be poisoned")
             .get(&cluster_id.trim().to_ascii_lowercase())
+            .cloned()
+    }
+
+    fn market_bucket_profile(
+        &self,
+        market_id: &str,
+        cluster_id: &str,
+    ) -> Option<MarketBucketProfile> {
+        self.market_bucket_profiles
+            .read()
+            .expect("market bucket runtime map should not be poisoned")
+            .get(&market_bucket_map_key(market_id, cluster_id))
             .cloned()
     }
 
@@ -578,6 +601,47 @@ where
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPretradePolicyContext {
+    risk_policy_key: String,
+    allocation_policy_key: String,
+}
+
+fn resolve_pretrade_policy_context<S: RuntimePolicyStateReader>(
+    runtime_policy_state: &S,
+    intent: &OrderIntent,
+    evaluated_at_utc: &str,
+) -> Result<ResolvedPretradePolicyContext, PreTradeGateResult> {
+    let Some(profile) = runtime_policy_state.market_bucket_profile(&intent.market_id, &intent.cluster_id)
+    else {
+        return Err(build_pretrade_gate_result(
+            PreTradeGateDimension::ExposureLimitState,
+            false,
+            PreTradeReasonCode::StratificationStateUnavailable,
+            evaluated_at_utc,
+        ));
+    };
+
+    let resolved = resolve_market_bucket_policy_links(
+        &intent.market_id,
+        &intent.cluster_id,
+        &[profile],
+    )
+    .map_err(|_| {
+        build_pretrade_gate_result(
+            PreTradeGateDimension::ExposureLimitState,
+            false,
+            PreTradeReasonCode::StratificationStateUnavailable,
+            evaluated_at_utc,
+        )
+    })?;
+
+    Ok(ResolvedPretradePolicyContext {
+        risk_policy_key: resolved.risk_policy_key,
+        allocation_policy_key: resolved.allocation_policy_key,
+    })
+}
+
 pub fn evaluate_pretrade_gate_decision_with_limit_state_and_safe_state<S, L, P>(
     runtime_policy_state: &S,
     runtime_limit_state: &L,
@@ -626,14 +690,37 @@ where
         );
     }
 
+    let policy_context =
+        match resolve_pretrade_policy_context(runtime_policy_state, intent, &evaluated_at_utc) {
+            Ok(context) => context,
+            Err(gate_result) => {
+                gate_results.push(gate_result);
+                return finalize_pretrade_decision(
+                    intent,
+                    profile_key,
+                    gate_results,
+                    false,
+                    safe_state_port,
+                    &evaluated_at_utc,
+                );
+            }
+        };
+    let effective_profile_key = policy_context.risk_policy_key;
+    emit_market_bucket_resolution_telemetry(
+        intent,
+        &effective_profile_key,
+        &policy_context.allocation_policy_key,
+        &evaluated_at_utc,
+    );
+
     let exposure_gate =
-        evaluate_pretrade_exposure_limit_gate(runtime_limit_state, profile_key, &evaluated_at_utc);
+        evaluate_pretrade_exposure_limit_gate(runtime_limit_state, &effective_profile_key, &evaluated_at_utc);
     let exposure_passed = exposure_gate.passed;
     gate_results.push(exposure_gate);
     if !exposure_passed {
         return finalize_pretrade_decision(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             false,
             safe_state_port,
@@ -648,7 +735,7 @@ where
     if !reconciliation_passed {
         return finalize_pretrade_decision(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             false,
             safe_state_port,
@@ -663,7 +750,7 @@ where
     if !user_stream_passed {
         return finalize_pretrade_decision(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             false,
             safe_state_port,
@@ -679,7 +766,7 @@ where
     if !drawdown_passed {
         return finalize_pretrade_decision(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             protective_mode_active,
             safe_state_port,
@@ -694,7 +781,7 @@ where
     if !strategy_approval_passed {
         return finalize_pretrade_decision(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             false,
             safe_state_port,
@@ -708,7 +795,7 @@ where
     if !venue_passed {
         return finalize_pretrade_decision(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             false,
             safe_state_port,
@@ -717,13 +804,13 @@ where
     }
 
     let reward_risk_gate =
-        evaluate_pretrade_reward_risk_gate(runtime_policy_state, intent, profile_key);
+        evaluate_pretrade_reward_risk_gate(runtime_policy_state, intent, &effective_profile_key);
     let reward_risk_passed = reward_risk_gate.passed;
     gate_results.push(reward_risk_gate);
     if !reward_risk_passed {
         return finalize_pretrade_decision(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             false,
             safe_state_port,
@@ -736,7 +823,7 @@ where
             runtime_policy_state,
             runtime_limit_state,
             intent,
-            profile_key,
+            &effective_profile_key,
             &evaluated_at_utc,
         );
     let participation_guardrail_passed = participation_guardrail_gate.passed;
@@ -744,7 +831,7 @@ where
     if !participation_guardrail_passed {
         return finalize_pretrade_decision_with_guardrail(
             intent,
-            profile_key,
+            &effective_profile_key,
             gate_results,
             false,
             safe_state_port,
@@ -755,7 +842,7 @@ where
 
     finalize_pretrade_decision_with_guardrail(
         intent,
-        profile_key,
+        &effective_profile_key,
         gate_results,
         false,
         safe_state_port,
@@ -764,12 +851,11 @@ where
     )
 }
 
-fn validate_pretrade_intent_inputs(intent: &OrderIntent, profile_key: &str) -> bool {
+fn validate_pretrade_intent_inputs(intent: &OrderIntent, _profile_key: &str) -> bool {
     intent.intent_id.trim().is_empty()
         || intent.market_id.trim().is_empty()
         || intent.cluster_id.trim().is_empty()
         || intent.correlation_id.trim().is_empty()
-        || profile_key.trim().is_empty()
         || !is_utc_timestamp(&intent.requested_at_utc)
 }
 
@@ -883,6 +969,14 @@ fn sanitize_identifier(value: &str, fallback: &str) -> String {
     } else {
         normalized
     }
+}
+
+fn market_bucket_map_key(market_id: &str, cluster_id: &str) -> String {
+    format!(
+        "{}::{}",
+        sanitize_identifier(market_id, "unknown_market"),
+        sanitize_identifier(cluster_id, "unknown_cluster")
+    )
 }
 
 fn normalized_pretrade_evaluated_at_utc(value: &str) -> String {
@@ -1468,6 +1562,7 @@ fn map_pretrade_reason_to_emergency_signal(
         PreTradeReasonCode::FreshnessStateUnavailable
         | PreTradeReasonCode::StreamHealthStateUnavailable
         | PreTradeReasonCode::RiskLimitStateUnavailable
+        | PreTradeReasonCode::StratificationStateUnavailable
         | PreTradeReasonCode::StrategyApprovalUnavailable
         | PreTradeReasonCode::VenueEligibilityUnavailable
         | PreTradeReasonCode::RewardRiskStateUnavailable
@@ -1511,6 +1606,29 @@ fn to_legacy_gate_decision(pretrade_decision: &PreTradeGateDecision) -> OrderInt
         correlation_id: pretrade_decision.correlation_id.clone(),
         decided_at_utc: pretrade_decision.evaluated_at_utc.clone(),
     }
+}
+
+fn emit_market_bucket_resolution_telemetry(
+    intent: &OrderIntent,
+    risk_policy_key: &str,
+    allocation_policy_key: &str,
+    timestamp_utc: &str,
+) {
+    let event = MarketBucketResolutionTelemetryEvent {
+        event_name: "risk_market_bucket_resolution_v1",
+        action: "resolve_market_bucket_policy_links",
+        intent_id: &intent.intent_id,
+        market_id: &intent.market_id,
+        cluster_id: &intent.cluster_id,
+        risk_policy_key,
+        allocation_policy_key,
+        correlation_id: &intent.correlation_id,
+        timestamp_utc,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&event).expect("market bucket resolution telemetry should serialize")
+    );
 }
 
 fn emit_pretrade_gate_telemetry(decision: &PreTradeGateDecision) {
@@ -1586,6 +1704,19 @@ struct OrderIntentGateTelemetryEvent<'a> {
     timestamp_utc: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+struct MarketBucketResolutionTelemetryEvent<'a> {
+    event_name: &'a str,
+    action: &'a str,
+    intent_id: &'a str,
+    market_id: &'a str,
+    cluster_id: &'a str,
+    risk_policy_key: &'a str,
+    allocation_policy_key: &'a str,
+    correlation_id: &'a str,
+    timestamp_utc: &'a str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1593,7 +1724,7 @@ mod tests {
     use crate::safe_state::InMemorySafeStateSignals;
     use domain::risk::{
         EmergencyControlReasonCode, EmergencyControlTriggerSource, InventoryLimitRule,
-        MarketPolicyProfile, MarketSnapshot, ParticipationGuardrailReasonCode,
+        MarketBucketProfile, MarketPolicyProfile, MarketSnapshot, ParticipationGuardrailReasonCode,
         PreTradeDecisionOutcome, PreTradeGateDimension, PreTradeReasonCode, RegimeShiftReasonCode,
         RewardRiskPolicy, RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode,
         RiskLimitScope, RiskScopeLimit, VenueEligibilityState,
@@ -1646,8 +1777,15 @@ mod tests {
     }
 
     fn sample_active_limit_profile(updated_at_utc: &str) -> RiskLimitProfileVersion {
+        sample_active_limit_profile_for_key("default", updated_at_utc)
+    }
+
+    fn sample_active_limit_profile_for_key(
+        profile_key: &str,
+        updated_at_utc: &str,
+    ) -> RiskLimitProfileVersion {
         RiskLimitProfileVersion {
-            profile_key: "default".to_string(),
+            profile_key: profile_key.to_string(),
             version: 1,
             portfolio: sample_limit_scope(
                 RiskLimitScope::Portfolio,
@@ -1714,6 +1852,24 @@ mod tests {
         }
     }
 
+    fn sample_market_bucket_profile(
+        risk_policy_key: &str,
+        allocation_policy_key: &str,
+    ) -> MarketBucketProfile {
+        MarketBucketProfile {
+            profile_id: "bucket::market_yes_no_1::cluster_alpha".to_string(),
+            market_id: "market_yes_no_1".to_string(),
+            cluster_id: "cluster_alpha".to_string(),
+            bucket_type: "core".to_string(),
+            risk_policy_key: risk_policy_key.to_string(),
+            allocation_policy_key: allocation_policy_key.to_string(),
+            is_active: true,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-bucket-001".to_string(),
+            updated_at_utc: "2026-04-07T00:00:00Z".to_string(),
+        }
+    }
+
     fn sample_market_snapshot() -> MarketSnapshot {
         MarketSnapshot {
             market_id: "market_yes_no_1".to_string(),
@@ -1766,6 +1922,8 @@ mod tests {
             reason_code: "approval_granted".to_string(),
             observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
         });
+        runtime_state
+            .upsert_market_bucket_profile(sample_market_bucket_profile("default", "alloc-default"));
         runtime_state.upsert_market_policy_profile(sample_market_policy_profile());
         runtime_state.upsert_market_snapshot(sample_market_snapshot());
     }
@@ -2093,7 +2251,7 @@ mod tests {
         assert!(!decision.allowed);
         assert_eq!(
             decision.reason_code,
-            PreTradeReasonCode::VenueEligibilityUnavailable.code()
+            PreTradeReasonCode::StratificationStateUnavailable.code()
         );
     }
 
@@ -2116,6 +2274,73 @@ mod tests {
         assert_eq!(
             decision.reason_code,
             PreTradeReasonCode::RewardRiskBelowThreshold.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_resolves_bucket_risk_policy_key_before_reward_risk_gate()
+    {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        runtime_state.upsert_market_bucket_profile(sample_market_bucket_profile(
+            "satellite-risk-1",
+            "satellite-allocation-1",
+        ));
+        runtime_state.upsert_reward_risk_policy(sample_reward_risk_policy("satellite-risk-1", 2.0));
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile_for_key(
+            "satellite-risk-1",
+            "2026-04-06T00:00:00Z",
+        ));
+
+        let pretrade_decision = evaluate_pretrade_gate_decision_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert_eq!(pretrade_decision.profile_key, "satellite-risk-1");
+        assert_eq!(pretrade_decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            pretrade_decision.reason_code,
+            PreTradeReasonCode::RewardRiskBelowThreshold.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_fails_closed_when_market_bucket_mapping_is_unavailable() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        let mut intent = sample_intent();
+        intent.market_id = "market_yes_no_missing".to_string();
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        let safe_state_signals = InMemorySafeStateSignals::default();
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state_and_safe_state(
+            &runtime_state,
+            &limit_state,
+            &intent,
+            "default",
+            &safe_state_signals,
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::StratificationStateUnavailable.code()
+        );
+        let emergency_signal = safe_state_signals
+            .latest_emergency_signal()
+            .expect("missing stratification mapping should publish emergency signal");
+        assert_eq!(
+            emergency_signal.reason_code,
+            EmergencyControlReasonCode::ControlUncertaintyTriggered.code()
+        );
+        assert_eq!(
+            emergency_signal.trigger_source,
+            EmergencyControlTriggerSource::ControlUncertainty
         );
     }
 

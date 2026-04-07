@@ -53,3 +53,7 @@ Runtime behavior is immediate for new intent gating logic: newly submitted order
    Remediation: Reapply cluster toggle and policy profile for the target cluster, then verify subsequent intent-gate decisions.
 4. **Persistence/runtime dependency outage** (`market_policy_persistence_unavailable`, HTTP 503)  
    Remediation: Keep fail-closed posture, escalate platform on-call, and retry after persistence health is restored.
+
+## Cross-runbook links
+
+1. Core/satellite market stratification operations (FR42): `docs/operations/core-satellite-market-stratification.md`
