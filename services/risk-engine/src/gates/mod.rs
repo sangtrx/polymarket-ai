@@ -11,8 +11,10 @@ use domain::risk::{
     FreshnessGateReasonCode, MarketClusterOverride, MarketEligibilityOutcome, MarketPolicyProfile,
     MarketPolicyReasonCode, MarketSnapshot, MarketStreamHealthStatus, PreTradeDecisionOutcome,
     PreTradeGateDecision, PreTradeGateDimension, PreTradeGateResult, PreTradeReasonCode,
-    UserStreamReasonCode, adjudicate_pretrade_gate_results, assess_market_stream_health,
-    drawdown_stop_triggered, evaluate_market_eligibility,
+    RewardRiskPolicy, UserStreamReasonCode, adjudicate_pretrade_gate_results,
+    assess_market_stream_health, compute_reward_per_risk_score, drawdown_stop_triggered,
+    evaluate_market_eligibility, reward_risk_score_input_from_snapshot,
+    reward_risk_threshold_for_policy, validate_reward_risk_policy,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -102,6 +104,7 @@ pub trait RuntimePolicyStateReader: Send + Sync {
     fn strategy_approval_state(&self) -> Option<RuntimeStrategyApprovalState>;
     fn market_snapshot(&self, market_id: &str) -> Option<MarketSnapshot>;
     fn market_policy_profile(&self, cluster_id: &str) -> Option<MarketPolicyProfile>;
+    fn reward_risk_policy(&self, policy_key: &str) -> Option<RewardRiskPolicy>;
 }
 
 const FALLBACK_PRETRADE_EVALUATED_AT_UTC: &str = "1970-01-01T00:00:00Z";
@@ -117,6 +120,7 @@ pub struct InMemoryRuntimePolicyState {
     strategy_approval_state: Arc<RwLock<Option<RuntimeStrategyApprovalState>>>,
     market_snapshots: Arc<RwLock<BTreeMap<String, MarketSnapshot>>>,
     market_policy_profiles: Arc<RwLock<BTreeMap<String, MarketPolicyProfile>>>,
+    reward_risk_policies: Arc<RwLock<BTreeMap<String, RewardRiskPolicy>>>,
 }
 
 impl InMemoryRuntimePolicyState {
@@ -220,6 +224,13 @@ impl InMemoryRuntimePolicyState {
             .expect("market policy runtime map should not be poisoned")
             .insert(profile.cluster_id.trim().to_ascii_lowercase(), profile);
     }
+
+    pub fn upsert_reward_risk_policy(&self, policy: RewardRiskPolicy) {
+        self.reward_risk_policies
+            .write()
+            .expect("reward-risk runtime map should not be poisoned")
+            .insert(policy.policy_key.trim().to_ascii_lowercase(), policy);
+    }
 }
 
 fn normalize_freshness_pause_reason(is_active: bool, reason_code: &str) -> String {
@@ -311,6 +322,14 @@ impl RuntimePolicyStateReader for InMemoryRuntimePolicyState {
             .read()
             .expect("market policy runtime map should not be poisoned")
             .get(&cluster_id.trim().to_ascii_lowercase())
+            .cloned()
+    }
+
+    fn reward_risk_policy(&self, policy_key: &str) -> Option<RewardRiskPolicy> {
+        self.reward_risk_policies
+            .read()
+            .expect("reward-risk runtime map should not be poisoned")
+            .get(&policy_key.trim().to_ascii_lowercase())
             .cloned()
     }
 }
@@ -623,6 +642,21 @@ where
     let venue_passed = venue_gate.passed;
     gate_results.push(venue_gate);
     if !venue_passed {
+        return finalize_pretrade_decision(
+            intent,
+            profile_key,
+            gate_results,
+            false,
+            safe_state_port,
+            &evaluated_at_utc,
+        );
+    }
+
+    let reward_risk_gate =
+        evaluate_pretrade_reward_risk_gate(runtime_policy_state, intent, profile_key);
+    let reward_risk_passed = reward_risk_gate.passed;
+    gate_results.push(reward_risk_gate);
+    if !reward_risk_passed {
         return finalize_pretrade_decision(
             intent,
             profile_key,
@@ -1074,6 +1108,75 @@ fn map_market_eligibility_reason_to_pretrade(reason_code: &str) -> PreTradeReaso
     }
 }
 
+fn evaluate_pretrade_reward_risk_gate<S: RuntimePolicyStateReader>(
+    runtime_policy_state: &S,
+    intent: &OrderIntent,
+    policy_key: &str,
+) -> PreTradeGateResult {
+    let evaluated_at_utc = intent.requested_at_utc.as_str();
+    let Some(snapshot) = runtime_policy_state.market_snapshot(&intent.market_id) else {
+        return build_pretrade_gate_result(
+            PreTradeGateDimension::RewardPerRisk,
+            false,
+            PreTradeReasonCode::RewardRiskStateUnavailable,
+            evaluated_at_utc,
+        );
+    };
+
+    let score_input = match reward_risk_score_input_from_snapshot(&snapshot) {
+        Ok(input) => input,
+        Err(_) => {
+            return build_pretrade_gate_result(
+                PreTradeGateDimension::RewardPerRisk,
+                false,
+                PreTradeReasonCode::RewardRiskStateUnavailable,
+                evaluated_at_utc,
+            );
+        }
+    };
+    let score = match compute_reward_per_risk_score(&score_input) {
+        Ok(score) => score,
+        Err(_) => {
+            return build_pretrade_gate_result(
+                PreTradeGateDimension::RewardPerRisk,
+                false,
+                PreTradeReasonCode::RewardRiskStateUnavailable,
+                evaluated_at_utc,
+            );
+        }
+    };
+
+    let policy_override = runtime_policy_state.reward_risk_policy(policy_key);
+    if policy_override
+        .as_ref()
+        .is_some_and(|policy| validate_reward_risk_policy(policy).is_err())
+    {
+        return build_pretrade_gate_result(
+            PreTradeGateDimension::RewardPerRisk,
+            false,
+            PreTradeReasonCode::RewardRiskStateUnavailable,
+            evaluated_at_utc,
+        );
+    }
+    let threshold = reward_risk_threshold_for_policy(policy_override.as_ref());
+
+    if score < threshold {
+        build_pretrade_gate_result(
+            PreTradeGateDimension::RewardPerRisk,
+            false,
+            PreTradeReasonCode::RewardRiskBelowThreshold,
+            evaluated_at_utc,
+        )
+    } else {
+        build_pretrade_gate_result(
+            PreTradeGateDimension::RewardPerRisk,
+            true,
+            PreTradeReasonCode::Pass,
+            evaluated_at_utc,
+        )
+    }
+}
+
 fn map_pretrade_reason_to_emergency_signal(
     decision: &PreTradeGateDecision,
 ) -> Option<EmergencySafeStateSignal> {
@@ -1095,7 +1198,8 @@ fn map_pretrade_reason_to_emergency_signal(
         | PreTradeReasonCode::StreamHealthStateUnavailable
         | PreTradeReasonCode::RiskLimitStateUnavailable
         | PreTradeReasonCode::StrategyApprovalUnavailable
-        | PreTradeReasonCode::VenueEligibilityUnavailable => (
+        | PreTradeReasonCode::VenueEligibilityUnavailable
+        | PreTradeReasonCode::RewardRiskStateUnavailable => (
             EmergencyControlTriggerSource::ControlUncertainty,
             EmergencyControlReasonCode::ControlUncertaintyTriggered.code(),
         ),
@@ -1215,8 +1319,8 @@ mod tests {
     use domain::risk::{
         EmergencyControlReasonCode, EmergencyControlTriggerSource, MarketPolicyProfile,
         MarketSnapshot, PreTradeDecisionOutcome, PreTradeGateDimension, PreTradeReasonCode,
-        RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode, RiskLimitScope,
-        RiskScopeLimit,
+        RewardRiskPolicy, RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode,
+        RiskLimitScope, RiskScopeLimit,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -1321,8 +1425,23 @@ mod tests {
             liquidity_depth_usd: 1200.0,
             spread_bps: 2.0,
             reward_score: 0.8,
+            expected_reward_bps: Some(1.8),
+            maker_rebate_bps: Some(0.1),
+            expected_cost_bps: Some(0.2),
+            expected_volatility_bps: Some(1.0),
             projected_exposure_pct_nav: 12.0,
             observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_reward_risk_policy(policy_key: &str, threshold: f64) -> RewardRiskPolicy {
+        RewardRiskPolicy {
+            policy_key: policy_key.to_string(),
+            strategy_key: policy_key.to_string(),
+            min_reward_per_risk: threshold,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-reward-risk-policy-001".to_string(),
+            updated_at_utc: "2026-04-06T00:00:00Z".to_string(),
         }
     }
 
@@ -1677,6 +1796,79 @@ mod tests {
         assert_eq!(
             decision.reason_code,
             PreTradeReasonCode::VenueEligibilityUnavailable.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_denies_when_reward_risk_score_is_below_threshold() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        runtime_state.upsert_reward_risk_policy(sample_reward_risk_policy("default", 2.0));
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+
+        let decision = evaluate_order_intent_gate_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::RewardRiskBelowThreshold.code()
+        );
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_uses_default_reward_risk_threshold_without_override() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+
+        let decision = evaluate_order_intent_gate_with_limit_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+        );
+
+        assert!(decision.allowed);
+        assert_eq!(decision.reason_code, PreTradeReasonCode::Pass.code());
+    }
+
+    #[test]
+    fn order_intent_gate_with_limit_state_fails_closed_when_reward_risk_inputs_are_unavailable() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        seed_healthy_pretrade_policy_state(&runtime_state);
+        let mut missing_components = sample_market_snapshot();
+        missing_components.expected_volatility_bps = None;
+        runtime_state.upsert_market_snapshot(missing_components);
+        let limit_state = InMemoryRiskLimitState::default();
+        limit_state.upsert_active_profile(sample_active_limit_profile("2026-04-06T00:00:00Z"));
+        let safe_state_signals = InMemorySafeStateSignals::default();
+
+        let decision = evaluate_pretrade_gate_decision_with_limit_state_and_safe_state(
+            &runtime_state,
+            &limit_state,
+            &sample_intent(),
+            "default",
+            &safe_state_signals,
+        );
+
+        assert_eq!(decision.outcome, PreTradeDecisionOutcome::Deny);
+        assert_eq!(
+            decision.reason_code,
+            PreTradeReasonCode::RewardRiskStateUnavailable.code()
+        );
+        let emergency_signal = safe_state_signals
+            .latest_emergency_signal()
+            .expect("reward-risk unavailable path should publish emergency signal");
+        assert_eq!(
+            emergency_signal.reason_code,
+            EmergencyControlReasonCode::ControlUncertaintyTriggered.code()
         );
     }
 

@@ -47,8 +47,8 @@ use domain::reporting_schedule::{
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
-    MarketPolicyValidationIssue, RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue,
-    SafetyControlActionRecord,
+    MarketPolicyValidationIssue, RewardRiskReasonCode, RewardRiskValidationIssue,
+    RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue, SafetyControlActionRecord,
 };
 use governance_service::allocation_policy::{
     AllocationPolicyMutationEvidence, EvaluateRebalanceDriftInput,
@@ -67,6 +67,9 @@ use governance_service::recovery::{
     EvaluateRecoveryReadinessInput, ExecuteRecoveryResumeInput, ExecuteRestoreRehearsalInput,
     QueryRecoveryGateRunInput, QueryRestoreRehearsalByRunIdInput, QueryRestoreRehearsalsInput,
     RecoveryResumeExecutionEvidence,
+};
+use governance_service::reward_risk::{
+    ReadRewardRiskPolicyInput, RewardRiskPolicyEvidence, UpsertRewardRiskPolicyInput,
 };
 use governance_service::risk_limits::{
     PendingRiskLimitProfilesInput, RiskLimitProfileMutationEvidence, RiskLimitRuleInput,
@@ -151,6 +154,15 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/risk-limits/pending",
             get(list_pending_risk_limit_profiles),
+        )
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_actor,
+        ));
+    let reward_risk_routes = Router::new()
+        .route(
+            "/control/reward-risk/policies/{policy_key}",
+            post(upsert_reward_risk_policy).get(read_reward_risk_policy),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -288,6 +300,7 @@ pub fn app_router(state: ControlApiState) -> Router {
         .merge(credential_rotation_routes)
         .merge(market_policy_routes)
         .merge(risk_limit_routes)
+        .merge(reward_risk_routes)
         .merge(allocation_policy_routes)
         .merge(attribution_routes)
         .merge(incident_forensics_routes)
@@ -890,6 +903,98 @@ pub async fn list_pending_risk_limit_profiles(
         pending,
         authorization.timestamp_utc,
         endpoint,
+    )
+}
+
+pub async fn upsert_reward_risk_policy(
+    State(state): State<ControlApiState>,
+    Path(policy_key): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<RewardRiskPolicyPayload>,
+) -> Response {
+    let endpoint = format!("/control/reward-risk/policies/{policy_key}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "POST") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let evidence = match state.reward_risk_orchestrator.upsert_reward_risk_policy(
+        UpsertRewardRiskPolicyInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            policy_key,
+            strategy_key: payload.strategy_key,
+            min_reward_per_risk: payload.min_reward_per_risk,
+            correlation_id: actor.correlation_id.clone(),
+            updated_at_utc: authorization.timestamp_utc.clone(),
+        },
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return reward_risk_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "reward_risk_policy_upsert",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    reward_risk_policy_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "reward_risk_policy_upsert",
+    )
+}
+
+pub async fn read_reward_risk_policy(
+    State(state): State<ControlApiState>,
+    Path(policy_key): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/reward-risk/policies/{policy_key}");
+    let authorization = match authorize_critical_action(&state, &actor, &endpoint, "GET") {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let evidence =
+        match state
+            .reward_risk_orchestrator
+            .read_reward_risk_policy(ReadRewardRiskPolicyInput {
+                actor_id: actor.actor_id.clone(),
+                actor_role: actor.role.clone(),
+                policy_key,
+                correlation_id: actor.correlation_id.clone(),
+                queried_at_utc: authorization.timestamp_utc.clone(),
+            }) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return reward_risk_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "reward_risk_policy_read",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+
+    reward_risk_policy_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "reward_risk_policy_read",
     )
 }
 
@@ -5170,6 +5275,135 @@ fn risk_limit_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn reward_risk_policy_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: RewardRiskPolicyEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+) -> Response {
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "policy_key": evidence.policy_key,
+            "strategy_key": evidence.strategy_key,
+            "min_reward_per_risk": evidence.min_reward_per_risk,
+            "default_threshold_applied": evidence.default_threshold_applied,
+        }),
+        approval_reference: None,
+        timestamp: evidence.updated_at_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: evidence.reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: evidence.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            evidence.correlation_id.clone(),
+            evidence.updated_at_utc,
+        );
+    }
+
+    (
+        if http_method == "GET" {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        axum::Json(RewardRiskPolicyDecisionResponse {
+            status: "accepted",
+            error_code: None,
+            message: None,
+            policy_key: evidence.policy_key,
+            strategy_key: evidence.strategy_key,
+            min_reward_per_risk: evidence.min_reward_per_risk,
+            default_threshold_applied: evidence.default_threshold_applied,
+            actor_id: evidence.actor_id,
+            role: actor.role.clone(),
+            reason_code: evidence.reason_code,
+            correlation_id: evidence.correlation_id,
+            timestamp_utc: evidence.updated_at_utc,
+            security_signal: None,
+        }),
+    )
+        .into_response()
+}
+
+fn reward_risk_service_error_response(
+    error_code: &'static str,
+    message: String,
+    field_errors: Vec<RewardRiskValidationIssue>,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let security_signal = if error_code == "reward_risk_unauthorized_role" {
+        Some(RewardRiskSecuritySignal {
+            name: "unauthorized_reward_risk_mutation_attempt_v1",
+            severity: "high",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        reward_risk_service_error_status(error_code),
+        axum::Json(RewardRiskServiceErrorResponse {
+            error_code,
+            message,
+            action: action.to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            endpoint,
+            field_errors: field_errors
+                .into_iter()
+                .map(|issue| RewardRiskFieldError {
+                    field: issue.field.to_string(),
+                    code: issue.code.to_string(),
+                    message: issue.message,
+                })
+                .collect(),
+            security_signal,
+        }),
+    )
+        .into_response()
+}
+
+fn reward_risk_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == RewardRiskReasonCode::InvalidPayload.code()
+            || code == RewardRiskReasonCode::InvalidPolicyKey.code()
+            || code == RewardRiskReasonCode::InvalidThreshold.code() =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        "reward_risk_unauthorized_role" => StatusCode::FORBIDDEN,
+        "reward_risk_constraint_violation" => StatusCode::CONFLICT,
+        code if code == RewardRiskReasonCode::PersistenceUnavailable.code()
+            || code == "reward_risk_query_failed"
+            || code == "reward_risk_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn allocation_policy_mutation_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -7495,6 +7729,12 @@ pub struct RiskLimitProfilePayload {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RewardRiskPolicyPayload {
+    pub strategy_key: String,
+    pub min_reward_per_risk: f64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
@@ -8103,6 +8343,57 @@ pub struct RiskLimitSecuritySignal {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RewardRiskPolicyDecisionResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub policy_key: String,
+    pub strategy_key: String,
+    pub min_reward_per_risk: f64,
+    pub default_threshold_applied: bool,
+    pub actor_id: String,
+    pub role: String,
+    pub reason_code: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<RewardRiskSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RewardRiskServiceErrorResponse {
+    pub error_code: &'static str,
+    pub message: String,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<RewardRiskFieldError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<RewardRiskSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RewardRiskFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RewardRiskSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
 pub struct EmergencyControlDecisionResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8625,7 +8916,7 @@ mod tests {
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
-        EmergencyControlTriggerSource,
+        EmergencyControlTriggerSource, REWARD_RISK_DEFAULT_THRESHOLD,
     };
     use governance_service::{
         allocation_policy::{
@@ -8646,6 +8937,10 @@ mod tests {
             ExecuteRestoreRehearsalInput, QueryRecoveryGateRunInput,
             QueryRestoreRehearsalByRunIdInput, QueryRestoreRehearsalsInput, RecoveryOrchestrator,
             RecoveryResumeExecutionEvidence, RecoveryService, RecoveryServiceError,
+        },
+        reward_risk::{
+            ReadRewardRiskPolicyInput, RewardRiskOrchestrator, RewardRiskPolicyEvidence,
+            RewardRiskServiceError, UpsertRewardRiskPolicyInput,
         },
         risk_limits::{
             PendingRiskLimitProfilesInput, RiskLimitOrchestrator, RiskLimitProfileMutationEvidence,
@@ -9270,6 +9565,87 @@ mod tests {
                 approval_reference: None,
                 inventory_rule_count: 2,
             }])
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StubRewardRiskOrchestrator {
+        upsert_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        read_returns_default_threshold: bool,
+    }
+
+    impl RewardRiskOrchestrator for StubRewardRiskOrchestrator {
+        fn upsert_reward_risk_policy(
+            &self,
+            input: UpsertRewardRiskPolicyInput,
+        ) -> Result<RewardRiskPolicyEvidence, RewardRiskServiceError> {
+            if let Some((code, message)) = self.upsert_error {
+                return Err(RewardRiskServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: if code == RewardRiskReasonCode::InvalidPayload.code() {
+                        vec![RewardRiskValidationIssue {
+                            field: "min_reward_per_risk",
+                            code: RewardRiskReasonCode::InvalidThreshold.code(),
+                            message: "min_reward_per_risk must be greater than or equal to 0"
+                                .to_string(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+
+            Ok(RewardRiskPolicyEvidence {
+                policy_key: input.policy_key.trim().to_ascii_lowercase(),
+                strategy_key: input.strategy_key.trim().to_ascii_lowercase(),
+                min_reward_per_risk: input.min_reward_per_risk,
+                actor_id: input.actor_id,
+                reason_code: RewardRiskReasonCode::PolicyUpdated.code().to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.updated_at_utc,
+                default_threshold_applied: false,
+            })
+        }
+
+        fn read_reward_risk_policy(
+            &self,
+            input: ReadRewardRiskPolicyInput,
+        ) -> Result<RewardRiskPolicyEvidence, RewardRiskServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(RewardRiskServiceError {
+                    code,
+                    message: message.to_string(),
+                    field_errors: Vec::new(),
+                });
+            }
+
+            if self.read_returns_default_threshold {
+                return Ok(RewardRiskPolicyEvidence {
+                    policy_key: input.policy_key.trim().to_ascii_lowercase(),
+                    strategy_key: input.policy_key.trim().to_ascii_lowercase(),
+                    min_reward_per_risk: REWARD_RISK_DEFAULT_THRESHOLD,
+                    actor_id: input.actor_id,
+                    reason_code: RewardRiskReasonCode::DefaultThresholdApplied
+                        .code()
+                        .to_string(),
+                    correlation_id: input.correlation_id,
+                    updated_at_utc: input.queried_at_utc,
+                    default_threshold_applied: true,
+                });
+            }
+
+            Ok(RewardRiskPolicyEvidence {
+                policy_key: input.policy_key.trim().to_ascii_lowercase(),
+                strategy_key: input.policy_key.trim().to_ascii_lowercase(),
+                min_reward_per_risk: 1.35,
+                actor_id: input.actor_id,
+                reason_code: RewardRiskReasonCode::PolicyRead.code().to_string(),
+                correlation_id: input.correlation_id,
+                updated_at_utc: input.queried_at_utc,
+                default_threshold_applied: false,
+            })
         }
     }
 
@@ -10046,6 +10422,28 @@ mod tests {
             Arc::new(SafetyControlService::default()),
             Arc::new(RecoveryService::default()),
         ))
+    }
+
+    fn test_app_with_reward_risk_orchestrator(
+        reward_risk_orchestrator: Arc<dyn RewardRiskOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_reward_risk_orchestrator(reward_risk_orchestrator),
+        )
     }
 
     fn test_app_with_safety_control_orchestrator(
@@ -13324,6 +13722,161 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "risk_limit_persistence_unavailable");
         assert_eq!(payload["action"], "risk_limit_profile_update");
+    }
+
+    #[tokio::test]
+    async fn reward_risk_policy_upsert_route_returns_machine_readable_evidence() {
+        let app =
+            test_app_with_reward_risk_orchestrator(Arc::new(StubRewardRiskOrchestrator::default()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/reward-risk/policies/strategy-maker-alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-reward-risk-upsert-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "strategy_key": "strategy::maker-alpha",
+                            "min_reward_per_risk": 1.3
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["policy_key"], "strategy-maker-alpha");
+        assert_eq!(payload["reason_code"], "reward_risk_policy_updated");
+        assert_eq!(payload["default_threshold_applied"], false);
+    }
+
+    #[tokio::test]
+    async fn reward_risk_policy_read_route_returns_default_threshold_when_override_missing() {
+        let app = test_app_with_reward_risk_orchestrator(Arc::new(StubRewardRiskOrchestrator {
+            read_returns_default_threshold: true,
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/reward-risk/policies/strategy-maker-alpha")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-reward-risk-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["reason_code"],
+            "reward_risk_default_threshold_applied"
+        );
+        assert_eq!(payload["default_threshold_applied"], true);
+        assert_eq!(
+            payload["min_reward_per_risk"],
+            serde_json::json!(REWARD_RISK_DEFAULT_THRESHOLD)
+        );
+    }
+
+    #[tokio::test]
+    async fn reward_risk_policy_upsert_route_surfaces_validation_field_errors() {
+        let app = test_app_with_reward_risk_orchestrator(Arc::new(StubRewardRiskOrchestrator {
+            upsert_error: Some(("reward_risk_invalid_payload", "invalid threshold payload")),
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/reward-risk/policies/strategy-maker-alpha")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-reward-risk-invalid-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "strategy_key": "strategy::maker-alpha",
+                            "min_reward_per_risk": -0.2
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "reward_risk_invalid_payload");
+        assert_eq!(payload["action"], "reward_risk_policy_upsert");
+        assert_eq!(payload["field_errors"][0]["field"], "min_reward_per_risk");
+    }
+
+    #[tokio::test]
+    async fn reward_risk_policy_read_route_surfaces_service_unavailable_machine_error() {
+        let app = test_app_with_reward_risk_orchestrator(Arc::new(StubRewardRiskOrchestrator {
+            read_error: Some((
+                "reward_risk_persistence_unavailable",
+                "reward-risk repository unavailable",
+            )),
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/reward-risk/policies/strategy-maker-alpha")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-reward-risk-failure-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "reward_risk_persistence_unavailable");
+        assert_eq!(payload["action"], "reward_risk_policy_read");
     }
 
     #[tokio::test]

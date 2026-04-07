@@ -16,6 +16,8 @@ pub const USER_STREAM_AUTH_STATE_PARTITION_KEY: &str = "__user_stream_auth_state
 pub const FRESHNESS_STALE_THRESHOLD_SECONDS: f64 = 30.0;
 pub const FRESHNESS_RECOVERY_STABILITY_WINDOW_SECONDS: f64 = 10.0;
 pub const FRESHNESS_MAX_BREACH_TO_PAUSE_SECONDS: f64 = 5.0;
+pub const REWARD_RISK_DEFAULT_THRESHOLD: f64 = 1.2;
+pub const REWARD_RISK_MIN_VOLATILITY_BPS: f64 = 0.000_001;
 pub const EMERGENCY_CONTROL_ACK_MAX_SECONDS: f64 = 1.0;
 pub const EMERGENCY_CONTROL_STATE_REFLECTION_MAX_SECONDS: f64 = 5.0;
 pub const EMERGENCY_CONTROL_SAFE_STATE_MAX_SECONDS: f64 = 5.0;
@@ -446,8 +448,254 @@ pub struct MarketSnapshot {
     pub liquidity_depth_usd: f64,
     pub spread_bps: f64,
     pub reward_score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_reward_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_rebate_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_cost_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_volatility_bps: Option<f64>,
     pub projected_exposure_pct_nav: f64,
     pub observed_at_utc: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RewardRiskScoreInput {
+    pub expected_reward_bps: f64,
+    pub maker_rebate_bps: f64,
+    pub expected_cost_bps: f64,
+    pub expected_volatility_bps: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardRiskReasonCode {
+    ScoreEligible,
+    ScoreBelowThreshold,
+    PolicyStateUnavailable,
+    ScoreStateUnavailable,
+    InvalidPayload,
+    InvalidPolicyKey,
+    InvalidThreshold,
+    PolicyUpdated,
+    PolicyRead,
+    DefaultThresholdApplied,
+    PersistenceUnavailable,
+}
+
+impl RewardRiskReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ScoreEligible => "reward_risk_score_eligible",
+            Self::ScoreBelowThreshold => "reward_risk_score_below_threshold",
+            Self::PolicyStateUnavailable => "reward_risk_policy_state_unavailable",
+            Self::ScoreStateUnavailable => "reward_risk_score_state_unavailable",
+            Self::InvalidPayload => "reward_risk_invalid_payload",
+            Self::InvalidPolicyKey => "reward_risk_invalid_policy_key",
+            Self::InvalidThreshold => "reward_risk_invalid_threshold",
+            Self::PolicyUpdated => "reward_risk_policy_updated",
+            Self::PolicyRead => "reward_risk_policy_read",
+            Self::DefaultThresholdApplied => "reward_risk_default_threshold_applied",
+            Self::PersistenceUnavailable => "reward_risk_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RewardRiskContractError> {
+        match value {
+            "reward_risk_score_eligible" => Ok(Self::ScoreEligible),
+            "reward_risk_score_below_threshold" => Ok(Self::ScoreBelowThreshold),
+            "reward_risk_policy_state_unavailable" => Ok(Self::PolicyStateUnavailable),
+            "reward_risk_score_state_unavailable" => Ok(Self::ScoreStateUnavailable),
+            "reward_risk_invalid_payload" => Ok(Self::InvalidPayload),
+            "reward_risk_invalid_policy_key" => Ok(Self::InvalidPolicyKey),
+            "reward_risk_invalid_threshold" => Ok(Self::InvalidThreshold),
+            "reward_risk_policy_updated" => Ok(Self::PolicyUpdated),
+            "reward_risk_policy_read" => Ok(Self::PolicyRead),
+            "reward_risk_default_threshold_applied" => Ok(Self::DefaultThresholdApplied),
+            "reward_risk_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(RewardRiskContractError::invalid_payload(format!(
+                "unknown reward-risk reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RewardRiskValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RewardRiskContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<RewardRiskValidationIssue>,
+}
+
+impl RewardRiskContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: RewardRiskReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<RewardRiskValidationIssue>,
+    ) -> Self {
+        Self {
+            code: RewardRiskReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+
+    pub fn state_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: RewardRiskReasonCode::ScoreStateUnavailable.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RewardRiskPolicy {
+    pub policy_key: String,
+    pub strategy_key: String,
+    pub min_reward_per_risk: f64,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub updated_at_utc: String,
+}
+
+pub fn normalize_reward_risk_identifier(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+pub fn validate_reward_risk_policy(
+    policy: &RewardRiskPolicy,
+) -> Result<(), RewardRiskContractError> {
+    let mut field_errors = Vec::new();
+    validate_reward_risk_non_empty_field(&mut field_errors, "policy_key", &policy.policy_key);
+    validate_reward_risk_non_empty_field(&mut field_errors, "strategy_key", &policy.strategy_key);
+    validate_reward_risk_non_empty_field(&mut field_errors, "actor_id", &policy.actor_id);
+    validate_reward_risk_non_empty_field(
+        &mut field_errors,
+        "correlation_id",
+        &policy.correlation_id,
+    );
+    validate_reward_risk_threshold_field(
+        &mut field_errors,
+        "min_reward_per_risk",
+        policy.min_reward_per_risk,
+    );
+    validate_reward_risk_timestamp_field(
+        &mut field_errors,
+        "updated_at_utc",
+        &policy.updated_at_utc,
+    );
+
+    if !field_errors.is_empty() {
+        return Err(RewardRiskContractError::invalid_payload_with_issues(
+            "reward-risk policy payload is invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_reward_risk_score_input(
+    input: &RewardRiskScoreInput,
+) -> Result<(), RewardRiskContractError> {
+    let mut field_errors = Vec::new();
+    validate_reward_risk_finite_field(
+        &mut field_errors,
+        "expected_reward_bps",
+        input.expected_reward_bps,
+    );
+    validate_reward_risk_finite_field(
+        &mut field_errors,
+        "maker_rebate_bps",
+        input.maker_rebate_bps,
+    );
+    validate_reward_risk_finite_field(
+        &mut field_errors,
+        "expected_cost_bps",
+        input.expected_cost_bps,
+    );
+    validate_reward_risk_volatility_field(
+        &mut field_errors,
+        "expected_volatility_bps",
+        input.expected_volatility_bps,
+    );
+
+    if !field_errors.is_empty() {
+        return Err(RewardRiskContractError::invalid_payload_with_issues(
+            "reward-risk score inputs are invalid",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn compute_reward_per_risk_score(
+    input: &RewardRiskScoreInput,
+) -> Result<f64, RewardRiskContractError> {
+    validate_reward_risk_score_input(input)?;
+    let score = (input.expected_reward_bps + input.maker_rebate_bps - input.expected_cost_bps)
+        / input.expected_volatility_bps;
+    if !score.is_finite() {
+        return Err(RewardRiskContractError::invalid_payload(
+            "computed reward-risk score must be finite",
+        ));
+    }
+    Ok(score)
+}
+
+pub fn reward_risk_threshold_for_policy(policy: Option<&RewardRiskPolicy>) -> f64 {
+    policy
+        .map(|value| value.min_reward_per_risk)
+        .unwrap_or(REWARD_RISK_DEFAULT_THRESHOLD)
+}
+
+pub fn reward_risk_score_input_from_snapshot(
+    snapshot: &MarketSnapshot,
+) -> Result<RewardRiskScoreInput, RewardRiskContractError> {
+    let expected_reward_bps = snapshot.expected_reward_bps.ok_or_else(|| {
+        RewardRiskContractError::state_unavailable(
+            "market snapshot is missing `expected_reward_bps` input",
+        )
+    })?;
+    let maker_rebate_bps = snapshot.maker_rebate_bps.ok_or_else(|| {
+        RewardRiskContractError::state_unavailable(
+            "market snapshot is missing `maker_rebate_bps` input",
+        )
+    })?;
+    let expected_cost_bps = snapshot.expected_cost_bps.ok_or_else(|| {
+        RewardRiskContractError::state_unavailable(
+            "market snapshot is missing `expected_cost_bps` input",
+        )
+    })?;
+    let expected_volatility_bps = snapshot.expected_volatility_bps.ok_or_else(|| {
+        RewardRiskContractError::state_unavailable(
+            "market snapshot is missing `expected_volatility_bps` input",
+        )
+    })?;
+
+    let input = RewardRiskScoreInput {
+        expected_reward_bps,
+        maker_rebate_bps,
+        expected_cost_bps,
+        expected_volatility_bps,
+    };
+    validate_reward_risk_score_input(&input)?;
+    Ok(input)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1331,6 +1579,10 @@ pub fn market_stream_tick_to_snapshot(
         liquidity_depth_usd,
         spread_bps,
         reward_score,
+        expected_reward_bps: Some(reward_score),
+        maker_rebate_bps: Some(0.0),
+        expected_cost_bps: Some(0.0),
+        expected_volatility_bps: Some(1.0),
         projected_exposure_pct_nav,
         observed_at_utc: tick.observed_at_utc.clone(),
     })
@@ -2460,6 +2712,7 @@ pub enum PreTradeGateDimension {
     DrawdownStop,
     StrategyApproval,
     VenueEligibility,
+    RewardPerRisk,
 }
 
 impl PreTradeGateDimension {
@@ -2473,6 +2726,7 @@ impl PreTradeGateDimension {
             Self::DrawdownStop => "drawdown_stop",
             Self::StrategyApproval => "strategy_approval",
             Self::VenueEligibility => "venue_eligibility",
+            Self::RewardPerRisk => "reward_per_risk",
         }
     }
 
@@ -2486,6 +2740,7 @@ impl PreTradeGateDimension {
             "drawdown_stop" => Ok(Self::DrawdownStop),
             "strategy_approval" => Ok(Self::StrategyApproval),
             "venue_eligibility" => Ok(Self::VenueEligibility),
+            "reward_per_risk" => Ok(Self::RewardPerRisk),
             _ => Err(PreTradeGateContractError::invalid_payload(format!(
                 "unknown pre-trade gate dimension `{value}`"
             ))),
@@ -2536,6 +2791,8 @@ pub enum PreTradeReasonCode {
     StrategyApprovalRequired,
     VenueEligibilityUnavailable,
     VenueIneligible,
+    RewardRiskStateUnavailable,
+    RewardRiskBelowThreshold,
     AdjudicationUnavailable,
     AdjudicationTimeout,
     PersistenceUnavailable,
@@ -2559,6 +2816,8 @@ impl PreTradeReasonCode {
             Self::StrategyApprovalRequired => "pretrade_strategy_approval_required",
             Self::VenueEligibilityUnavailable => "pretrade_venue_eligibility_unavailable",
             Self::VenueIneligible => "pretrade_venue_ineligible",
+            Self::RewardRiskStateUnavailable => "pretrade_reward_risk_state_unavailable",
+            Self::RewardRiskBelowThreshold => "pretrade_reward_risk_below_threshold",
             Self::AdjudicationUnavailable => "pretrade_adjudication_unavailable",
             Self::AdjudicationTimeout => "pretrade_adjudication_timeout",
             Self::PersistenceUnavailable => "pretrade_persistence_unavailable",
@@ -2582,6 +2841,8 @@ impl PreTradeReasonCode {
             "pretrade_strategy_approval_required" => Ok(Self::StrategyApprovalRequired),
             "pretrade_venue_eligibility_unavailable" => Ok(Self::VenueEligibilityUnavailable),
             "pretrade_venue_ineligible" => Ok(Self::VenueIneligible),
+            "pretrade_reward_risk_state_unavailable" => Ok(Self::RewardRiskStateUnavailable),
+            "pretrade_reward_risk_below_threshold" => Ok(Self::RewardRiskBelowThreshold),
             "pretrade_adjudication_unavailable" => Ok(Self::AdjudicationUnavailable),
             "pretrade_adjudication_timeout" => Ok(Self::AdjudicationTimeout),
             "pretrade_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
@@ -4027,6 +4288,94 @@ fn validate_utc_timestamp_field(
     }
 }
 
+fn validate_reward_risk_non_empty_field(
+    field_errors: &mut Vec<RewardRiskValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(RewardRiskValidationIssue {
+            field,
+            code: RewardRiskReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_reward_risk_finite_field(
+    field_errors: &mut Vec<RewardRiskValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(RewardRiskValidationIssue {
+            field,
+            code: RewardRiskReasonCode::InvalidThreshold.code(),
+            message: format!("{field} must be finite"),
+        });
+    }
+}
+
+fn validate_reward_risk_threshold_field(
+    field_errors: &mut Vec<RewardRiskValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(RewardRiskValidationIssue {
+            field,
+            code: RewardRiskReasonCode::InvalidThreshold.code(),
+            message: format!("{field} must be finite"),
+        });
+        return;
+    }
+    if value < 0.0 {
+        field_errors.push(RewardRiskValidationIssue {
+            field,
+            code: RewardRiskReasonCode::InvalidThreshold.code(),
+            message: format!("{field} must be greater than or equal to 0"),
+        });
+    }
+}
+
+fn validate_reward_risk_volatility_field(
+    field_errors: &mut Vec<RewardRiskValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(RewardRiskValidationIssue {
+            field,
+            code: RewardRiskReasonCode::InvalidThreshold.code(),
+            message: format!("{field} must be finite"),
+        });
+        return;
+    }
+    if value <= REWARD_RISK_MIN_VOLATILITY_BPS {
+        field_errors.push(RewardRiskValidationIssue {
+            field,
+            code: RewardRiskReasonCode::InvalidThreshold.code(),
+            message: format!(
+                "{field} must be greater than {REWARD_RISK_MIN_VOLATILITY_BPS} to avoid unstable score division"
+            ),
+        });
+    }
+}
+
+fn validate_reward_risk_timestamp_field(
+    field_errors: &mut Vec<RewardRiskValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    if parse_utc_timestamp(value).is_err() {
+        field_errors.push(RewardRiskValidationIssue {
+            field,
+            code: RewardRiskReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be an RFC3339 UTC timestamp"),
+        });
+    }
+}
+
 fn parse_utc_timestamp(value: &str) -> Result<OffsetDateTime, ()> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ())?;
     if parsed.offset() != UtcOffset::UTC {
@@ -4218,8 +4567,100 @@ mod tests {
             liquidity_depth_usd: 700.0,
             spread_bps: 2.5,
             reward_score: 0.7,
+            expected_reward_bps: Some(80.0),
+            maker_rebate_bps: Some(10.0),
+            expected_cost_bps: Some(20.0),
+            expected_volatility_bps: Some(100.0),
             projected_exposure_pct_nav: 12.0,
             observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn reward_risk_formula_computation_is_deterministic() {
+        let score = compute_reward_per_risk_score(&RewardRiskScoreInput {
+            expected_reward_bps: 110.0,
+            maker_rebate_bps: 15.0,
+            expected_cost_bps: 25.0,
+            expected_volatility_bps: 100.0,
+        })
+        .expect("valid FR39 inputs should compute score");
+
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn reward_risk_threshold_defaults_to_story_boundary_when_policy_missing() {
+        assert_eq!(
+            reward_risk_threshold_for_policy(None),
+            REWARD_RISK_DEFAULT_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn reward_risk_score_input_from_snapshot_rejects_missing_components_as_unavailable_state() {
+        let mut snapshot = sample_snapshot();
+        snapshot.expected_volatility_bps = None;
+
+        let error = reward_risk_score_input_from_snapshot(&snapshot)
+            .expect_err("missing FR39 component should fail closed");
+        assert_eq!(
+            error.code,
+            RewardRiskReasonCode::ScoreStateUnavailable.code()
+        );
+    }
+
+    #[test]
+    fn reward_risk_validation_rejects_non_finite_inputs_and_near_zero_volatility() {
+        let error = validate_reward_risk_score_input(&RewardRiskScoreInput {
+            expected_reward_bps: f64::NAN,
+            maker_rebate_bps: 0.0,
+            expected_cost_bps: 0.0,
+            expected_volatility_bps: 0.0,
+        })
+        .expect_err("invalid FR39 score inputs should fail validation");
+        assert_eq!(error.code, RewardRiskReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "expected_reward_bps")
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "expected_volatility_bps")
+        );
+    }
+
+    #[test]
+    fn reward_risk_threshold_boundary_score_equal_is_eligible() {
+        let score = compute_reward_per_risk_score(&RewardRiskScoreInput {
+            expected_reward_bps: 120.0,
+            maker_rebate_bps: 0.0,
+            expected_cost_bps: 0.0,
+            expected_volatility_bps: 100.0,
+        })
+        .expect("boundary inputs should compute score");
+        assert_eq!(score, REWARD_RISK_DEFAULT_THRESHOLD);
+        assert!(score >= REWARD_RISK_DEFAULT_THRESHOLD);
+    }
+
+    #[test]
+    fn reward_risk_reason_code_parse_round_trip_is_deterministic() {
+        let codes = [
+            RewardRiskReasonCode::ScoreEligible,
+            RewardRiskReasonCode::ScoreBelowThreshold,
+            RewardRiskReasonCode::ScoreStateUnavailable,
+            RewardRiskReasonCode::DefaultThresholdApplied,
+            RewardRiskReasonCode::PolicyUpdated,
+        ];
+
+        for code in codes {
+            let parsed = RewardRiskReasonCode::parse(code.code())
+                .expect("known reward-risk reason code should parse");
+            assert_eq!(parsed, code);
         }
     }
 
@@ -4907,6 +5348,7 @@ mod tests {
             PreTradeReasonCode::RiskLimitStateUnavailable,
             PreTradeReasonCode::DrawdownStopTriggered,
             PreTradeReasonCode::VenueIneligible,
+            PreTradeReasonCode::RewardRiskBelowThreshold,
         ];
 
         for code in codes {

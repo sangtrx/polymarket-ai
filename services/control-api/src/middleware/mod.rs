@@ -17,6 +17,7 @@ use governance_service::audit::{AuditAppendError, PrivilegedAuditAppender};
 use governance_service::credentials::{CredentialRotationOrchestrator, CredentialRotationService};
 use governance_service::market_policy::{MarketPolicyOrchestrator, MarketPolicyService};
 use governance_service::recovery::{RecoveryOrchestrator, RecoveryService};
+use governance_service::reward_risk::{RewardRiskOrchestrator, RewardRiskService};
 use governance_service::risk_limits::{RiskLimitOrchestrator, RiskLimitService};
 use governance_service::safety_controls::{SafetyControlOrchestrator, SafetyControlService};
 use reporting_service::exports::scheduling::{ReportScheduleOrchestrator, ReportSchedulingService};
@@ -223,6 +224,7 @@ pub struct ControlApiState {
     pub allocation_policy_orchestrator: Arc<dyn AllocationPolicyOrchestrator>,
     pub market_policy_orchestrator: Arc<dyn MarketPolicyOrchestrator>,
     pub risk_limit_orchestrator: Arc<dyn RiskLimitOrchestrator>,
+    pub reward_risk_orchestrator: Arc<dyn RewardRiskOrchestrator>,
     pub safety_control_orchestrator: Arc<dyn SafetyControlOrchestrator>,
     pub report_schedule_orchestrator: Arc<dyn ReportScheduleOrchestrator>,
     pub report_export_orchestrator: Arc<dyn ReportExportOrchestrator>,
@@ -332,12 +334,22 @@ impl ControlApiState {
             allocation_policy_orchestrator,
             market_policy_orchestrator,
             risk_limit_orchestrator,
+            reward_risk_orchestrator: Arc::new(RewardRiskService::default()),
             safety_control_orchestrator,
             report_schedule_orchestrator,
             report_export_orchestrator: Arc::new(ReportExportWorkflowService::default()),
             recovery_orchestrator,
             attribution_pool: None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_reward_risk_orchestrator(
+        mut self,
+        reward_risk_orchestrator: Arc<dyn RewardRiskOrchestrator>,
+    ) -> Self {
+        self.reward_risk_orchestrator = reward_risk_orchestrator;
+        self
     }
 
     #[allow(dead_code)]

@@ -10,7 +10,7 @@ use domain::recovery::{
 };
 use domain::risk::{
     EmergencyControlMode, MarketPolicyReasonCode, MarketSnapshot, PreTradeReasonCode,
-    RiskLimitReasonCode,
+    RewardRiskScoreInput, RiskLimitReasonCode, compute_reward_per_risk_score,
 };
 use persistence::postgres::freshness_gate::load_latest_freshness_gate_event;
 use persistence::postgres::market_policy::{
@@ -21,6 +21,7 @@ use persistence::postgres::pretrade_gate::{
     PreTradeGatePersistenceError, insert_pretrade_gate_decision,
 };
 use persistence::postgres::recovery_gate_runs::load_latest_recovery_gate_run;
+use persistence::postgres::reward_risk::load_reward_risk_policy;
 use persistence::postgres::risk_limits::{
     load_active_risk_limit_profile_bundle, load_pending_risk_limit_profile_bundles,
 };
@@ -249,6 +250,7 @@ async fn hydrate_runtime_state_from_sources(
     hydrate_latest_stream_health_state(runtime_policy_state, &pool, config).await;
     hydrate_latest_limit_state(runtime_limit_state, &pool, config).await;
     hydrate_latest_market_policy_state(runtime_policy_state, &pool, config).await;
+    hydrate_latest_reward_risk_state(runtime_policy_state, &pool, config).await;
     hydrate_latest_safety_mode_state(runtime_policy_state, &pool).await;
     Some(pool)
 }
@@ -366,6 +368,20 @@ async fn hydrate_latest_market_policy_state(
     }
 }
 
+async fn hydrate_latest_reward_risk_state(
+    runtime_policy_state: &gates::InMemoryRuntimePolicyState,
+    pool: &PgPool,
+    config: &BootstrapRuntimeConfig,
+) {
+    match load_reward_risk_policy(pool, &config.profile_key).await {
+        Ok(Some(policy)) => runtime_policy_state.upsert_reward_risk_policy(policy),
+        Ok(None) => {}
+        Err(error) => {
+            println!("risk-engine bootstrap could not hydrate reward-risk policy: {error}");
+        }
+    }
+}
+
 async fn hydrate_latest_safety_mode_state(
     runtime_policy_state: &gates::InMemoryRuntimePolicyState,
     pool: &PgPool,
@@ -453,10 +469,59 @@ fn is_approved_recovery_resume_run(run: &RecoveryGateRunEvidence) -> bool {
 fn load_market_snapshot_from_env(config: &BootstrapRuntimeConfig) -> Option<MarketSnapshot> {
     let liquidity_depth_usd = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_LIQUIDITY_USD")?;
     let spread_bps = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_SPREAD_BPS")?;
-    let reward_score = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_REWARD_SCORE")?;
     let projected_exposure_pct_nav = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_EXPOSURE_PCT_NAV")?;
     let observed_at_utc = std::env::var("RISK_ENGINE_BOOTSTRAP_MARKET_OBSERVED_AT_UTC")
         .unwrap_or_else(|_| "2026-04-06T00:00:00Z".to_string());
+    let expected_reward_bps = env_f64_any("RISK_ENGINE_BOOTSTRAP_MARKET_EXPECTED_REWARD_BPS");
+    let maker_rebate_bps = env_f64_any("RISK_ENGINE_BOOTSTRAP_MARKET_MAKER_REBATE_BPS");
+    let expected_cost_bps = env_f64_any("RISK_ENGINE_BOOTSTRAP_MARKET_EXPECTED_COST_BPS");
+    let expected_volatility_bps =
+        env_f64_any("RISK_ENGINE_BOOTSTRAP_MARKET_EXPECTED_VOLATILITY_BPS");
+
+    let (
+        reward_score,
+        expected_reward_bps,
+        maker_rebate_bps,
+        expected_cost_bps,
+        expected_volatility_bps,
+    ) = match (
+        expected_reward_bps,
+        maker_rebate_bps,
+        expected_cost_bps,
+        expected_volatility_bps,
+    ) {
+        (
+            Some(expected_reward_bps),
+            Some(maker_rebate_bps),
+            Some(expected_cost_bps),
+            Some(expected_volatility_bps),
+        ) => {
+            let reward_score = compute_reward_per_risk_score(&RewardRiskScoreInput {
+                expected_reward_bps,
+                maker_rebate_bps,
+                expected_cost_bps,
+                expected_volatility_bps,
+            })
+            .ok()?;
+            (
+                reward_score,
+                Some(expected_reward_bps),
+                Some(maker_rebate_bps),
+                Some(expected_cost_bps),
+                Some(expected_volatility_bps),
+            )
+        }
+        _ => {
+            let reward_score = env_f64("RISK_ENGINE_BOOTSTRAP_MARKET_REWARD_SCORE")?;
+            (
+                reward_score,
+                Some(reward_score),
+                Some(0.0),
+                Some(0.0),
+                Some(1.0),
+            )
+        }
+    };
 
     Some(MarketSnapshot {
         market_id: config.market_id.clone(),
@@ -464,6 +529,10 @@ fn load_market_snapshot_from_env(config: &BootstrapRuntimeConfig) -> Option<Mark
         liquidity_depth_usd,
         spread_bps,
         reward_score,
+        expected_reward_bps,
+        maker_rebate_bps,
+        expected_cost_bps,
+        expected_volatility_bps,
         projected_exposure_pct_nav,
         observed_at_utc,
     })
@@ -507,6 +576,13 @@ fn env_f64(name: &str) -> Option<f64> {
         .ok()
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn env_f64_any(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
 }
 
 fn env_bool(name: &str) -> Option<bool> {

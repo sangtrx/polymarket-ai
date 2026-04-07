@@ -5,5 +5,6 @@ pub mod credentials;
 pub mod market_policy;
 pub mod rbac;
 pub mod recovery;
+pub mod reward_risk;
 pub mod risk_limits;
 pub mod safety_controls;

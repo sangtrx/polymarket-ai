@@ -11,6 +11,7 @@ use governance_service::audit::{GovernanceAuditService, InMemoryAuditAppendPort}
 use governance_service::credentials::CredentialRotationService;
 use governance_service::market_policy::MarketPolicyService;
 use governance_service::recovery::RecoveryService;
+use governance_service::reward_risk::RewardRiskService;
 use governance_service::risk_limits::RiskLimitService;
 use governance_service::safety_controls::SafetyControlService;
 use middleware::{ControlApiState, GovernanceAuthorizationGuard, HeaderTokenAuthenticator};
@@ -46,6 +47,7 @@ async fn main() {
         Arc::new(ReportSchedulingService::postgres(pool.clone())),
         Arc::new(RecoveryService::postgres(pool.clone())),
     )
+    .with_reward_risk_orchestrator(Arc::new(RewardRiskService::postgres(pool.clone())))
     .with_report_export_orchestrator(Arc::new(ReportExportWorkflowService::postgres(
         pool.clone(),
     )))

@@ -612,3 +612,37 @@
 
 - `node --test tests/api/story-4-4-report-export-workflows-api.test.mjs tests/e2e/story-4-4-report-export-workflows.e2e.test.mjs` ✅
 - `npm run --silent qa:test:story-4-4` ✅
+
+---
+
+## Story 5.1 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/risk.rs` (`risk::tests::reward_risk_`) — validates FR39 formula determinism, default threshold fallback (`1.2`), equality boundary semantics (`score == threshold`), and unavailable-state handling for missing score inputs.
+- [x] `crates/persistence/src/postgres/reward_risk.rs` (`postgres::reward_risk::tests::`) — validates migration scope (`reward_risk_policies` only), threshold/identifier constraints, UTC enforcement, canonical normalization, and deterministic latest-read query ordering.
+- [x] `services/governance-service/src/reward_risk/mod.rs` (`reward_risk::tests::`) — validates privileged role boundaries, default-threshold read fallback behavior, normalized identifier upserts, and machine-readable invalid-threshold denial.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::reward_risk_`) — validates authenticated reward-risk upsert/read route evidence, default-threshold read envelopes, field-level invalid payload error surfaces, and dependency-unavailable status mapping.
+- [x] `services/risk-engine/src/gates/mod.rs` (`gates::tests::order_intent_gate_with_limit_state_`) — validates reward-per-risk gate composition in the pre-trade pipeline, below-threshold deny behavior, default-threshold pass path without override, and unavailable-state fail-closed emergency-signal compatibility.
+- [x] `tests/api/story-5-1-reward-risk-policy-api.test.mjs` — validates Story 5.1 authenticated reward-risk route wiring, deterministic machine-readable status-code mappings, unauthorized security-signal evidence, and governance default-threshold fallback boundaries.
+- [x] `tests/e2e/story-5-1-reward-risk-policy-gating.e2e.test.mjs` — validates pre-trade reward-risk gate composition, FR39 score/threshold application pathing, fail-closed unavailable-state emergency compatibility, and runbook workflow/contract coverage.
+
+### Coverage
+
+- Story 5.1 now has deterministic automated coverage for:
+  - FR39 reward-per-risk formula application and explicit numeric/volatility guardrails,
+  - policy persistence and retrieval contracts with canonical identifiers + UTC evidence metadata,
+  - governance/control-plane mutation + read surfaces with machine-readable failure envelopes,
+  - pre-trade reward-risk gate composition with existing Story 2.1/2.7/2.8 controls and fail-closed unavailable-state semantics,
+  - Story 5.1 API/E2E static regression coverage for control-plane route contracts, pre-trade gating integration flow, and operations runbook boundary semantics.
+- Automated Story 5.1 regression inventory in this QA refresh: **38 Story-5.1 tests passing** (`domain: 6`, `persistence: 6`, `governance: 5`, `control-api: 4`, `risk-engine: 9`, `api/e2e: 8`).
+
+### Execution Result
+
+- `cargo test -p domain risk::tests::reward_risk_` ✅
+- `cargo test -p persistence postgres::reward_risk::tests::` ✅
+- `cargo test -p governance-service reward_risk::tests::` ✅
+- `cargo test -p control-api routes::tests::reward_risk_` ✅
+- `cargo test -p risk-engine gates::tests::order_intent_gate_with_limit_state_` ✅
+- `node --test tests/api/story-5-1*.test.mjs tests/e2e/story-5-1*.test.mjs` ✅
+- `npm run --silent qa:test:story-5-1` ✅
