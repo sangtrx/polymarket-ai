@@ -91,3 +91,4 @@ For each delivery attempt:
 3. Controlled recovery readiness gates: `docs/operations/controlled-recovery-readiness-gates.md`
 4. Backup integrity and deterministic restore rehearsal: `docs/operations/backup-integrity-restore-rehearsal.md`
 5. Accessibility and reduced-motion critical-flow standards: `docs/operations/accessibility-reduced-motion-critical-flows.md`
+6. Incentive regime-shift alerts (FR40): `docs/operations/incentive-regime-shift-alerts.md`

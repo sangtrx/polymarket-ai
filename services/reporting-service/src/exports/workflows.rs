@@ -443,11 +443,7 @@ impl ReportExportWorkflowService {
                 if trigger_source == ReportingExportTriggerSource::ScheduledWeekly
                     && is_weekly_idempotency_collision(&error) =>
             {
-                if let (
-                    Some(schedule_id),
-                    Some(schedule_window_key),
-                    Some(report_run_id),
-                ) = (
+                if let (Some(schedule_id), Some(schedule_window_key), Some(report_run_id)) = (
                     schedule_id.as_deref(),
                     schedule_window_key.as_deref(),
                     report_run_id.as_deref(),
@@ -457,9 +453,10 @@ impl ReportExportWorkflowService {
                         schedule_window_key,
                         report_run_id,
                     )? {
-                        let artifacts = self
-                            .repository
-                            .load_artifacts_for_job(&existing.job_id, Some(MAX_EXPORT_LIST_LIMIT))?;
+                        let artifacts = self.repository.load_artifacts_for_job(
+                            &existing.job_id,
+                            Some(MAX_EXPORT_LIST_LIMIT),
+                        )?;
                         emit_export_telemetry(ExportJobTelemetryEvent {
                             event_name: "report_export_job_transition_v1",
                             trigger_source: existing.trigger_source.as_str(),

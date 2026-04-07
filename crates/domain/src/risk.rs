@@ -18,6 +18,8 @@ pub const FRESHNESS_RECOVERY_STABILITY_WINDOW_SECONDS: f64 = 10.0;
 pub const FRESHNESS_MAX_BREACH_TO_PAUSE_SECONDS: f64 = 5.0;
 pub const REWARD_RISK_DEFAULT_THRESHOLD: f64 = 1.2;
 pub const REWARD_RISK_MIN_VOLATILITY_BPS: f64 = 0.000_001;
+pub const FR40_REBATE_DELTA_THRESHOLD_BPS: f64 = 20.0;
+pub const FR40_SPREAD_WIDENING_THRESHOLD_BPS: f64 = 50.0;
 pub const EMERGENCY_CONTROL_ACK_MAX_SECONDS: f64 = 1.0;
 pub const EMERGENCY_CONTROL_STATE_REFLECTION_MAX_SECONDS: f64 = 5.0;
 pub const EMERGENCY_CONTROL_SAFE_STATE_MAX_SECONDS: f64 = 5.0;
@@ -456,8 +458,328 @@ pub struct MarketSnapshot {
     pub expected_cost_bps: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_volatility_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue_eligibility_state: Option<VenueEligibilityState>,
     pub projected_exposure_pct_nav: f64,
     pub observed_at_utc: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VenueEligibilityState {
+    Eligible,
+    Restricted,
+    Ineligible,
+}
+
+impl VenueEligibilityState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::Restricted => "restricted",
+            Self::Ineligible => "ineligible",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RegimeShiftContractError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "eligible" => Ok(Self::Eligible),
+            "restricted" => Ok(Self::Restricted),
+            "ineligible" => Ok(Self::Ineligible),
+            _ => Err(RegimeShiftContractError::invalid_payload_with_issues(
+                format!("unsupported eligibility_state `{value}`"),
+                vec![RegimeShiftValidationIssue {
+                    field: "eligibility_state",
+                    code: RegimeShiftReasonCode::InvalidPayload.code(),
+                    message: "eligibility_state must be one of: eligible, restricted, ineligible"
+                        .to_string(),
+                }],
+            )),
+        }
+    }
+
+    pub const fn is_eligible(self) -> bool {
+        matches!(self, Self::Eligible)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegimeShiftReasonCode {
+    RebateDeltaExceeded,
+    SpreadWideningExceeded,
+    EligibilityTransition,
+    InvalidPayload,
+    DependencyUnavailable,
+    PersistenceUnavailable,
+    EvidencePersisted,
+    EvidenceRead,
+}
+
+impl RegimeShiftReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RebateDeltaExceeded => "fr40_regime_rebate_delta_exceeded",
+            Self::SpreadWideningExceeded => "fr40_regime_spread_widening_exceeded",
+            Self::EligibilityTransition => "fr40_regime_eligibility_transition",
+            Self::InvalidPayload => "fr40_regime_invalid_payload",
+            Self::DependencyUnavailable => "fr40_regime_dependency_unavailable",
+            Self::PersistenceUnavailable => "fr40_regime_persistence_unavailable",
+            Self::EvidencePersisted => "fr40_regime_evidence_persisted",
+            Self::EvidenceRead => "fr40_regime_evidence_read",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RegimeShiftContractError> {
+        match value {
+            "fr40_regime_rebate_delta_exceeded" => Ok(Self::RebateDeltaExceeded),
+            "fr40_regime_spread_widening_exceeded" => Ok(Self::SpreadWideningExceeded),
+            "fr40_regime_eligibility_transition" => Ok(Self::EligibilityTransition),
+            "fr40_regime_invalid_payload" => Ok(Self::InvalidPayload),
+            "fr40_regime_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "fr40_regime_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            "fr40_regime_evidence_persisted" => Ok(Self::EvidencePersisted),
+            "fr40_regime_evidence_read" => Ok(Self::EvidenceRead),
+            _ => Err(RegimeShiftContractError::invalid_payload(format!(
+                "unknown FR40 regime-shift reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegimeShiftValidationIssue {
+    pub field: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegimeShiftContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<RegimeShiftValidationIssue>,
+}
+
+impl RegimeShiftContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<RegimeShiftValidationIssue>,
+    ) -> Self {
+        Self {
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+
+    pub fn dependency_unavailable_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<RegimeShiftValidationIssue>,
+    ) -> Self {
+        Self {
+            code: RegimeShiftReasonCode::DependencyUnavailable.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RegimeShiftThresholds {
+    pub rebate_delta_bps: f64,
+    pub spread_widening_bps: f64,
+}
+
+impl Default for RegimeShiftThresholds {
+    fn default() -> Self {
+        Self {
+            rebate_delta_bps: FR40_REBATE_DELTA_THRESHOLD_BPS,
+            spread_widening_bps: FR40_SPREAD_WIDENING_THRESHOLD_BPS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RegimeShiftDetection {
+    pub market_id: String,
+    pub cluster_id: String,
+    pub reason_code: String,
+    pub severity: String,
+    pub correlation_id: String,
+    pub observed_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_maker_rebate_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_maker_rebate_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebate_delta_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_spread_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_spread_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_widening_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_eligibility_state: Option<VenueEligibilityState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_eligibility_state: Option<VenueEligibilityState>,
+    pub threshold_rebate_delta_bps: f64,
+    pub threshold_spread_widening_bps: f64,
+}
+
+pub fn evaluate_fr40_regime_shift(
+    previous: &MarketSnapshot,
+    current: &MarketSnapshot,
+    correlation_id: &str,
+    thresholds: Option<&RegimeShiftThresholds>,
+) -> Result<Vec<RegimeShiftDetection>, RegimeShiftContractError> {
+    let thresholds = thresholds.copied().unwrap_or_default();
+    validate_regime_shift_thresholds(&thresholds)?;
+    validate_regime_shift_identifiers(previous, current, correlation_id)?;
+    let previous_observed_at = validate_regime_shift_observed_timestamp(
+        "previous.observed_at_utc",
+        &previous.observed_at_utc,
+    )?;
+    let current_observed_at = validate_regime_shift_observed_timestamp(
+        "current.observed_at_utc",
+        &current.observed_at_utc,
+    )?;
+    if current_observed_at < previous_observed_at {
+        return Err(RegimeShiftContractError::invalid_payload_with_issues(
+            "current.observed_at_utc must be greater than or equal to previous.observed_at_utc",
+            vec![RegimeShiftValidationIssue {
+                field: "current.observed_at_utc",
+                code: RegimeShiftReasonCode::InvalidPayload.code(),
+                message:
+                    "current.observed_at_utc must be greater than or equal to previous.observed_at_utc"
+                        .to_string(),
+            }],
+        ));
+    }
+
+    let mut dependency_issues = Vec::new();
+    let previous_rebate = require_regime_shift_f64_option(
+        &mut dependency_issues,
+        "previous.maker_rebate_bps",
+        previous.maker_rebate_bps,
+    );
+    let current_rebate = require_regime_shift_f64_option(
+        &mut dependency_issues,
+        "current.maker_rebate_bps",
+        current.maker_rebate_bps,
+    );
+    let previous_eligibility = require_regime_shift_eligibility_state(
+        &mut dependency_issues,
+        "previous.venue_eligibility_state",
+        previous.venue_eligibility_state,
+    );
+    let current_eligibility = require_regime_shift_eligibility_state(
+        &mut dependency_issues,
+        "current.venue_eligibility_state",
+        current.venue_eligibility_state,
+    );
+
+    if !dependency_issues.is_empty() {
+        return Err(
+            RegimeShiftContractError::dependency_unavailable_with_issues(
+                "required FR40 baseline dependencies are unavailable",
+                dependency_issues,
+            ),
+        );
+    }
+
+    let previous_rebate = previous_rebate.expect("dependency validation should guarantee rebate");
+    let current_rebate = current_rebate.expect("dependency validation should guarantee rebate");
+    let previous_eligibility =
+        previous_eligibility.expect("dependency validation should guarantee eligibility");
+    let current_eligibility =
+        current_eligibility.expect("dependency validation should guarantee eligibility");
+    let normalized_correlation = correlation_id.trim().to_ascii_lowercase();
+    let normalized_market_id = current.market_id.trim().to_ascii_lowercase();
+    let normalized_cluster_id = current.cluster_id.trim().to_ascii_lowercase();
+
+    let mut detections = Vec::new();
+    let rebate_delta_bps = (current_rebate - previous_rebate).abs();
+    let spread_widening_bps = (current.spread_bps - previous.spread_bps).max(0.0);
+    if rebate_delta_bps > thresholds.rebate_delta_bps {
+        detections.push(RegimeShiftDetection {
+            market_id: normalized_market_id.clone(),
+            cluster_id: normalized_cluster_id.clone(),
+            reason_code: RegimeShiftReasonCode::RebateDeltaExceeded
+                .code()
+                .to_string(),
+            severity: "critical".to_string(),
+            correlation_id: normalized_correlation.clone(),
+            observed_at_utc: current.observed_at_utc.clone(),
+            previous_maker_rebate_bps: Some(previous_rebate),
+            current_maker_rebate_bps: Some(current_rebate),
+            rebate_delta_bps: Some(rebate_delta_bps),
+            previous_spread_bps: Some(previous.spread_bps),
+            current_spread_bps: Some(current.spread_bps),
+            spread_widening_bps: Some(spread_widening_bps),
+            previous_eligibility_state: Some(previous_eligibility),
+            current_eligibility_state: Some(current_eligibility),
+            threshold_rebate_delta_bps: thresholds.rebate_delta_bps,
+            threshold_spread_widening_bps: thresholds.spread_widening_bps,
+        });
+    }
+
+    if spread_widening_bps > thresholds.spread_widening_bps {
+        detections.push(RegimeShiftDetection {
+            market_id: normalized_market_id.clone(),
+            cluster_id: normalized_cluster_id.clone(),
+            reason_code: RegimeShiftReasonCode::SpreadWideningExceeded
+                .code()
+                .to_string(),
+            severity: "critical".to_string(),
+            correlation_id: normalized_correlation.clone(),
+            observed_at_utc: current.observed_at_utc.clone(),
+            previous_maker_rebate_bps: Some(previous_rebate),
+            current_maker_rebate_bps: Some(current_rebate),
+            rebate_delta_bps: Some(rebate_delta_bps),
+            previous_spread_bps: Some(previous.spread_bps),
+            current_spread_bps: Some(current.spread_bps),
+            spread_widening_bps: Some(spread_widening_bps),
+            previous_eligibility_state: Some(previous_eligibility),
+            current_eligibility_state: Some(current_eligibility),
+            threshold_rebate_delta_bps: thresholds.rebate_delta_bps,
+            threshold_spread_widening_bps: thresholds.spread_widening_bps,
+        });
+    }
+
+    if previous_eligibility.is_eligible() != current_eligibility.is_eligible() {
+        detections.push(RegimeShiftDetection {
+            market_id: normalized_market_id,
+            cluster_id: normalized_cluster_id,
+            reason_code: RegimeShiftReasonCode::EligibilityTransition
+                .code()
+                .to_string(),
+            severity: "critical".to_string(),
+            correlation_id: normalized_correlation,
+            observed_at_utc: current.observed_at_utc.clone(),
+            previous_maker_rebate_bps: Some(previous_rebate),
+            current_maker_rebate_bps: Some(current_rebate),
+            rebate_delta_bps: Some(rebate_delta_bps),
+            previous_spread_bps: Some(previous.spread_bps),
+            current_spread_bps: Some(current.spread_bps),
+            spread_widening_bps: Some(spread_widening_bps),
+            previous_eligibility_state: Some(previous_eligibility),
+            current_eligibility_state: Some(current_eligibility),
+            threshold_rebate_delta_bps: thresholds.rebate_delta_bps,
+            threshold_spread_widening_bps: thresholds.spread_widening_bps,
+        });
+    }
+
+    Ok(detections)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -1583,6 +1905,7 @@ pub fn market_stream_tick_to_snapshot(
         maker_rebate_bps: Some(0.0),
         expected_cost_bps: Some(0.0),
         expected_volatility_bps: Some(1.0),
+        venue_eligibility_state: None,
         projected_exposure_pct_nav,
         observed_at_utc: tick.observed_at_utc.clone(),
     })
@@ -4376,12 +4699,213 @@ fn validate_reward_risk_timestamp_field(
     }
 }
 
+fn validate_regime_shift_thresholds(
+    thresholds: &RegimeShiftThresholds,
+) -> Result<(), RegimeShiftContractError> {
+    let mut field_errors = Vec::new();
+    validate_regime_shift_threshold_field(
+        &mut field_errors,
+        "thresholds.rebate_delta_bps",
+        thresholds.rebate_delta_bps,
+    );
+    validate_regime_shift_threshold_field(
+        &mut field_errors,
+        "thresholds.spread_widening_bps",
+        thresholds.spread_widening_bps,
+    );
+    if field_errors.is_empty() {
+        return Ok(());
+    }
+    Err(RegimeShiftContractError::invalid_payload_with_issues(
+        "FR40 thresholds are invalid",
+        field_errors,
+    ))
+}
+
+fn validate_regime_shift_threshold_field(
+    field_errors: &mut Vec<RegimeShiftValidationIssue>,
+    field: &'static str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        field_errors.push(RegimeShiftValidationIssue {
+            field,
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite"),
+        });
+        return;
+    }
+    if value < 0.0 {
+        field_errors.push(RegimeShiftValidationIssue {
+            field,
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be greater than or equal to 0"),
+        });
+    }
+}
+
+fn validate_regime_shift_identifiers(
+    previous: &MarketSnapshot,
+    current: &MarketSnapshot,
+    correlation_id: &str,
+) -> Result<(), RegimeShiftContractError> {
+    let mut field_errors = Vec::new();
+    validate_regime_shift_identifier_field(
+        &mut field_errors,
+        "previous.market_id",
+        &previous.market_id,
+    );
+    validate_regime_shift_identifier_field(
+        &mut field_errors,
+        "current.market_id",
+        &current.market_id,
+    );
+    validate_regime_shift_identifier_field(
+        &mut field_errors,
+        "previous.cluster_id",
+        &previous.cluster_id,
+    );
+    validate_regime_shift_identifier_field(
+        &mut field_errors,
+        "current.cluster_id",
+        &current.cluster_id,
+    );
+    validate_regime_shift_identifier_field(&mut field_errors, "correlation_id", correlation_id);
+    if previous
+        .market_id
+        .trim()
+        .eq_ignore_ascii_case(current.market_id.trim())
+    {
+        // Keep going.
+    } else {
+        field_errors.push(RegimeShiftValidationIssue {
+            field: "market_id",
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: "previous and current snapshots must reference the same market_id".to_string(),
+        });
+    }
+    if previous
+        .cluster_id
+        .trim()
+        .eq_ignore_ascii_case(current.cluster_id.trim())
+    {
+        // Keep going.
+    } else {
+        field_errors.push(RegimeShiftValidationIssue {
+            field: "cluster_id",
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: "previous and current snapshots must reference the same cluster_id"
+                .to_string(),
+        });
+    }
+    if field_errors.is_empty() {
+        return Ok(());
+    }
+    Err(RegimeShiftContractError::invalid_payload_with_issues(
+        "FR40 regime-shift identifier validation failed",
+        field_errors,
+    ))
+}
+
+fn validate_regime_shift_identifier_field(
+    field_errors: &mut Vec<RegimeShiftValidationIssue>,
+    field: &'static str,
+    value: &str,
+) {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        field_errors.push(RegimeShiftValidationIssue {
+            field,
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+        return;
+    }
+    if !is_canonical_identifier(&normalized) {
+        field_errors.push(RegimeShiftValidationIssue {
+            field,
+            code: RegimeShiftReasonCode::InvalidPayload.code(),
+            message: format!("{field} must contain 3-120 canonical characters"),
+        });
+    }
+}
+
+fn validate_regime_shift_observed_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<OffsetDateTime, RegimeShiftContractError> {
+    parse_utc_timestamp(value).map_err(|_| {
+        RegimeShiftContractError::invalid_payload_with_issues(
+            format!("{field} must be an RFC3339 UTC timestamp"),
+            vec![RegimeShiftValidationIssue {
+                field,
+                code: RegimeShiftReasonCode::InvalidPayload.code(),
+                message: format!("{field} must be an RFC3339 UTC timestamp"),
+            }],
+        )
+    })
+}
+
+fn require_regime_shift_f64_option(
+    field_errors: &mut Vec<RegimeShiftValidationIssue>,
+    field: &'static str,
+    value: Option<f64>,
+) -> Option<f64> {
+    match value {
+        Some(value) if value.is_finite() => Some(value),
+        Some(_) => {
+            field_errors.push(RegimeShiftValidationIssue {
+                field,
+                code: RegimeShiftReasonCode::DependencyUnavailable.code(),
+                message: format!("{field} must be finite"),
+            });
+            None
+        }
+        None => {
+            field_errors.push(RegimeShiftValidationIssue {
+                field,
+                code: RegimeShiftReasonCode::DependencyUnavailable.code(),
+                message: format!("{field} is required for FR40 evaluation"),
+            });
+            None
+        }
+    }
+}
+
+fn require_regime_shift_eligibility_state(
+    field_errors: &mut Vec<RegimeShiftValidationIssue>,
+    field: &'static str,
+    value: Option<VenueEligibilityState>,
+) -> Option<VenueEligibilityState> {
+    match value {
+        Some(value) => Some(value),
+        None => {
+            field_errors.push(RegimeShiftValidationIssue {
+                field,
+                code: RegimeShiftReasonCode::DependencyUnavailable.code(),
+                message: format!("{field} is required for FR40 eligibility-transition evaluation"),
+            });
+            None
+        }
+    }
+}
+
 fn parse_utc_timestamp(value: &str) -> Result<OffsetDateTime, ()> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ())?;
     if parsed.offset() != UtcOffset::UTC {
         return Err(());
     }
     Ok(parsed)
+}
+
+fn is_canonical_identifier(value: &str) -> bool {
+    let length = value.len();
+    if !(3..=120).contains(&length) {
+        return false;
+    }
+    value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':' | '.')
+    })
 }
 
 fn normalize_identifier<'a>(value: &'a str, fallback: &'a str) -> &'a str {
@@ -4571,6 +5095,7 @@ mod tests {
             maker_rebate_bps: Some(10.0),
             expected_cost_bps: Some(20.0),
             expected_volatility_bps: Some(100.0),
+            venue_eligibility_state: Some(VenueEligibilityState::Eligible),
             projected_exposure_pct_nav: 12.0,
             observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
         }
@@ -4662,6 +5187,113 @@ mod tests {
                 .expect("known reward-risk reason code should parse");
             assert_eq!(parsed, code);
         }
+    }
+
+    fn sample_regime_snapshot(
+        maker_rebate_bps: Option<f64>,
+        spread_bps: f64,
+        eligibility_state: Option<VenueEligibilityState>,
+    ) -> MarketSnapshot {
+        MarketSnapshot {
+            market_id: "market_yes_no_1".to_string(),
+            cluster_id: "cluster_alpha".to_string(),
+            liquidity_depth_usd: 700.0,
+            spread_bps,
+            reward_score: 0.7,
+            expected_reward_bps: Some(80.0),
+            maker_rebate_bps,
+            expected_cost_bps: Some(20.0),
+            expected_volatility_bps: Some(100.0),
+            projected_exposure_pct_nav: 12.0,
+            observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
+            venue_eligibility_state: eligibility_state,
+        }
+    }
+
+    #[test]
+    fn fr40_regime_shift_threshold_boundaries_are_strict_greater_than() {
+        let previous =
+            sample_regime_snapshot(Some(10.0), 120.0, Some(VenueEligibilityState::Eligible));
+        let current =
+            sample_regime_snapshot(Some(30.0), 170.0, Some(VenueEligibilityState::Eligible));
+        let detections =
+            evaluate_fr40_regime_shift(&previous, &current, "corr-fr40-boundary", None)
+                .expect("boundary payload should validate");
+        assert!(
+            detections.is_empty(),
+            "exact +20 rebate delta and +50 spread widening must not trigger"
+        );
+    }
+
+    #[test]
+    fn fr40_regime_shift_detects_rebate_spread_and_eligibility_transitions() {
+        let previous =
+            sample_regime_snapshot(Some(8.0), 80.0, Some(VenueEligibilityState::Eligible));
+        let current =
+            sample_regime_snapshot(Some(30.5), 145.5, Some(VenueEligibilityState::Restricted));
+
+        let detections = evaluate_fr40_regime_shift(&previous, &current, "corr-fr40-trigger", None)
+            .expect("valid payload should emit detections");
+        let reason_codes: Vec<&str> = detections
+            .iter()
+            .map(|detection| detection.reason_code.as_str())
+            .collect();
+        assert!(reason_codes.contains(&RegimeShiftReasonCode::RebateDeltaExceeded.code()));
+        assert!(reason_codes.contains(&RegimeShiftReasonCode::SpreadWideningExceeded.code()));
+        assert!(reason_codes.contains(&RegimeShiftReasonCode::EligibilityTransition.code()));
+    }
+
+    #[test]
+    fn fr40_regime_shift_fails_closed_when_required_baseline_data_is_missing() {
+        let previous =
+            sample_regime_snapshot(Some(10.0), 80.0, Some(VenueEligibilityState::Eligible));
+        let current = sample_regime_snapshot(None, 140.0, Some(VenueEligibilityState::Restricted));
+        let error =
+            evaluate_fr40_regime_shift(&previous, &current, "corr-fr40-missing-baseline", None)
+                .expect_err("missing economics baseline should fail closed");
+        assert_eq!(
+            error.code,
+            RegimeShiftReasonCode::DependencyUnavailable.code()
+        );
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "current.maker_rebate_bps")
+        );
+    }
+
+    #[test]
+    fn fr40_regime_shift_rejects_out_of_order_observation_timestamps() {
+        let mut previous =
+            sample_regime_snapshot(Some(10.0), 80.0, Some(VenueEligibilityState::Eligible));
+        previous.observed_at_utc = "2026-04-06T00:01:00Z".to_string();
+        let mut current =
+            sample_regime_snapshot(Some(32.0), 150.0, Some(VenueEligibilityState::Restricted));
+        current.observed_at_utc = "2026-04-06T00:00:00Z".to_string();
+
+        let error = evaluate_fr40_regime_shift(&previous, &current, "corr-fr40-chronology", None)
+            .expect_err("out-of-order observations must fail validation");
+        assert_eq!(error.code, RegimeShiftReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "current.observed_at_utc")
+        );
+    }
+
+    #[test]
+    fn venue_eligibility_state_parse_rejects_unsupported_values() {
+        let error = VenueEligibilityState::parse("partially_eligible")
+            .expect_err("unsupported state should be rejected");
+        assert_eq!(error.code, RegimeShiftReasonCode::InvalidPayload.code());
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "eligibility_state")
+        );
     }
 
     #[test]

@@ -47,8 +47,10 @@ use domain::reporting_schedule::{
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketPolicyReasonCode,
-    MarketPolicyValidationIssue, RewardRiskReasonCode, RewardRiskValidationIssue,
-    RiskLimitReasonCode, RiskLimitScope, RiskLimitValidationIssue, SafetyControlActionRecord,
+    MarketPolicyValidationIssue, MarketSnapshot, RegimeShiftReasonCode, RegimeShiftThresholds,
+    RewardRiskReasonCode, RewardRiskValidationIssue, RiskLimitReasonCode, RiskLimitScope,
+    RiskLimitValidationIssue, SafetyControlActionRecord, VenueEligibilityState,
+    evaluate_fr40_regime_shift,
 };
 use governance_service::allocation_policy::{
     AllocationPolicyMutationEvidence, EvaluateRebalanceDriftInput,
@@ -82,6 +84,9 @@ use persistence::postgres::incident_alerts::{
     load_recent_incident_alerts, update_incident_alert_status,
 };
 use persistence::postgres::incident_query_views::load_incident_forensics_timeline;
+use persistence::postgres::regime_shift_alerts::{
+    RegimeShiftAlertRecord, create_regime_shift_alert, load_regime_shift_alerts,
+};
 use reporting_service::exports::scheduling::{
     PauseReportScheduleInput, QueryReportRunHistoryInput, ReportScheduleMutationEvidence,
     ResumeReportScheduleInput, UpsertReportScheduleInput,
@@ -200,6 +205,14 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/incidents/alerts/dispatch",
             post(dispatch_incident_alert),
+        )
+        .route(
+            "/control/incidents/regime-shifts",
+            get(list_regime_shift_alerts),
+        )
+        .route(
+            "/control/incidents/regime-shifts/dispatch",
+            post(dispatch_regime_shift_alerts),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -1941,6 +1954,739 @@ pub async fn dispatch_incident_alert(
         authorization.timestamp_utc.clone(),
         endpoint,
     )
+}
+
+pub async fn list_regime_shift_alerts(
+    State(state): State<ControlApiState>,
+    Query(query): Query<RegimeShiftAlertsQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/incidents/regime-shifts".to_string();
+    let authorization = match authorize_incident_alert_action(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "regime_shift_alerts_query",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let limit = match parse_alert_limit(query.limit) {
+        Ok(limit) => limit,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "regime_shift_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+    let dependency_state = match parse_incident_dependency_state(query.dependency_state.as_deref())
+    {
+        Ok(state) => state,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::InvalidPayload.code(),
+                error.message,
+                error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlertValidationIssue {
+                        field: issue.field,
+                        code: issue.code,
+                        message: issue.message,
+                    })
+                    .collect(),
+                "regime_shift_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    match dependency_state {
+        IncidentDependencyState::DependencyUnavailable => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::DependencyUnavailable.code(),
+                "regime-shift alert dependencies are unavailable".to_string(),
+                Vec::new(),
+                "regime_shift_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::StaleEvidence => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::StaleEvidence.code(),
+                "regime-shift alert evidence is stale".to_string(),
+                Vec::new(),
+                "regime_shift_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::Healthy => {}
+    }
+
+    let Some(pool) = state.attribution_pool.as_ref() else {
+        return incident_alert_service_error_response(
+            RegimeShiftReasonCode::DependencyUnavailable.code(),
+            "regime-shift evidence persistence dependency is unavailable".to_string(),
+            Vec::new(),
+            "regime_shift_alerts_query",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    };
+    let alerts = match load_regime_shift_alerts(
+        pool,
+        query.market_id.as_deref(),
+        query.reason_code.as_deref(),
+        query.correlation_id.as_deref(),
+        query.start_ts.as_deref(),
+        query.end_ts.as_deref(),
+        limit,
+    )
+    .await
+    {
+        Ok(alerts) => alerts
+            .into_iter()
+            .map(to_regime_shift_alert_item)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlertValidationIssue {
+                        field: issue.field,
+                        code: issue.code,
+                        message: issue.message,
+                    })
+                    .collect(),
+                "regime_shift_alerts_query",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+
+    regime_shift_alert_query_response(
+        &state,
+        &actor,
+        alerts,
+        authorization.timestamp_utc.clone(),
+        endpoint,
+    )
+}
+
+pub async fn dispatch_regime_shift_alerts(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    axum::Json(payload): axum::Json<RegimeShiftAlertDispatchPayload>,
+) -> Response {
+    let endpoint = "/control/incidents/regime-shifts/dispatch".to_string();
+    let authorization = match authorize_incident_alert_action(
+        &state,
+        &actor,
+        &endpoint,
+        "POST",
+        "regime_shift_alert_dispatch",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+
+    let dependency_state =
+        match parse_incident_dependency_state(payload.dependency_state.as_deref()) {
+            Ok(state) => state,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    AlertReasonCode::InvalidPayload.code(),
+                    error.message,
+                    error
+                        .field_errors
+                        .into_iter()
+                        .map(|issue| AlertValidationIssue {
+                            field: issue.field,
+                            code: issue.code,
+                            message: issue.message,
+                        })
+                        .collect(),
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+    match dependency_state {
+        IncidentDependencyState::DependencyUnavailable => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::DependencyUnavailable.code(),
+                "regime-shift alert dispatch dependencies are unavailable".to_string(),
+                Vec::new(),
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::StaleEvidence => {
+            return incident_alert_service_error_response(
+                AlertReasonCode::StaleEvidence.code(),
+                "regime-shift alert dispatch evidence is stale".to_string(),
+                Vec::new(),
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        IncidentDependencyState::Healthy => {}
+    }
+
+    let base_correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(normalize_alert_identifier)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| normalize_alert_identifier(&actor.correlation_id));
+    let observed_at = payload
+        .observed_at
+        .clone()
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let issued_at = payload
+        .issued_at
+        .clone()
+        .unwrap_or_else(|| authorization.timestamp_utc.clone());
+    let market_id = payload.market_id.trim().to_ascii_lowercase();
+    let cluster_id = payload.cluster_id.trim().to_ascii_lowercase();
+    let scoped_correlation =
+        normalize_alert_identifier(&format!("{base_correlation_id}:{market_id}:{cluster_id}"));
+    let correlation_id = if scoped_correlation.len() <= 120 {
+        scoped_correlation
+    } else {
+        base_correlation_id
+    };
+
+    let previous_eligibility_state =
+        match VenueEligibilityState::parse(&payload.previous_eligibility_state) {
+            Ok(state) => state,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error
+                        .field_errors
+                        .into_iter()
+                        .map(|issue| AlertValidationIssue {
+                            field: issue.field,
+                            code: issue.code,
+                            message: issue.message,
+                        })
+                        .collect(),
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+    let current_eligibility_state =
+        match VenueEligibilityState::parse(&payload.current_eligibility_state) {
+            Ok(state) => state,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error
+                        .field_errors
+                        .into_iter()
+                        .map(|issue| AlertValidationIssue {
+                            field: issue.field,
+                            code: issue.code,
+                            message: issue.message,
+                        })
+                        .collect(),
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+
+    let previous_snapshot = MarketSnapshot {
+        market_id: market_id.clone(),
+        cluster_id: cluster_id.clone(),
+        liquidity_depth_usd: payload.previous_liquidity_depth_usd.unwrap_or(0.0),
+        spread_bps: payload.previous_spread_bps,
+        reward_score: 0.0,
+        expected_reward_bps: None,
+        maker_rebate_bps: Some(payload.previous_maker_rebate_bps),
+        expected_cost_bps: None,
+        expected_volatility_bps: None,
+        venue_eligibility_state: Some(previous_eligibility_state),
+        projected_exposure_pct_nav: payload.previous_projected_exposure_pct_nav.unwrap_or(0.0),
+        observed_at_utc: payload
+            .previous_observed_at
+            .clone()
+            .unwrap_or_else(|| observed_at.clone()),
+    };
+    let current_snapshot = MarketSnapshot {
+        market_id: market_id.clone(),
+        cluster_id: cluster_id.clone(),
+        liquidity_depth_usd: payload.current_liquidity_depth_usd.unwrap_or(0.0),
+        spread_bps: payload.current_spread_bps,
+        reward_score: 0.0,
+        expected_reward_bps: None,
+        maker_rebate_bps: Some(payload.current_maker_rebate_bps),
+        expected_cost_bps: None,
+        expected_volatility_bps: None,
+        venue_eligibility_state: Some(current_eligibility_state),
+        projected_exposure_pct_nav: payload.current_projected_exposure_pct_nav.unwrap_or(0.0),
+        observed_at_utc: observed_at.clone(),
+    };
+    let thresholds = RegimeShiftThresholds {
+        rebate_delta_bps: payload.rebate_delta_threshold_bps.unwrap_or(20.0),
+        spread_widening_bps: payload.spread_widening_threshold_bps.unwrap_or(50.0),
+    };
+    let detections = match evaluate_fr40_regime_shift(
+        &previous_snapshot,
+        &current_snapshot,
+        &correlation_id,
+        Some(&thresholds),
+    ) {
+        Ok(detections) => detections,
+        Err(error) => {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlertValidationIssue {
+                        field: issue.field,
+                        code: issue.code,
+                        message: issue.message,
+                    })
+                    .collect(),
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+    };
+    if detections.is_empty() {
+        return incident_alert_service_error_response(
+            AlertReasonCode::NoTrigger.code(),
+            "no FR40 regime-shift threshold was breached; alert dispatch not executed".to_string(),
+            Vec::new(),
+            "regime_shift_alert_dispatch",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    }
+    let Some(pool) = state.attribution_pool.as_ref() else {
+        return incident_alert_service_error_response(
+            RegimeShiftReasonCode::DependencyUnavailable.code(),
+            "regime-shift alert persistence dependency is unavailable".to_string(),
+            Vec::new(),
+            "regime_shift_alert_dispatch",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    };
+
+    let simulation_payload = IncidentAlertDispatchPayload {
+        correlation_id: Some(correlation_id.clone()),
+        issued_at: Some(issued_at.clone()),
+        observed_at: Some(observed_at.clone()),
+        impacted_subsystem: None,
+        cause: None,
+        recommended_next_action: payload.recommended_next_action.clone(),
+        evidence_link: payload.evidence_link.clone(),
+        drawdown_pct_of_daily_limit: None,
+        stream_disconnect_seconds: None,
+        reconciliation_lag_seconds: None,
+        stale_data_detected: None,
+        policy_bypass_attempt: None,
+        simulate_primary_failure: payload.simulate_primary_failure,
+        simulate_fallback_failure: payload.simulate_fallback_failure,
+        simulated_delivery_delay_seconds: payload.simulated_delivery_delay_seconds,
+        dedupe_window_seconds: payload.dedupe_window_seconds,
+        primary_channel: payload.primary_channel.clone(),
+        fallback_channel: payload.fallback_channel.clone(),
+        dependency_state: payload.dependency_state.clone(),
+    };
+    let dedupe_window_seconds = payload.dedupe_window_seconds.unwrap_or(300);
+    let mut dispatched = Vec::new();
+    let mut duplicate_suppressed_count = 0usize;
+    for detection in detections {
+        let alert_reason = match map_regime_reason_to_alert_reason(&detection.reason_code) {
+            Ok(reason) => reason,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        let effective_decision = AlertTriggerDecision {
+            severity: AlertSeverity::Critical,
+            reason_code: alert_reason,
+            impacted_subsystem: "market-economics".to_string(),
+            cause: regime_shift_cause(&detection),
+            recommended_next_action: payload
+                .recommended_next_action
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| regime_shift_recommended_action(alert_reason).to_string()),
+        };
+        let alert_id = match compose_alert_identifier(&correlation_id, alert_reason, &issued_at) {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        let evidence_link = payload
+            .evidence_link
+            .as_deref()
+            .unwrap_or("https://docs.example.com/operations/incentive-regime-shift-alerts")
+            .to_string();
+        let mut alert = match domain::alerts::build_incident_alert(
+            &effective_decision,
+            &alert_id,
+            &issued_at,
+            &correlation_id,
+            &evidence_link,
+            Some(&effective_decision.recommended_next_action),
+        ) {
+            Ok(alert) => alert,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        alert.cause = effective_decision.cause.clone();
+
+        let prior_alerts = match load_recent_incident_alerts(pool, 200).await {
+            Ok(alerts) => alerts,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        let should_emit = match should_emit_alert(
+            &prior_alerts,
+            alert.reason_code.as_str(),
+            &alert.correlation_id,
+            &alert.issued_at,
+            dedupe_window_seconds,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        if !should_emit {
+            duplicate_suppressed_count += 1;
+            continue;
+        }
+        let simulation = match simulate_alert_dispatch(&alert, &simulation_payload) {
+            Ok(simulation) => simulation,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        let record = RegimeShiftAlertRecord {
+            alert_id: simulation.alert.alert_id.clone(),
+            market_id: detection.market_id.clone(),
+            cluster_id: detection.cluster_id.clone(),
+            reason_code: detection.reason_code.clone(),
+            severity: AlertSeverity::Critical,
+            correlation_id: simulation.alert.correlation_id.clone(),
+            observed_at: detection.observed_at_utc.clone(),
+            issued_at: simulation.alert.issued_at.clone(),
+            dispatch_status: simulation.alert.status,
+            dispatch_reason_code: simulation.alert.reason_code.clone(),
+            recommended_next_action: simulation.alert.recommended_next_action.clone(),
+            evidence_link: simulation.alert.evidence_link.clone(),
+            previous_maker_rebate_bps: detection.previous_maker_rebate_bps,
+            current_maker_rebate_bps: detection.current_maker_rebate_bps,
+            rebate_delta_bps: detection.rebate_delta_bps,
+            previous_spread_bps: detection.previous_spread_bps,
+            current_spread_bps: detection.current_spread_bps,
+            spread_widening_bps: detection.spread_widening_bps,
+            previous_eligibility_state: detection.previous_eligibility_state,
+            current_eligibility_state: detection.current_eligibility_state,
+            threshold_rebate_delta_bps: detection.threshold_rebate_delta_bps,
+            threshold_spread_widening_bps: detection.threshold_spread_widening_bps,
+        };
+        let mut transaction = match pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return incident_alert_service_error_response(
+                    RegimeShiftReasonCode::PersistenceUnavailable.code(),
+                    format!("unable to begin regime-shift persistence transaction: {error}"),
+                    Vec::new(),
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        };
+        if let Err(error) = create_incident_alert(&mut *transaction, &alert).await {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        for attempt in &simulation.attempts {
+            if let Err(error) = append_alert_delivery_attempt(&mut *transaction, attempt).await {
+                return incident_alert_service_error_response(
+                    error.code,
+                    error.message,
+                    error.field_errors,
+                    "regime_shift_alert_dispatch",
+                    &actor,
+                    authorization.timestamp_utc.clone(),
+                    endpoint,
+                );
+            }
+        }
+        if let Err(error) = update_incident_alert_status(
+            &mut *transaction,
+            &simulation.alert.alert_id,
+            simulation.alert.status,
+            &simulation.alert.reason_code,
+            simulation.alert.delivered_at.as_deref(),
+            simulation.alert.failed_at.as_deref(),
+        )
+        .await
+        {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error.field_errors,
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        if let Err(error) = create_regime_shift_alert(&mut *transaction, &record).await {
+            return incident_alert_service_error_response(
+                error.code,
+                error.message,
+                error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlertValidationIssue {
+                        field: issue.field,
+                        code: issue.code,
+                        message: issue.message,
+                    })
+                    .collect(),
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        if let Err(error) = transaction.commit().await {
+            return incident_alert_service_error_response(
+                RegimeShiftReasonCode::PersistenceUnavailable.code(),
+                format!("unable to commit regime-shift persistence transaction: {error}"),
+                Vec::new(),
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+        if let Some((failure_code, failure_message)) = simulation.failure.clone() {
+            return incident_alert_service_error_response(
+                failure_code.code(),
+                failure_message,
+                Vec::new(),
+                "regime_shift_alert_dispatch",
+                &actor,
+                authorization.timestamp_utc.clone(),
+                endpoint,
+            );
+        }
+
+        dispatched.push(to_regime_shift_alert_dispatch_item(
+            &detection,
+            &simulation,
+            &effective_decision,
+        ));
+    }
+
+    if dispatched.is_empty() && duplicate_suppressed_count > 0 {
+        return incident_alert_service_error_response(
+            AlertReasonCode::DuplicateSuppressed.code(),
+            "duplicate regime-shift alerts were suppressed for this correlation and dedupe window"
+                .to_string(),
+            Vec::new(),
+            "regime_shift_alert_dispatch",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
+    }
+
+    regime_shift_alert_dispatch_response(
+        &state,
+        &actor,
+        dispatched,
+        duplicate_suppressed_count,
+        authorization.timestamp_utc.clone(),
+        endpoint,
+    )
+}
+
+fn map_regime_reason_to_alert_reason(
+    reason_code: &str,
+) -> Result<AlertReasonCode, AlertContractError> {
+    match RegimeShiftReasonCode::parse(reason_code) {
+        Ok(RegimeShiftReasonCode::RebateDeltaExceeded) => {
+            Ok(AlertReasonCode::RegimeRebateDeltaExceeded)
+        }
+        Ok(RegimeShiftReasonCode::SpreadWideningExceeded) => {
+            Ok(AlertReasonCode::RegimeSpreadWideningExceeded)
+        }
+        Ok(RegimeShiftReasonCode::EligibilityTransition) => {
+            Ok(AlertReasonCode::RegimeEligibilityTransition)
+        }
+        Ok(_) => Err(AlertContractError::invalid_payload_with_issues(
+            format!("unsupported FR40 regime reason code `{reason_code}` for dispatch"),
+            vec![AlertValidationIssue {
+                field: "reason_code",
+                code: AlertReasonCode::InvalidPayload.code(),
+                message: "reason_code must map to an FR40 dispatch reason".to_string(),
+            }],
+        )),
+        Err(error) => Err(AlertContractError::invalid_payload_with_issues(
+            error.message,
+            vec![AlertValidationIssue {
+                field: "reason_code",
+                code: AlertReasonCode::InvalidPayload.code(),
+                message: "reason_code must be a supported FR40 regime-shift reason".to_string(),
+            }],
+        )),
+    }
+}
+
+fn regime_shift_cause(detection: &domain::risk::RegimeShiftDetection) -> String {
+    match RegimeShiftReasonCode::parse(&detection.reason_code) {
+        Ok(RegimeShiftReasonCode::RebateDeltaExceeded) => format!(
+            "Maker rebate delta exceeded FR40 threshold: delta={}bps (> {}bps).",
+            detection.rebate_delta_bps.unwrap_or(0.0),
+            detection.threshold_rebate_delta_bps
+        ),
+        Ok(RegimeShiftReasonCode::SpreadWideningExceeded) => format!(
+            "Spread widening exceeded FR40 threshold: widening={}bps (> {}bps).",
+            detection.spread_widening_bps.unwrap_or(0.0),
+            detection.threshold_spread_widening_bps
+        ),
+        Ok(RegimeShiftReasonCode::EligibilityTransition) => format!(
+            "Venue eligibility shifted from `{}` to `{}`.",
+            detection
+                .previous_eligibility_state
+                .map(|state| state.as_str())
+                .unwrap_or("unknown"),
+            detection
+                .current_eligibility_state
+                .map(|state| state.as_str())
+                .unwrap_or("unknown")
+        ),
+        _ => "FR40 regime shift detected in venue economics.".to_string(),
+    }
+}
+
+fn regime_shift_recommended_action(reason_code: AlertReasonCode) -> &'static str {
+    match reason_code {
+        AlertReasonCode::RegimeRebateDeltaExceeded => {
+            "Review maker incentive assumptions and adjust participation weights before next cycle."
+        }
+        AlertReasonCode::RegimeSpreadWideningExceeded => {
+            "Reduce aggressive participation, confirm liquidity quality, and reassess spread budgets."
+        }
+        AlertReasonCode::RegimeEligibilityTransition => {
+            "Confirm venue eligibility constraints and move impacted markets into restricted handling."
+        }
+        _ => "Inspect FR40 evidence and execute the linked regime-shift runbook steps.",
+    }
 }
 
 struct AlertDispatchSimulation {
@@ -3831,10 +4577,14 @@ fn report_export_service_error_response(
 
 fn report_export_service_error_status(code: &str) -> StatusCode {
     match code {
-        value if value == ReportingExportReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        value if value == ReportingExportReasonCode::InvalidPayload.code() => {
+            StatusCode::BAD_REQUEST
+        }
         value if value == ReportingExportReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
         value if value == ReportingExportReasonCode::NotFound.code() => StatusCode::NOT_FOUND,
-        value if value == ReportingExportReasonCode::MissingIncidentContext.code() => StatusCode::BAD_REQUEST,
+        value if value == ReportingExportReasonCode::MissingIncidentContext.code() => {
+            StatusCode::BAD_REQUEST
+        }
         value
             if value == ReportingExportReasonCode::DependencyUnavailable.code()
                 || value == ReportingExportReasonCode::StaleEvidence.code()
@@ -6225,6 +6975,219 @@ fn attribution_service_error_status(code: &str) -> StatusCode {
     }
 }
 
+fn to_regime_shift_alert_item(alert: RegimeShiftAlertRecord) -> RegimeShiftAlertItem {
+    RegimeShiftAlertItem {
+        alert_id: alert.alert_id,
+        market_id: alert.market_id,
+        cluster_id: alert.cluster_id,
+        reason_code: alert.reason_code,
+        severity: alert.severity.as_str().to_string(),
+        correlation_id: alert.correlation_id,
+        observed_at: alert.observed_at,
+        issued_at: alert.issued_at,
+        dispatch_status: alert.dispatch_status.as_str().to_string(),
+        dispatch_reason_code: alert.dispatch_reason_code,
+        recommended_next_action: alert.recommended_next_action,
+        evidence_link: alert.evidence_link,
+        previous_maker_rebate_bps: alert.previous_maker_rebate_bps,
+        current_maker_rebate_bps: alert.current_maker_rebate_bps,
+        rebate_delta_bps: alert.rebate_delta_bps,
+        previous_spread_bps: alert.previous_spread_bps,
+        current_spread_bps: alert.current_spread_bps,
+        spread_widening_bps: alert.spread_widening_bps,
+        previous_eligibility_state: alert
+            .previous_eligibility_state
+            .map(|state| state.as_str().to_string()),
+        current_eligibility_state: alert
+            .current_eligibility_state
+            .map(|state| state.as_str().to_string()),
+        threshold_rebate_delta_bps: alert.threshold_rebate_delta_bps,
+        threshold_spread_widening_bps: alert.threshold_spread_widening_bps,
+        attempts: Vec::new(),
+        dispatch_latency_seconds: None,
+        fallback_used: None,
+    }
+}
+
+fn to_regime_shift_alert_dispatch_item(
+    detection: &domain::risk::RegimeShiftDetection,
+    simulation: &AlertDispatchSimulation,
+    _decision: &AlertTriggerDecision,
+) -> RegimeShiftAlertItem {
+    RegimeShiftAlertItem {
+        alert_id: simulation.alert.alert_id.clone(),
+        market_id: detection.market_id.clone(),
+        cluster_id: detection.cluster_id.clone(),
+        reason_code: detection.reason_code.clone(),
+        severity: simulation.alert.severity.as_str().to_string(),
+        correlation_id: simulation.alert.correlation_id.clone(),
+        observed_at: detection.observed_at_utc.clone(),
+        issued_at: simulation.alert.issued_at.clone(),
+        dispatch_status: simulation.alert.status.as_str().to_string(),
+        dispatch_reason_code: simulation.alert.reason_code.clone(),
+        recommended_next_action: simulation.alert.recommended_next_action.clone(),
+        evidence_link: simulation.alert.evidence_link.clone(),
+        previous_maker_rebate_bps: detection.previous_maker_rebate_bps,
+        current_maker_rebate_bps: detection.current_maker_rebate_bps,
+        rebate_delta_bps: detection.rebate_delta_bps,
+        previous_spread_bps: detection.previous_spread_bps,
+        current_spread_bps: detection.current_spread_bps,
+        spread_widening_bps: detection.spread_widening_bps,
+        previous_eligibility_state: detection
+            .previous_eligibility_state
+            .map(|state| state.as_str().to_string()),
+        current_eligibility_state: detection
+            .current_eligibility_state
+            .map(|state| state.as_str().to_string()),
+        threshold_rebate_delta_bps: detection.threshold_rebate_delta_bps,
+        threshold_spread_widening_bps: detection.threshold_spread_widening_bps,
+        attempts: simulation
+            .attempts
+            .iter()
+            .map(|attempt| IncidentAlertDeliveryAttemptItem {
+                attempt_number: i64::from(attempt.attempt_number),
+                channel: attempt.channel.as_str().to_string(),
+                outcome: attempt.outcome.as_str().to_string(),
+                reason_code: attempt.reason_code.clone(),
+                attempted_at: attempt.attempted_at.clone(),
+                delivered_at: attempt.delivered_at.clone(),
+                failed_at: attempt.failed_at.clone(),
+            })
+            .collect(),
+        dispatch_latency_seconds: Some(simulation.dispatch_latency_seconds),
+        fallback_used: Some(simulation.fallback_used),
+    }
+}
+
+fn regime_shift_alert_query_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    alerts: Vec<RegimeShiftAlertItem>,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let data_state = if alerts.is_empty() { "empty" } else { "ready" };
+    let reason_code = if alerts.is_empty() {
+        AlertReasonCode::NoTrigger.code().to_string()
+    } else {
+        AlertReasonCode::Ready.code().to_string()
+    };
+    let recommended_next_action = if alerts.is_empty() {
+        "No active FR40 regime-shift evidence rows. Continue monitoring venue economics."
+            .to_string()
+    } else {
+        "Review FR40 reason codes, confirm market/cluster impact, and execute runbook guidance."
+            .to_string()
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "regime_shift_alerts_query".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "GET",
+            "alert_count": alerts.len(),
+            "data_state": data_state,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "regime_shift_alerts_query".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(RegimeShiftAlertsQueryResponse {
+            status: "accepted",
+            action: "regime_shift_alerts_query".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            source: "control-api.regime-shift-alerts.v1".to_string(),
+            reason_code,
+            data_state: data_state.to_string(),
+            recommended_next_action,
+            alerts,
+        }),
+    )
+        .into_response()
+}
+
+fn regime_shift_alert_dispatch_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    alerts: Vec<RegimeShiftAlertItem>,
+    duplicate_suppressed_count: usize,
+    timestamp_utc: String,
+    endpoint: String,
+) -> Response {
+    let reason_code = if duplicate_suppressed_count > 0 && alerts.is_empty() {
+        AlertReasonCode::DuplicateSuppressed.code().to_string()
+    } else if alerts.is_empty() {
+        AlertReasonCode::NoTrigger.code().to_string()
+    } else {
+        AlertReasonCode::Ready.code().to_string()
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: "regime_shift_alert_dispatch".to_string(),
+        parameters: json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+            "emitted_alert_count": alerts.len(),
+            "duplicate_suppressed_count": duplicate_suppressed_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code: reason_code.clone(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: actor.correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            "regime_shift_alert_dispatch".to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            actor.correlation_id.clone(),
+            timestamp_utc.clone(),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(RegimeShiftAlertDispatchResponse {
+            status: "accepted",
+            action: "regime_shift_alert_dispatch".to_string(),
+            actor_id: actor.actor_id.clone(),
+            role: actor.role.clone(),
+            correlation_id: actor.correlation_id.clone(),
+            timestamp_utc,
+            source: "control-api.regime-shift-alerts.v1".to_string(),
+            reason_code,
+            duplicate_suppressed_count,
+            alerts,
+        }),
+    )
+        .into_response()
+}
+
 fn incident_alert_query_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -6446,6 +7409,7 @@ fn incident_alert_service_error_status(code: &str) -> StatusCode {
     match code {
         code if code == AlertReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
         code if code == AlertReasonCode::NoTrigger.code() => StatusCode::BAD_REQUEST,
+        code if code == RegimeShiftReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
         code if code == AlertReasonCode::Unauthorized.code() => StatusCode::FORBIDDEN,
         code if code == AlertReasonCode::DuplicateSuppressed.code() => StatusCode::CONFLICT,
         code if code == AlertReasonCode::DependencyUnavailable.code()
@@ -6453,11 +7417,16 @@ fn incident_alert_service_error_status(code: &str) -> StatusCode {
             || code == AlertReasonCode::DeliveryPrimaryFailed.code()
             || code == AlertReasonCode::DeliveryFallbackFailed.code()
             || code == AlertReasonCode::DeliverySlaBreached.code()
+            || code == RegimeShiftReasonCode::DependencyUnavailable.code()
+            || code == RegimeShiftReasonCode::PersistenceUnavailable.code()
+            || code == "regime_shift_query_failed"
+            || code == "regime_shift_row_decode_failed"
             || code == "alert_query_failed"
             || code == "alert_row_decode_failed" =>
         {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        "regime_shift_constraint_violation" => StatusCode::CONFLICT,
         "alert_constraint_violation" => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -7631,6 +8600,74 @@ pub struct IncidentAlertsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RegimeShiftAlertsQuery {
+    #[serde(default)]
+    pub market_id: Option<String>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub start_ts: Option<String>,
+    #[serde(default)]
+    pub end_ts: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub dependency_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegimeShiftAlertDispatchPayload {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub issued_at: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub previous_maker_rebate_bps: f64,
+    pub current_maker_rebate_bps: f64,
+    pub previous_spread_bps: f64,
+    pub current_spread_bps: f64,
+    pub previous_eligibility_state: String,
+    pub current_eligibility_state: String,
+    #[serde(default)]
+    pub previous_observed_at: Option<String>,
+    #[serde(default)]
+    pub previous_liquidity_depth_usd: Option<f64>,
+    #[serde(default)]
+    pub current_liquidity_depth_usd: Option<f64>,
+    #[serde(default)]
+    pub previous_projected_exposure_pct_nav: Option<f64>,
+    #[serde(default)]
+    pub current_projected_exposure_pct_nav: Option<f64>,
+    #[serde(default)]
+    pub rebate_delta_threshold_bps: Option<f64>,
+    #[serde(default)]
+    pub spread_widening_threshold_bps: Option<f64>,
+    #[serde(default)]
+    pub recommended_next_action: Option<String>,
+    #[serde(default)]
+    pub evidence_link: Option<String>,
+    #[serde(default)]
+    pub simulate_primary_failure: Option<bool>,
+    #[serde(default)]
+    pub simulate_fallback_failure: Option<bool>,
+    #[serde(default)]
+    pub simulated_delivery_delay_seconds: Option<i64>,
+    #[serde(default)]
+    pub dedupe_window_seconds: Option<i64>,
+    #[serde(default)]
+    pub primary_channel: Option<String>,
+    #[serde(default)]
+    pub fallback_channel: Option<String>,
+    #[serde(default)]
+    pub dependency_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct IncidentAlertDispatchPayload {
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -8054,6 +9091,74 @@ pub struct AttributionFieldError {
     pub field: String,
     pub code: String,
     pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegimeShiftAlertsQueryResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub data_state: String,
+    pub recommended_next_action: String,
+    pub alerts: Vec<RegimeShiftAlertItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegimeShiftAlertDispatchResponse {
+    pub status: &'static str,
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub source: String,
+    pub reason_code: String,
+    pub duplicate_suppressed_count: usize,
+    pub alerts: Vec<RegimeShiftAlertItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegimeShiftAlertItem {
+    pub alert_id: String,
+    pub market_id: String,
+    pub cluster_id: String,
+    pub reason_code: String,
+    pub severity: String,
+    pub correlation_id: String,
+    pub observed_at: String,
+    pub issued_at: String,
+    pub dispatch_status: String,
+    pub dispatch_reason_code: String,
+    pub recommended_next_action: String,
+    pub evidence_link: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_maker_rebate_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_maker_rebate_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebate_delta_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_spread_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_spread_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spread_widening_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_eligibility_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_eligibility_state: Option<String>,
+    pub threshold_rebate_delta_bps: f64,
+    pub threshold_spread_widening_bps: f64,
+    pub attempts: Vec<IncidentAlertDeliveryAttemptItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_latency_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_used: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -15039,6 +16144,126 @@ mod tests {
         .expect("payload should be valid json");
         assert_eq!(payload["error_code"], "alert_unauthorized");
         assert_eq!(payload["action"], "incident_alerts_query");
+    }
+
+    #[tokio::test]
+    async fn regime_shift_dispatch_route_fails_closed_when_persistence_dependency_is_unavailable() {
+        let correlation_id = unique_correlation_id("corr-regime-shift-dispatch");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/regime-shifts/dispatch")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", correlation_id.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "market_id": "market_yes_no_1",
+                            "cluster_id": "cluster_alpha",
+                            "previous_maker_rebate_bps": 8.0,
+                            "current_maker_rebate_bps": 30.5,
+                            "previous_spread_bps": 82.0,
+                            "current_spread_bps": 138.5,
+                            "previous_eligibility_state": "eligible",
+                            "current_eligibility_state": "restricted",
+                            "evidence_link": "https://docs.example.com/operations/incentive-regime-shift-alerts#fr40"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["action"], "regime_shift_alert_dispatch");
+        assert_eq!(
+            payload["error_code"],
+            RegimeShiftReasonCode::DependencyUnavailable.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn regime_shift_dispatch_route_rejects_boundary_non_trigger_payloads() {
+        let correlation_id = unique_correlation_id("corr-regime-shift-boundary");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/regime-shifts/dispatch")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", correlation_id.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "market_id": "market_yes_no_1",
+                            "cluster_id": "cluster_alpha",
+                            "previous_maker_rebate_bps": 10.0,
+                            "current_maker_rebate_bps": 30.0,
+                            "previous_spread_bps": 100.0,
+                            "current_spread_bps": 150.0,
+                            "previous_eligibility_state": "eligible",
+                            "current_eligibility_state": "eligible"
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["error_code"], "alert_no_trigger");
+        assert_eq!(payload["action"], "regime_shift_alert_dispatch");
+    }
+
+    #[tokio::test]
+    async fn regime_shift_query_route_fails_closed_when_persistence_dependency_is_unavailable() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/incidents/regime-shifts?market_id=market_yes_no_1&limit=10")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-regime-shift-query-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["action"], "regime_shift_alerts_query");
+        assert_eq!(
+            payload["error_code"],
+            RegimeShiftReasonCode::DependencyUnavailable.code()
+        );
     }
 
     #[tokio::test]

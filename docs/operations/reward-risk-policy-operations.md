@@ -57,3 +57,8 @@ Operational guardrails:
    Remediation: preserve fail-closed posture, escalate platform on-call, and retry after persistence recovers.
 4. **Runtime scoring/policy unavailable** (`pretrade_reward_risk_state_unavailable`)  
    Remediation: verify market snapshot FR39 fields are populated, verify policy read endpoint, and confirm risk-engine bootstrap hydration from `reward_risk_policies`.
+
+## Cross-runbook links
+
+1. Incentive regime-shift alerts (FR40): `docs/operations/incentive-regime-shift-alerts.md`
+2. Severity alert delivery and fallback (Story 3.6): `docs/operations/severity-alert-delivery.md`

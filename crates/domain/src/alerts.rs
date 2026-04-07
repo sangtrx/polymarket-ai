@@ -126,6 +126,9 @@ pub enum AlertReasonCode {
     ReconciliationLagExceeded,
     StaleDataDetected,
     PolicyBypassAttempt,
+    RegimeRebateDeltaExceeded,
+    RegimeSpreadWideningExceeded,
+    RegimeEligibilityTransition,
     DeliveryPrimaryFailed,
     DeliveryFallbackFailed,
     DeliverySlaBreached,
@@ -146,6 +149,9 @@ impl AlertReasonCode {
             Self::ReconciliationLagExceeded => "alert_reconciliation_lag_exceeded",
             Self::StaleDataDetected => "alert_stale_data_detected",
             Self::PolicyBypassAttempt => "alert_policy_bypass_attempt",
+            Self::RegimeRebateDeltaExceeded => "alert_regime_rebate_delta_exceeded",
+            Self::RegimeSpreadWideningExceeded => "alert_regime_spread_widening_exceeded",
+            Self::RegimeEligibilityTransition => "alert_regime_eligibility_transition",
             Self::DeliveryPrimaryFailed => "alert_delivery_primary_failed",
             Self::DeliveryFallbackFailed => "alert_delivery_fallback_failed",
             Self::DeliverySlaBreached => "alert_delivery_sla_breached",
@@ -166,6 +172,9 @@ impl AlertReasonCode {
             "alert_reconciliation_lag_exceeded" => Ok(Self::ReconciliationLagExceeded),
             "alert_stale_data_detected" => Ok(Self::StaleDataDetected),
             "alert_policy_bypass_attempt" => Ok(Self::PolicyBypassAttempt),
+            "alert_regime_rebate_delta_exceeded" => Ok(Self::RegimeRebateDeltaExceeded),
+            "alert_regime_spread_widening_exceeded" => Ok(Self::RegimeSpreadWideningExceeded),
+            "alert_regime_eligibility_transition" => Ok(Self::RegimeEligibilityTransition),
             "alert_delivery_primary_failed" => Ok(Self::DeliveryPrimaryFailed),
             "alert_delivery_fallback_failed" => Ok(Self::DeliveryFallbackFailed),
             "alert_delivery_sla_breached" => Ok(Self::DeliverySlaBreached),
@@ -884,11 +893,26 @@ mod tests {
     }
 
     #[test]
-    fn alert_reason_code_parse_accepts_fr29_and_delivery_codes() {
+    fn alert_reason_code_parse_accepts_fr29_fr40_and_delivery_codes() {
         assert_eq!(
             AlertReasonCode::parse("alert_policy_bypass_attempt")
                 .expect("policy bypass reason should parse"),
             AlertReasonCode::PolicyBypassAttempt
+        );
+        assert_eq!(
+            AlertReasonCode::parse("alert_regime_rebate_delta_exceeded")
+                .expect("FR40 rebate shift reason should parse"),
+            AlertReasonCode::RegimeRebateDeltaExceeded
+        );
+        assert_eq!(
+            AlertReasonCode::parse("alert_regime_spread_widening_exceeded")
+                .expect("FR40 spread shift reason should parse"),
+            AlertReasonCode::RegimeSpreadWideningExceeded
+        );
+        assert_eq!(
+            AlertReasonCode::parse("alert_regime_eligibility_transition")
+                .expect("FR40 eligibility transition reason should parse"),
+            AlertReasonCode::RegimeEligibilityTransition
         );
         assert_eq!(
             AlertReasonCode::parse("alert_delivery_primary_failed")

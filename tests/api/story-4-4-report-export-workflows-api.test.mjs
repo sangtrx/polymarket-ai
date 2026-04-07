@@ -36,7 +36,7 @@ test("Story 4.4 report export endpoints preserve canonical envelope and machine 
   assert.match(routes, /ReportExportEnvelopeError/);
   assert.match(
     routes,
-    /ReportingExportReasonCode::InvalidPayload\.code\(\)\s*=>\s*StatusCode::BAD_REQUEST/,
+    /ReportingExportReasonCode::InvalidPayload\.code\(\)\s*=>\s*\{?\s*StatusCode::BAD_REQUEST/,
   );
   assert.match(
     routes,
@@ -70,7 +70,10 @@ test("Story 4.4 export read handlers preserve correlation precedence and fail-cl
     routes,
     /report_export_artifact_response\([\s\S]*effective_correlation_id,\s*authorization\.timestamp_utc,\s*\)/,
   );
-  assert.match(routes, /ReportingExportReasonCode::MissingIncidentContext\.code\(\)\s*=>\s*StatusCode::BAD_REQUEST/);
+  assert.match(
+    routes,
+    /ReportingExportReasonCode::MissingIncidentContext\.code\(\)\s*=>\s*\{?\s*StatusCode::BAD_REQUEST/,
+  );
   assert.match(routes, /ReportingExportReasonCode::ArtifactUnavailable\.code\(\)/);
   assert.match(routes, /StatusCode::CONFLICT/);
 });

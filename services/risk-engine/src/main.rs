@@ -10,7 +10,8 @@ use domain::recovery::{
 };
 use domain::risk::{
     EmergencyControlMode, MarketPolicyReasonCode, MarketSnapshot, PreTradeReasonCode,
-    RewardRiskScoreInput, RiskLimitReasonCode, compute_reward_per_risk_score,
+    RewardRiskScoreInput, RiskLimitReasonCode, VenueEligibilityState,
+    compute_reward_per_risk_score,
 };
 use persistence::postgres::freshness_gate::load_latest_freshness_gate_event;
 use persistence::postgres::market_policy::{
@@ -533,9 +534,25 @@ fn load_market_snapshot_from_env(config: &BootstrapRuntimeConfig) -> Option<Mark
         maker_rebate_bps,
         expected_cost_bps,
         expected_volatility_bps,
+        venue_eligibility_state: load_market_eligibility_state_from_env(),
         projected_exposure_pct_nav,
         observed_at_utc,
     })
+}
+
+fn load_market_eligibility_state_from_env() -> Option<VenueEligibilityState> {
+    let raw = std::env::var("RISK_ENGINE_BOOTSTRAP_MARKET_ELIGIBILITY_STATE").ok()?;
+    match VenueEligibilityState::parse(raw.trim()) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            println!(
+                "risk-engine bootstrap ignored unsupported market eligibility state `{}`: {}",
+                raw.trim(),
+                error.message
+            );
+            None
+        }
+    }
 }
 
 fn load_drawdown_state_from_env() -> Option<gates::RuntimeDrawdownState> {

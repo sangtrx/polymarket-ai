@@ -11,10 +11,11 @@ use domain::risk::{
     FreshnessGateReasonCode, MarketClusterOverride, MarketEligibilityOutcome, MarketPolicyProfile,
     MarketPolicyReasonCode, MarketSnapshot, MarketStreamHealthStatus, PreTradeDecisionOutcome,
     PreTradeGateDecision, PreTradeGateDimension, PreTradeGateResult, PreTradeReasonCode,
-    RewardRiskPolicy, UserStreamReasonCode, adjudicate_pretrade_gate_results,
-    assess_market_stream_health, compute_reward_per_risk_score, drawdown_stop_triggered,
-    evaluate_market_eligibility, reward_risk_score_input_from_snapshot,
-    reward_risk_threshold_for_policy, validate_reward_risk_policy,
+    RegimeShiftContractError, RegimeShiftDetection, RewardRiskPolicy, UserStreamReasonCode,
+    adjudicate_pretrade_gate_results, assess_market_stream_health, compute_reward_per_risk_score,
+    drawdown_stop_triggered, evaluate_fr40_regime_shift, evaluate_market_eligibility,
+    reward_risk_score_input_from_snapshot, reward_risk_threshold_for_policy,
+    validate_reward_risk_policy,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -121,6 +122,8 @@ pub struct InMemoryRuntimePolicyState {
     market_snapshots: Arc<RwLock<BTreeMap<String, MarketSnapshot>>>,
     market_policy_profiles: Arc<RwLock<BTreeMap<String, MarketPolicyProfile>>>,
     reward_risk_policies: Arc<RwLock<BTreeMap<String, RewardRiskPolicy>>>,
+    regime_shift_detections: Arc<RwLock<Vec<RegimeShiftDetection>>>,
+    regime_shift_error: Arc<RwLock<Option<RegimeShiftContractError>>>,
 }
 
 impl InMemoryRuntimePolicyState {
@@ -212,10 +215,51 @@ impl InMemoryRuntimePolicyState {
     }
 
     pub fn upsert_market_snapshot(&self, snapshot: MarketSnapshot) {
+        let market_key = snapshot.market_id.trim().to_ascii_lowercase();
+        let previous_snapshot = self
+            .market_snapshots
+            .read()
+            .expect("market snapshot runtime map should not be poisoned")
+            .get(&market_key)
+            .cloned();
         self.market_snapshots
             .write()
             .expect("market snapshot runtime map should not be poisoned")
-            .insert(snapshot.market_id.trim().to_ascii_lowercase(), snapshot);
+            .insert(market_key.clone(), snapshot.clone());
+
+        let Some(previous_snapshot) = previous_snapshot else {
+            *self
+                .regime_shift_error
+                .write()
+                .expect("regime-shift runtime error state should not be poisoned") = None;
+            return;
+        };
+        let correlation_id = format!("runtime-regime-shift-{market_key}");
+        match evaluate_fr40_regime_shift(&previous_snapshot, &snapshot, &correlation_id, None) {
+            Ok(mut detections) => {
+                if !detections.is_empty() {
+                    self.regime_shift_detections
+                        .write()
+                        .expect("regime-shift detection buffer should not be poisoned")
+                        .append(&mut detections);
+                }
+                *self
+                    .regime_shift_error
+                    .write()
+                    .expect("regime-shift runtime error state should not be poisoned") = None;
+            }
+            Err(error) => {
+                println!(
+                    "risk-engine FR40 regime-shift detection failed closed: {} ({})",
+                    error.code, error.message
+                );
+                *self
+                    .regime_shift_error
+                    .write()
+                    .expect("regime-shift runtime error state should not be poisoned") =
+                    Some(error);
+            }
+        }
     }
 
     pub fn upsert_market_policy_profile(&self, profile: MarketPolicyProfile) {
@@ -230,6 +274,23 @@ impl InMemoryRuntimePolicyState {
             .write()
             .expect("reward-risk runtime map should not be poisoned")
             .insert(policy.policy_key.trim().to_ascii_lowercase(), policy);
+    }
+
+    pub fn take_regime_shift_detections(&self) -> Vec<RegimeShiftDetection> {
+        let mut detections = self
+            .regime_shift_detections
+            .write()
+            .expect("regime-shift detection buffer should not be poisoned");
+        let drained = detections.clone();
+        detections.clear();
+        drained
+    }
+
+    pub fn latest_regime_shift_error(&self) -> Option<RegimeShiftContractError> {
+        self.regime_shift_error
+            .read()
+            .expect("regime-shift runtime error state should not be poisoned")
+            .clone()
     }
 }
 
@@ -1319,8 +1380,8 @@ mod tests {
     use domain::risk::{
         EmergencyControlReasonCode, EmergencyControlTriggerSource, MarketPolicyProfile,
         MarketSnapshot, PreTradeDecisionOutcome, PreTradeGateDimension, PreTradeReasonCode,
-        RewardRiskPolicy, RiskLimitProfileStatus, RiskLimitProfileVersion, RiskLimitReasonCode,
-        RiskLimitScope, RiskScopeLimit,
+        RegimeShiftReasonCode, RewardRiskPolicy, RiskLimitProfileStatus, RiskLimitProfileVersion,
+        RiskLimitReasonCode, RiskLimitScope, RiskScopeLimit, VenueEligibilityState,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -1429,6 +1490,7 @@ mod tests {
             maker_rebate_bps: Some(0.1),
             expected_cost_bps: Some(0.2),
             expected_volatility_bps: Some(1.0),
+            venue_eligibility_state: Some(VenueEligibilityState::Eligible),
             projected_exposure_pct_nav: 12.0,
             observed_at_utc: "2026-04-06T00:00:00Z".to_string(),
         }
@@ -1869,6 +1931,80 @@ mod tests {
         assert_eq!(
             emergency_signal.reason_code,
             EmergencyControlReasonCode::ControlUncertaintyTriggered.code()
+        );
+    }
+
+    #[test]
+    fn runtime_market_snapshot_upsert_detects_fr40_regime_shift_candidates() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        let mut baseline = sample_market_snapshot();
+        baseline.maker_rebate_bps = Some(5.0);
+        baseline.spread_bps = 80.0;
+        baseline.venue_eligibility_state = Some(VenueEligibilityState::Eligible);
+        runtime_state.upsert_market_snapshot(baseline);
+
+        let mut shifted = sample_market_snapshot();
+        shifted.maker_rebate_bps = Some(31.5);
+        shifted.spread_bps = 135.0;
+        shifted.venue_eligibility_state = Some(VenueEligibilityState::Restricted);
+        shifted.observed_at_utc = "2026-04-06T00:01:00Z".to_string();
+        runtime_state.upsert_market_snapshot(shifted);
+
+        let detections = runtime_state.take_regime_shift_detections();
+        let reason_codes: Vec<&str> = detections
+            .iter()
+            .map(|detection| detection.reason_code.as_str())
+            .collect();
+        assert!(reason_codes.contains(&RegimeShiftReasonCode::RebateDeltaExceeded.code()));
+        assert!(reason_codes.contains(&RegimeShiftReasonCode::SpreadWideningExceeded.code()));
+        assert!(reason_codes.contains(&RegimeShiftReasonCode::EligibilityTransition.code()));
+    }
+
+    #[test]
+    fn runtime_market_snapshot_upsert_honors_strict_fr40_boundaries() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        let mut baseline = sample_market_snapshot();
+        baseline.maker_rebate_bps = Some(10.0);
+        baseline.spread_bps = 100.0;
+        baseline.venue_eligibility_state = Some(VenueEligibilityState::Eligible);
+        runtime_state.upsert_market_snapshot(baseline);
+
+        let mut boundary = sample_market_snapshot();
+        boundary.maker_rebate_bps = Some(30.0);
+        boundary.spread_bps = 150.0;
+        boundary.venue_eligibility_state = Some(VenueEligibilityState::Eligible);
+        boundary.observed_at_utc = "2026-04-06T00:02:00Z".to_string();
+        runtime_state.upsert_market_snapshot(boundary);
+
+        let detections = runtime_state.take_regime_shift_detections();
+        assert!(
+            detections.is_empty(),
+            "exact +20 rebate delta and +50 spread widening must not emit FR40 detections"
+        );
+    }
+
+    #[test]
+    fn runtime_market_snapshot_upsert_records_fail_closed_regime_shift_errors() {
+        let runtime_state = InMemoryRuntimePolicyState::default();
+        let mut baseline = sample_market_snapshot();
+        baseline.maker_rebate_bps = Some(10.0);
+        baseline.spread_bps = 100.0;
+        baseline.venue_eligibility_state = Some(VenueEligibilityState::Eligible);
+        runtime_state.upsert_market_snapshot(baseline);
+
+        let mut missing = sample_market_snapshot();
+        missing.maker_rebate_bps = None;
+        missing.spread_bps = 180.0;
+        missing.venue_eligibility_state = Some(VenueEligibilityState::Restricted);
+        missing.observed_at_utc = "2026-04-06T00:03:00Z".to_string();
+        runtime_state.upsert_market_snapshot(missing);
+
+        let error = runtime_state
+            .latest_regime_shift_error()
+            .expect("missing required economics inputs should fail closed");
+        assert_eq!(
+            error.code,
+            RegimeShiftReasonCode::DependencyUnavailable.code()
         );
     }
 

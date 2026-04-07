@@ -646,3 +646,34 @@
 - `cargo test -p risk-engine gates::tests::order_intent_gate_with_limit_state_` ✅
 - `node --test tests/api/story-5-1*.test.mjs tests/e2e/story-5-1*.test.mjs` ✅
 - `npm run --silent qa:test:story-5-1` ✅
+
+---
+
+## Story 5.2 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/risk.rs` (`risk::tests::fr40_`) — validates strict FR40 threshold boundaries (`> 20`, `> 50`), multi-reason detection emission, and fail-closed dependency-unavailable behavior.
+- [x] `crates/domain/src/alerts.rs` (`alerts::tests::alert_reason_code_parse_accepts_fr29_fr40_and_delivery_codes`) — validates FR40 alert reason taxonomy parsing continuity with existing Story 3.6 reason codes.
+- [x] `crates/persistence/src/postgres/regime_shift_alerts.rs` (`postgres::regime_shift_alerts::tests::`) — validates migration scope boundaries, triage index contracts, deterministic query ordering, and machine-readable adapter validation denials.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::regime_shift_`) — validates authenticated FR40 query/dispatch routes, fail-closed persistence-dependency behavior, and strict boundary non-trigger behavior.
+- [x] `services/risk-engine/src/gates/mod.rs` (`gates::tests::runtime_market_snapshot_upsert_`) — validates runtime snapshot baseline comparisons, strict-boundary non-trigger handling, and fail-closed runtime error capture for FR40 evaluation.
+- [x] `tests/api/story-5-2-regime-shift-alerts-api.test.mjs` — validates route wiring, actionability payload/evidence contracts (`recommended_next_action`, `evidence_link`), dedupe/fallback dispatch seam reuse, and FR40/persistence error-status mapping continuity.
+- [x] `tests/e2e/story-5-2-regime-shift-alerts-gating.e2e.test.mjs` — validates risk-engine/control-api FR40 composition seams, actionability field continuity, and operator runbook/cross-link coverage.
+
+### Coverage
+
+- Story 5.2 now has deterministic automated coverage for:
+  - FR40 rebate/spread strict-threshold and eligibility-transition regime detection contracts,
+  - `regime_shift_alerts` migration/adapter persistence behavior with deterministic retrieval ordering,
+  - control-plane authenticated dispatch/retrieval behavior with machine-readable failure mapping and audit continuity,
+  - runtime snapshot-based FR40 evaluation integration while preserving existing pre-trade composition seams,
+  - Story 5.2 API/E2E static regression coverage for route contracts, actionability payload/evidence fields, dedupe/fallback seam reuse, and operations runbook continuity.
+- Automated Story 5.2 regression inventory in this QA refresh: **24 Story-5.2 tests passing** (`domain: 5`, `persistence: 6`, `control-api: 3`, `risk-engine: 3`, `api/e2e: 7`).
+
+### Execution Result
+
+- `npm run --silent qa:test:story-5-2` ✅
+- `npm run --silent rust:test` ✅
+- `npm run --silent test` ✅
+- `npm run --silent qa:test:story-5-2` ✅ (re-run after API/E2E actionability-field coverage refresh)
