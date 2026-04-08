@@ -33,11 +33,14 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
       content: (
         <section className="shell-panel-grid">
           <PortfolioSummaryCard freshness={stateModel.freshness} />
-          <ExecutionSummaryCard freshness={stateModel.freshness} />
-          <GovernanceQueueCard freshness={stateModel.freshness} />
-          <IncidentTimelineCard
-            baseUrl={apiBaseUrl}
-            freshness={stateModel.freshness}
+           <ExecutionSummaryCard freshness={stateModel.freshness} />
+           <GovernanceQueueCard
+             baseUrl={apiBaseUrl}
+             freshness={stateModel.freshness}
+           />
+           <IncidentTimelineCard
+             baseUrl={apiBaseUrl}
+             freshness={stateModel.freshness}
           />
           <IncidentAlertsPanel
             baseUrl={apiBaseUrl}

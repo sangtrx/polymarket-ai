@@ -1,40 +1,8 @@
-import type { ShellFreshnessSnapshot } from "@/lib/shell/read-models";
+import {
+  AlphaGovernanceReadinessCard,
+  type AlphaGovernanceReadinessCardProps,
+} from "@/components/governance/AlphaGovernanceReadinessCard";
 
-export function GovernanceQueueCard({
-  freshness,
-}: {
-  freshness: ShellFreshnessSnapshot;
-}) {
-  return (
-    <article className="shell-panel shell-panel-grid-item">
-      <div className="shell-panel-header">
-        <p className="type-eyebrow">Governance</p>
-        <span className="shell-status-pill" data-tone="locked-safe">
-          locked-safe
-        </span>
-      </div>
-
-      <h2 className="type-heading-m">Approval queue shell slot</h2>
-      <p className="type-body text-muted">
-        Read-only shell placeholder for policy-gated privileged action
-        requests.
-      </p>
-
-      <dl className="shell-metric-grid">
-        <div>
-          <dt className="type-metadata">Pending approvals</dt>
-          <dd className="type-mono">4</dd>
-        </div>
-        <div>
-          <dt className="type-metadata">Oldest request age</dt>
-          <dd className="type-mono">00:12:18</dd>
-        </div>
-      </dl>
-
-      <p className="type-metadata text-muted">
-        Last update:{" "}
-        <time dateTime={freshness.lastUpdatedIso}>{freshness.lastUpdatedIso}</time>
-      </p>
-    </article>
-  );
+export function GovernanceQueueCard(props: AlphaGovernanceReadinessCardProps) {
+  return <AlphaGovernanceReadinessCard {...props} />;
 }

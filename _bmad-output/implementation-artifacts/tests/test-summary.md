@@ -948,3 +948,27 @@
 
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-7` ✅
 - `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-7` ✅ (2026-04-08 03:14:32 QA refresh with expanded breach DTO + boundary/alert contract checks)
+
+---
+
+## Story 6.8 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `tests/story-6-8/alpha-governance-readiness-card.story-6-8.test.mjs` — validates explicit card state machine contracts (`loading|ready|empty|error|critical`), metadata-first rendering order, wrapper continuity, and readiness status signaling.
+- [x] `tests/api/story-6-8-alpha-governance-readiness-api.test.mjs` — validates compiled typed governance-readiness client behavior for composed control-api reads, canonical identifier normalization, deterministic readiness derivation (including blocked missing-artifact scenarios), and fail-closed contract mismatch/transport handling.
+- [x] `tests/e2e/story-6-8-alpha-governance-readiness.e2e.test.mjs` — validates dashboard/governance route wiring continuity, readiness CSS contract classes, machine-readable blocked/error accessibility surfaces, QA command wiring, and runbook cross-link continuity.
+
+### Coverage
+
+- Story 6.8 now has deterministic automated coverage for:
+  - composed read-model query contracts across promotion decisions, shadow evaluations, validation runs/detail, alpha health metrics, and threshold breaches,
+  - deterministic lifecycle/completeness/shadow/guardrail derivation and machine-readable blocked artifact output,
+  - metadata-first card presentation, explicit state contracts, and fail-closed machine-readable error surfaces,
+  - governance shell composition continuity through `GovernanceQueueCard` compatibility wrapper and route-level base URL/freshness propagation.
+- Automated Story 6.8 regression inventory in this QA refresh: **13 Story-6.8 tests passing** (`story: 3`, `api: 5`, `e2e: 5`).
+
+### Execution Result
+
+- `npm run --silent qa:test:story-6-8` ✅ (2026-04-08 08:37:00 UTC QA refresh with blocked-readiness + fail-closed accessibility contract expansion)
+- `source "$HOME/.cargo/env" && npm test` ✅

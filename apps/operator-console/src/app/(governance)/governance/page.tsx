@@ -2,6 +2,7 @@ import { GovernanceQueueCard } from "@/components/governance/GovernanceQueueCard
 import { InPageTabs } from "@/components/shell/InPageTabs";
 import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
+import { getOperatorConsoleEnv } from "@/lib/env";
 import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
   type ShellSearchParams,
@@ -20,6 +21,7 @@ export default async function GovernancePage({
     resolvedSearchParams,
     "governance.read-model.shell",
   );
+  const { apiBaseUrl } = getOperatorConsoleEnv();
   const riskPosture = resolveRiskPostureViewModel(resolvedSearchParams, stateModel);
 
   const tabViews = [
@@ -28,7 +30,10 @@ export default async function GovernancePage({
       label: "Approvals",
       content: (
         <section className="shell-panel-grid">
-          <GovernanceQueueCard freshness={stateModel.freshness} />
+          <GovernanceQueueCard
+            baseUrl={apiBaseUrl}
+            freshness={stateModel.freshness}
+          />
           <article className="shell-panel shell-panel-grid-item">
             <p className="type-eyebrow">Control boundary</p>
             <h2 className="type-heading-m">
