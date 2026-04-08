@@ -7,10 +7,12 @@ use domain::research::{
     AlphaHealthThresholdDefinition, AlphaHealthValidationIssue, AlphaThresholdBreachRecord,
     CounterfactualReplayRunState, PromotionDecisionState, ShadowEvaluationState,
     canonicalize_alpha_health_metric_record, canonicalize_alpha_threshold_breach_record,
-    evaluate_alpha_health_thresholds, normalize_research_identifier, parse_alpha_health_utc_timestamp,
+    evaluate_alpha_health_thresholds, normalize_research_identifier,
+    parse_alpha_health_utc_timestamp,
 };
 use persistence::postgres::alpha_health_metrics::{
-    AlphaHealthPersistenceError, list_alpha_health_metrics_by_alpha as pg_list_alpha_health_metrics,
+    AlphaHealthPersistenceError,
+    list_alpha_health_metrics_by_alpha as pg_list_alpha_health_metrics,
     list_alpha_threshold_breaches_by_alpha as pg_list_alpha_threshold_breaches,
     load_alpha_health_metric as pg_load_alpha_health_metric,
     load_alpha_threshold_breach as pg_load_alpha_threshold_breach,
@@ -26,10 +28,12 @@ use persistence::postgres::incident_alerts::{
     AlertPersistenceError, create_incident_alert, load_recent_incident_alerts,
 };
 use persistence::postgres::promotion_decisions::{
-    PromotionDecisionPersistenceError, list_promotion_decisions_by_candidate as pg_list_promotion_decisions,
+    PromotionDecisionPersistenceError,
+    list_promotion_decisions_by_candidate as pg_list_promotion_decisions,
 };
 use persistence::postgres::shadow_evaluations::{
-    ShadowEvaluationPersistenceError, list_shadow_evaluations_by_candidate as pg_list_shadow_evaluations,
+    ShadowEvaluationPersistenceError,
+    list_shadow_evaluations_by_candidate as pg_list_shadow_evaluations,
 };
 use serde::Serialize;
 use sqlx::PgPool;
@@ -230,7 +234,8 @@ pub trait AlphaHealthOrchestrator: Send + Sync {
 }
 
 pub trait AlphaHealthRepositoryPort: Send + Sync {
-    fn upsert_metric(&self, metric: AlphaHealthMetricRecord) -> Result<(), AlphaHealthServiceError>;
+    fn upsert_metric(&self, metric: AlphaHealthMetricRecord)
+    -> Result<(), AlphaHealthServiceError>;
     fn upsert_metric_and_breaches(
         &self,
         metric: AlphaHealthMetricRecord,
@@ -321,7 +326,10 @@ impl AlphaHealthService {
         self
     }
 
-    pub fn with_incident_alert_port(mut self, incident_alert_port: Arc<dyn IncidentAlertPort>) -> Self {
+    pub fn with_incident_alert_port(
+        mut self,
+        incident_alert_port: Arc<dyn IncidentAlertPort>,
+    ) -> Self {
         self.incident_alert_port = incident_alert_port;
         self
     }
@@ -379,11 +387,13 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
                 }],
             ));
         }
-        let metric_id =
-            domain::research::compose_alpha_health_metric_id(&normalized_alpha_id, &input.requested_at_utc)
-                .map_err(map_contract_error)?;
-        let _requested_at =
-            parse_alpha_health_utc_timestamp(&input.requested_at_utc).map_err(map_contract_error)?;
+        let metric_id = domain::research::compose_alpha_health_metric_id(
+            &normalized_alpha_id,
+            &input.requested_at_utc,
+        )
+        .map_err(map_contract_error)?;
+        let _requested_at = parse_alpha_health_utc_timestamp(&input.requested_at_utc)
+            .map_err(map_contract_error)?;
         let _lock = self.lock_operations()?;
 
         if let Err(error) = self
@@ -515,7 +525,11 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
         emit_alpha_health_telemetry(
             "alpha_health_start_v1",
             "alpha_health_start",
-            if breaches.is_empty() { "allow" } else { "breach" },
+            if breaches.is_empty() {
+                "allow"
+            } else {
+                "breach"
+            },
             &input.actor_id,
             &metric.alpha_id,
             Some(metric.metric_id.as_str()),
@@ -562,7 +576,9 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
 
         let normalized_metric_id = normalize_research_identifier(&input.metric_id);
         let Some(metric) = self.repository.load_metric(&normalized_metric_id)? else {
-            return Err(AlphaHealthServiceError::metric_not_found(&normalized_metric_id));
+            return Err(AlphaHealthServiceError::metric_not_found(
+                &normalized_metric_id,
+            ));
         };
 
         emit_alpha_health_telemetry(
@@ -624,8 +640,10 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
             ));
         }
 
-        let normalized_after =
-            normalize_optional_timestamp("recorded_after_utc", input.recorded_after_utc.as_deref())?;
+        let normalized_after = normalize_optional_timestamp(
+            "recorded_after_utc",
+            input.recorded_after_utc.as_deref(),
+        )?;
         let normalized_before = normalize_optional_timestamp(
             "recorded_before_utc",
             input.recorded_before_utc.as_deref(),
@@ -633,10 +651,10 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
         if let (Some(recorded_after), Some(recorded_before)) =
             (normalized_after.as_deref(), normalized_before.as_deref())
         {
-            let recorded_after_ts = parse_alpha_health_utc_timestamp(recorded_after)
-                .map_err(map_contract_error)?;
-            let recorded_before_ts = parse_alpha_health_utc_timestamp(recorded_before)
-                .map_err(map_contract_error)?;
+            let recorded_after_ts =
+                parse_alpha_health_utc_timestamp(recorded_after).map_err(map_contract_error)?;
+            let recorded_before_ts =
+                parse_alpha_health_utc_timestamp(recorded_before).map_err(map_contract_error)?;
             if recorded_before_ts <= recorded_after_ts {
                 return Err(AlphaHealthServiceError::invalid_payload(
                     "recorded_before_utc must be greater than recorded_after_utc",
@@ -661,7 +679,10 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
                 }],
             ));
         }
-        let limit = input.limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .clamp(1, MAX_LIST_LIMIT);
         let metrics = self.repository.list_metrics(
             &normalized_alpha_id,
             normalized_after.as_deref(),
@@ -712,7 +733,9 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
 
         let normalized_breach_id = normalize_research_identifier(&input.breach_id);
         let Some(breach) = self.repository.load_breach(&normalized_breach_id)? else {
-            return Err(AlphaHealthServiceError::breach_not_found(&normalized_breach_id));
+            return Err(AlphaHealthServiceError::breach_not_found(
+                &normalized_breach_id,
+            ));
         };
 
         emit_alpha_health_telemetry(
@@ -774,8 +797,10 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
             ));
         }
 
-        let normalized_after =
-            normalize_optional_timestamp("breached_after_utc", input.breached_after_utc.as_deref())?;
+        let normalized_after = normalize_optional_timestamp(
+            "breached_after_utc",
+            input.breached_after_utc.as_deref(),
+        )?;
         let normalized_before = normalize_optional_timestamp(
             "breached_before_utc",
             input.breached_before_utc.as_deref(),
@@ -783,10 +808,10 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
         if let (Some(breached_after), Some(breached_before)) =
             (normalized_after.as_deref(), normalized_before.as_deref())
         {
-            let breached_after_ts = parse_alpha_health_utc_timestamp(breached_after)
-                .map_err(map_contract_error)?;
-            let breached_before_ts = parse_alpha_health_utc_timestamp(breached_before)
-                .map_err(map_contract_error)?;
+            let breached_after_ts =
+                parse_alpha_health_utc_timestamp(breached_after).map_err(map_contract_error)?;
+            let breached_before_ts =
+                parse_alpha_health_utc_timestamp(breached_before).map_err(map_contract_error)?;
             if breached_before_ts <= breached_after_ts {
                 return Err(AlphaHealthServiceError::invalid_payload(
                     "breached_before_utc must be greater than breached_after_utc",
@@ -811,7 +836,10 @@ impl AlphaHealthOrchestrator for AlphaHealthService {
                 }],
             ));
         }
-        let limit = input.limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .clamp(1, MAX_LIST_LIMIT);
         let breaches = self.repository.list_breaches(
             &normalized_alpha_id,
             normalized_after.as_deref(),
@@ -1014,7 +1042,10 @@ impl PostgresAlphaHealthRepository {
 }
 
 impl AlphaHealthRepositoryPort for PostgresAlphaHealthRepository {
-    fn upsert_metric(&self, metric: AlphaHealthMetricRecord) -> Result<(), AlphaHealthServiceError> {
+    fn upsert_metric(
+        &self,
+        metric: AlphaHealthMetricRecord,
+    ) -> Result<(), AlphaHealthServiceError> {
         self.run_future(pg_upsert_alpha_health_metric(&self.pool, &metric))
     }
 
@@ -1024,9 +1055,7 @@ impl AlphaHealthRepositoryPort for PostgresAlphaHealthRepository {
         breaches: Vec<AlphaThresholdBreachRecord>,
     ) -> Result<(), AlphaHealthServiceError> {
         self.run_future(pg_upsert_alpha_health_metric_with_breaches(
-            &self.pool,
-            &metric,
-            &breaches,
+            &self.pool, &metric, &breaches,
         ))
     }
 
@@ -1084,7 +1113,9 @@ impl AlphaHealthRepositoryPort for PostgresAlphaHealthRepository {
     }
 }
 
-fn map_alpha_health_persistence_error(error: AlphaHealthPersistenceError) -> AlphaHealthServiceError {
+fn map_alpha_health_persistence_error(
+    error: AlphaHealthPersistenceError,
+) -> AlphaHealthServiceError {
     match error.code {
         "alpha_health_query_failed" | "alpha_health_row_decode_failed" => {
             AlphaHealthServiceError::persistence_unavailable(error.message)
@@ -1170,8 +1201,9 @@ impl PostgresLiveMonitoringContextPort {
 
 impl LiveMonitoringContextPort for PostgresLiveMonitoringContextPort {
     fn ensure_live_monitoring_scope(&self, alpha_id: &str) -> Result<(), AlphaHealthServiceError> {
-        let latest_decision =
-            self.run_promotion_future(pg_list_promotion_decisions(&self.pool, alpha_id, None, None, 1))?;
+        let latest_decision = self.run_promotion_future(pg_list_promotion_decisions(
+            &self.pool, alpha_id, None, None, 1,
+        ))?;
         let Some(decision) = latest_decision.into_iter().next() else {
             return Err(AlphaHealthServiceError::state_unavailable(
                 "alpha_id must have an existing promotion decision for live monitoring",
@@ -1218,8 +1250,12 @@ fn map_promotion_decision_persistence_error(
     error: PromotionDecisionPersistenceError,
 ) -> AlphaHealthServiceError {
     match error.code {
-        "promotion_decision_query_failed" => AlphaHealthServiceError::dependency_unavailable(error.message),
-        "promotion_decision_row_decode_failed" => AlphaHealthServiceError::state_unavailable(error.message),
+        "promotion_decision_query_failed" => {
+            AlphaHealthServiceError::dependency_unavailable(error.message)
+        }
+        "promotion_decision_row_decode_failed" => {
+            AlphaHealthServiceError::state_unavailable(error.message)
+        }
         _ => AlphaHealthServiceError::invalid_payload(
             error.message,
             error
@@ -1235,7 +1271,9 @@ fn map_promotion_decision_persistence_error(
     }
 }
 
-fn map_replay_persistence_error(error: CounterfactualReplayPersistenceError) -> AlphaHealthServiceError {
+fn map_replay_persistence_error(
+    error: CounterfactualReplayPersistenceError,
+) -> AlphaHealthServiceError {
     match error.code {
         "counterfactual_replay_run_query_failed" => {
             AlphaHealthServiceError::dependency_unavailable(error.message)
@@ -1258,10 +1296,16 @@ fn map_replay_persistence_error(error: CounterfactualReplayPersistenceError) -> 
     }
 }
 
-fn map_shadow_persistence_error(error: ShadowEvaluationPersistenceError) -> AlphaHealthServiceError {
+fn map_shadow_persistence_error(
+    error: ShadowEvaluationPersistenceError,
+) -> AlphaHealthServiceError {
     match error.code {
-        "shadow_evaluation_query_failed" => AlphaHealthServiceError::dependency_unavailable(error.message),
-        "shadow_evaluation_row_decode_failed" => AlphaHealthServiceError::state_unavailable(error.message),
+        "shadow_evaluation_query_failed" => {
+            AlphaHealthServiceError::dependency_unavailable(error.message)
+        }
+        "shadow_evaluation_row_decode_failed" => {
+            AlphaHealthServiceError::state_unavailable(error.message)
+        }
         _ => AlphaHealthServiceError::invalid_payload(
             error.message,
             error
@@ -1336,7 +1380,9 @@ fn map_alert_persistence_error(error: AlertPersistenceError) -> AlphaHealthServi
     match error.code {
         "alert_query_failed" => AlphaHealthServiceError::dependency_unavailable(error.message),
         "alert_row_decode_failed" => AlphaHealthServiceError::state_unavailable(error.message),
-        "alert_constraint_violation" => AlphaHealthServiceError::persistence_unavailable(error.message),
+        "alert_constraint_violation" => {
+            AlphaHealthServiceError::persistence_unavailable(error.message)
+        }
         _ => AlphaHealthServiceError::invalid_payload(
             error.message,
             error
@@ -1412,8 +1458,12 @@ pub struct InMemoryAlphaHealthRepository {
 }
 
 impl AlphaHealthRepositoryPort for InMemoryAlphaHealthRepository {
-    fn upsert_metric(&self, metric: AlphaHealthMetricRecord) -> Result<(), AlphaHealthServiceError> {
-        let canonical = canonicalize_alpha_health_metric_record(&metric).map_err(map_contract_error)?;
+    fn upsert_metric(
+        &self,
+        metric: AlphaHealthMetricRecord,
+    ) -> Result<(), AlphaHealthServiceError> {
+        let canonical =
+            canonicalize_alpha_health_metric_record(&metric).map_err(map_contract_error)?;
         let mut metrics = self.metrics.lock().map_err(|_| {
             AlphaHealthServiceError::persistence_unavailable(
                 "in-memory alpha-health metric store lock poisoned",
@@ -1432,7 +1482,9 @@ impl AlphaHealthRepositoryPort for InMemoryAlphaHealthRepository {
             canonicalize_alpha_health_metric_record(&metric).map_err(map_contract_error)?;
         let canonical_breaches = breaches
             .into_iter()
-            .map(|breach| canonicalize_alpha_threshold_breach_record(&breach).map_err(map_contract_error))
+            .map(|breach| {
+                canonicalize_alpha_threshold_breach_record(&breach).map_err(map_contract_error)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut metrics = self.metrics.lock().map_err(|_| {
@@ -1466,7 +1518,9 @@ impl AlphaHealthRepositoryPort for InMemoryAlphaHealthRepository {
         metrics
             .get(&normalized_metric_id)
             .cloned()
-            .map(|record| canonicalize_alpha_health_metric_record(&record).map_err(map_contract_error))
+            .map(|record| {
+                canonicalize_alpha_health_metric_record(&record).map_err(map_contract_error)
+            })
             .transpose()
     }
 
@@ -1533,7 +1587,9 @@ impl AlphaHealthRepositoryPort for InMemoryAlphaHealthRepository {
                 }
             })
             .take(limit as usize)
-            .map(|metric| canonicalize_alpha_health_metric_record(&metric).map_err(map_contract_error))
+            .map(|metric| {
+                canonicalize_alpha_health_metric_record(&metric).map_err(map_contract_error)
+            })
             .collect()
     }
 
@@ -1541,7 +1597,8 @@ impl AlphaHealthRepositoryPort for InMemoryAlphaHealthRepository {
         &self,
         breach: AlphaThresholdBreachRecord,
     ) -> Result<(), AlphaHealthServiceError> {
-        let canonical = canonicalize_alpha_threshold_breach_record(&breach).map_err(map_contract_error)?;
+        let canonical =
+            canonicalize_alpha_threshold_breach_record(&breach).map_err(map_contract_error)?;
         let mut breaches = self.breaches.lock().map_err(|_| {
             AlphaHealthServiceError::persistence_unavailable(
                 "in-memory alpha-health breach store lock poisoned",
@@ -1564,7 +1621,9 @@ impl AlphaHealthRepositoryPort for InMemoryAlphaHealthRepository {
         breaches
             .get(&normalized_breach_id)
             .cloned()
-            .map(|record| canonicalize_alpha_threshold_breach_record(&record).map_err(map_contract_error))
+            .map(|record| {
+                canonicalize_alpha_threshold_breach_record(&record).map_err(map_contract_error)
+            })
             .transpose()
     }
 
@@ -1631,7 +1690,9 @@ impl AlphaHealthRepositoryPort for InMemoryAlphaHealthRepository {
                 }
             })
             .take(limit as usize)
-            .map(|breach| canonicalize_alpha_threshold_breach_record(&breach).map_err(map_contract_error))
+            .map(|breach| {
+                canonicalize_alpha_threshold_breach_record(&breach).map_err(map_contract_error)
+            })
             .collect()
     }
 }
@@ -1728,12 +1789,16 @@ mod tests {
             thresholds: vec![
                 AlphaHealthThresholdDefinition {
                     metric_key: AlphaHealthMetricKey::RollingSharpe,
-                    comparator: expected_alpha_health_comparator(AlphaHealthMetricKey::RollingSharpe),
+                    comparator: expected_alpha_health_comparator(
+                        AlphaHealthMetricKey::RollingSharpe,
+                    ),
                     threshold_value: 1.0,
                 },
                 AlphaHealthThresholdDefinition {
                     metric_key: AlphaHealthMetricKey::RollingDrawdown,
-                    comparator: expected_alpha_health_comparator(AlphaHealthMetricKey::RollingDrawdown),
+                    comparator: expected_alpha_health_comparator(
+                        AlphaHealthMetricKey::RollingDrawdown,
+                    ),
                     threshold_value: 0.08,
                 },
             ],
@@ -1804,8 +1869,8 @@ mod tests {
 
     #[test]
     fn alpha_health_start_fails_closed_when_live_context_is_unavailable() {
-        let service =
-            AlphaHealthService::default().with_live_monitoring_context_port(Arc::new(FailingContextPort));
+        let service = AlphaHealthService::default()
+            .with_live_monitoring_context_port(Arc::new(FailingContextPort));
         let error = service
             .start_alpha_health_metric(sample_start_input())
             .expect_err("missing context should fail closed");

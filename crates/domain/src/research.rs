@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -410,12 +410,12 @@ impl ValidationGateStageScope {
     }
 
     pub const fn applies_to(self, stage: ValidationGateWorkflowStage) -> bool {
-        match (self, stage) {
+        matches!(
+            (self, stage),
             (Self::Training, ValidationGateWorkflowStage::Training)
-            | (Self::Promotion, ValidationGateWorkflowStage::Promotion)
-            | (Self::TrainingAndPromotion, _) => true,
-            _ => false,
-        }
+                | (Self::Promotion, ValidationGateWorkflowStage::Promotion)
+                | (Self::TrainingAndPromotion, _)
+        )
     }
 }
 
@@ -1985,10 +1985,7 @@ pub fn validate_counterfactual_replay_summary(
             field_errors.push(CounterfactualReplayValidationIssue {
                 field: "scenarios".to_string(),
                 code: CounterfactualReplayReasonCode::InvalidPayload.code(),
-                message: format!(
-                    "scenario `{}` must appear exactly once",
-                    required.as_str()
-                ),
+                message: format!("scenario `{}` must appear exactly once", required.as_str()),
             });
         }
     }
@@ -2007,14 +2004,13 @@ pub fn validate_counterfactual_replay_summary(
         .scenarios
         .iter()
         .find(|scenario| scenario.scenario == CounterfactualReplayScenarioKind::Baseline)
+        && (baseline_scenario.net_pnl - summary.baseline_net_pnl).abs() > 1e-9
     {
-        if (baseline_scenario.net_pnl - summary.baseline_net_pnl).abs() > 1e-9 {
-            field_errors.push(CounterfactualReplayValidationIssue {
-                field: "baseline_net_pnl".to_string(),
-                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
-                message: "baseline_net_pnl must match baseline scenario net_pnl".to_string(),
-            });
-        }
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "baseline_net_pnl".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "baseline_net_pnl must match baseline scenario net_pnl".to_string(),
+        });
     }
     if let Some(stressed_scenario) = summary
         .scenarios
@@ -2052,15 +2048,13 @@ pub fn validate_counterfactual_replay_summary(
         .scenarios
         .iter()
         .find(|scenario| scenario.scenario == CounterfactualReplayScenarioKind::DelayedExit)
+        && (delayed_exit_scenario.net_pnl - summary.delayed_exit_net_pnl).abs() > 1e-9
     {
-        if (delayed_exit_scenario.net_pnl - summary.delayed_exit_net_pnl).abs() > 1e-9 {
-            field_errors.push(CounterfactualReplayValidationIssue {
-                field: "delayed_exit_net_pnl".to_string(),
-                code: CounterfactualReplayReasonCode::InvalidPayload.code(),
-                message: "delayed_exit_net_pnl must match delayed_exit scenario net_pnl"
-                    .to_string(),
-            });
-        }
+        field_errors.push(CounterfactualReplayValidationIssue {
+            field: "delayed_exit_net_pnl".to_string(),
+            code: CounterfactualReplayReasonCode::InvalidPayload.code(),
+            message: "delayed_exit_net_pnl must match delayed_exit scenario net_pnl".to_string(),
+        });
     }
 
     for (index, scenario) in summary.scenarios.iter().enumerate() {
@@ -3520,7 +3514,9 @@ pub fn parse_alpha_health_utc_timestamp(
     value: &str,
 ) -> Result<OffsetDateTime, AlphaHealthContractError> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
-        AlphaHealthContractError::invalid_payload(format!("timestamp `{value}` must be RFC3339 UTC"))
+        AlphaHealthContractError::invalid_payload(format!(
+            "timestamp `{value}` must be RFC3339 UTC"
+        ))
     })?;
     if parsed.offset() != UtcOffset::UTC {
         return Err(AlphaHealthContractError::invalid_payload(
@@ -3644,11 +3640,7 @@ pub fn validate_alpha_health_metric_record(
         });
     }
 
-    validate_finite_alpha_health_value(
-        record.rolling_sharpe,
-        "rolling_sharpe",
-        &mut field_errors,
-    );
+    validate_finite_alpha_health_value(record.rolling_sharpe, "rolling_sharpe", &mut field_errors);
     validate_finite_alpha_health_value(
         record.rolling_hit_rate,
         "rolling_hit_rate",
@@ -3740,18 +3732,16 @@ pub fn validate_alpha_threshold_breach_record(
             message: "reason_code is not a supported alpha-health reason".to_string(),
         });
     }
-    if let Err(error) = validate_alpha_health_threshold_definition(&AlphaHealthThresholdDefinition {
-        metric_key: record.metric_key,
-        comparator: record.comparator,
-        threshold_value: record.threshold_value,
-    }) {
+    if let Err(error) =
+        validate_alpha_health_threshold_definition(&AlphaHealthThresholdDefinition {
+            metric_key: record.metric_key,
+            comparator: record.comparator,
+            threshold_value: record.threshold_value,
+        })
+    {
         field_errors.extend(error.field_errors);
     }
-    validate_finite_alpha_health_value(
-        record.observed_value,
-        "observed_value",
-        &mut field_errors,
-    );
+    validate_finite_alpha_health_value(record.observed_value, "observed_value", &mut field_errors);
 
     if !field_errors.is_empty() {
         return Err(AlphaHealthContractError::invalid_payload_with_issues(
@@ -3865,7 +3855,9 @@ pub fn is_alpha_health_threshold_breached(
     }
 }
 
-pub fn expected_alpha_health_comparator(metric_key: AlphaHealthMetricKey) -> ValidationGateComparator {
+pub fn expected_alpha_health_comparator(
+    metric_key: AlphaHealthMetricKey,
+) -> ValidationGateComparator {
     if metric_key.is_floor_metric() {
         ValidationGateComparator::Lt
     } else {
@@ -4054,6 +4046,802 @@ fn alpha_health_window_order(window: AlphaHealthMetricWindow) -> i32 {
         AlphaHealthMetricWindow::TwentyFourHours => 1,
         AlphaHealthMetricWindow::ThirtyDays => 2,
     }
+}
+
+pub const FR48_STOP_RESEARCH_MIN_TRADE_COUNT_30D: i64 = 200;
+pub const FR48_STOP_RESEARCH_MIN_OUT_OF_SAMPLE_SHARPE_30D: f64 = 0.2;
+pub const FR48_STOP_RESEARCH_MAX_PROMOTION_FAILURE_RATE_LAST_10: f64 = 0.70;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AlphaLifecycleActionType {
+    Deallocate,
+    StopResearch,
+}
+
+impl AlphaLifecycleActionType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deallocate => "deallocate",
+            Self::StopResearch => "stop_research",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AlphaLifecycleContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "deallocate" => Ok(Self::Deallocate),
+            "stop_research" => Ok(Self::StopResearch),
+            _ => Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+                "unsupported alpha lifecycle action type",
+                vec![AlphaLifecycleValidationIssue {
+                    field: "action_type".to_string(),
+                    code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                    message: format!(
+                        "action_type must be one of: deallocate, stop_research (received `{value}`)"
+                    ),
+                }],
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlphaLifecycleActionStatus {
+    Applied,
+    Denied,
+    Unapplied,
+}
+
+impl AlphaLifecycleActionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Denied => "denied",
+            Self::Unapplied => "unapplied",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AlphaLifecycleContractError> {
+        match normalize_research_identifier(value).as_str() {
+            "applied" => Ok(Self::Applied),
+            "denied" => Ok(Self::Denied),
+            "unapplied" => Ok(Self::Unapplied),
+            _ => Err(AlphaLifecycleContractError::invalid_payload(format!(
+                "unknown alpha lifecycle action status `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlphaLifecycleReasonCode {
+    ActionStarted,
+    ActionApplied,
+    ActionDenied,
+    ActionRead,
+    ActionListed,
+    InvalidPayload,
+    UnauthorizedRole,
+    ActionNotFound,
+    DeallocationThresholdBreached,
+    StopResearchCriteriaMet,
+    AuthorizationFailed,
+    DependencyUnavailable,
+    StateUnavailable,
+    PersistenceUnavailable,
+}
+
+impl AlphaLifecycleReasonCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ActionStarted => "alpha_lifecycle_action_started",
+            Self::ActionApplied => "alpha_lifecycle_action_applied",
+            Self::ActionDenied => "alpha_lifecycle_action_denied",
+            Self::ActionRead => "alpha_lifecycle_action_read",
+            Self::ActionListed => "alpha_lifecycle_action_listed",
+            Self::InvalidPayload => "alpha_lifecycle_action_invalid_payload",
+            Self::UnauthorizedRole => "alpha_lifecycle_action_unauthorized_role",
+            Self::ActionNotFound => "alpha_lifecycle_action_not_found",
+            Self::DeallocationThresholdBreached => {
+                "alpha_lifecycle_action_deallocation_threshold_breached"
+            }
+            Self::StopResearchCriteriaMet => "alpha_lifecycle_action_stop_research_criteria_met",
+            Self::AuthorizationFailed => "alpha_lifecycle_action_authorization_failed",
+            Self::DependencyUnavailable => "alpha_lifecycle_action_dependency_unavailable",
+            Self::StateUnavailable => "alpha_lifecycle_action_state_unavailable",
+            Self::PersistenceUnavailable => "alpha_lifecycle_action_persistence_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AlphaLifecycleContractError> {
+        match value {
+            "alpha_lifecycle_action_started" => Ok(Self::ActionStarted),
+            "alpha_lifecycle_action_applied" => Ok(Self::ActionApplied),
+            "alpha_lifecycle_action_denied" => Ok(Self::ActionDenied),
+            "alpha_lifecycle_action_read" => Ok(Self::ActionRead),
+            "alpha_lifecycle_action_listed" => Ok(Self::ActionListed),
+            "alpha_lifecycle_action_invalid_payload" => Ok(Self::InvalidPayload),
+            "alpha_lifecycle_action_unauthorized_role" => Ok(Self::UnauthorizedRole),
+            "alpha_lifecycle_action_not_found" => Ok(Self::ActionNotFound),
+            "alpha_lifecycle_action_deallocation_threshold_breached" => {
+                Ok(Self::DeallocationThresholdBreached)
+            }
+            "alpha_lifecycle_action_stop_research_criteria_met" => {
+                Ok(Self::StopResearchCriteriaMet)
+            }
+            "alpha_lifecycle_action_authorization_failed" => Ok(Self::AuthorizationFailed),
+            "alpha_lifecycle_action_dependency_unavailable" => Ok(Self::DependencyUnavailable),
+            "alpha_lifecycle_action_state_unavailable" => Ok(Self::StateUnavailable),
+            "alpha_lifecycle_action_persistence_unavailable" => Ok(Self::PersistenceUnavailable),
+            _ => Err(AlphaLifecycleContractError::invalid_payload(format!(
+                "unknown alpha lifecycle action reason code `{value}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlphaLifecycleValidationIssue {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlphaLifecycleContractError {
+    pub code: &'static str,
+    pub message: String,
+    pub field_errors: Vec<AlphaLifecycleValidationIssue>,
+}
+
+impl AlphaLifecycleContractError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid_payload_with_issues(
+        message: impl Into<String>,
+        field_errors: Vec<AlphaLifecycleValidationIssue>,
+    ) -> Self {
+        Self {
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: message.into(),
+            field_errors,
+        }
+    }
+
+    pub fn dependency_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaLifecycleReasonCode::DependencyUnavailable.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn state_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaLifecycleReasonCode::StateUnavailable.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn persistence_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaLifecycleReasonCode::PersistenceUnavailable.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    pub fn authorization_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: AlphaLifecycleReasonCode::AuthorizationFailed.code(),
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlphaLifecycleDeallocationPolicy {
+    pub metric_key: AlphaHealthMetricKey,
+    pub comparator: ValidationGateComparator,
+    pub threshold_value: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StopResearchCriteriaSnapshot {
+    pub trade_count_30d: i64,
+    pub out_of_sample_sharpe_30d: f64,
+    pub promotion_failure_rate_last_10: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggered_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlphaLifecycleActionRecord {
+    pub action_id: String,
+    pub alpha_id: String,
+    pub action_type: AlphaLifecycleActionType,
+    pub action_status: AlphaLifecycleActionStatus,
+    pub reason_code: String,
+    pub trigger_evidence: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_research_criteria: Option<StopResearchCriteriaSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_guidance: Option<String>,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub acted_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlphaLifecycleDeallocationEvaluation {
+    pub triggered: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggered_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_breach: Option<AlphaThresholdBreachRecord>,
+}
+
+pub fn parse_alpha_lifecycle_utc_timestamp(
+    value: &str,
+) -> Result<OffsetDateTime, AlphaLifecycleContractError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        AlphaLifecycleContractError::invalid_payload(format!(
+            "timestamp `{value}` must be RFC3339 UTC"
+        ))
+    })?;
+    if parsed.offset() != UtcOffset::UTC {
+        return Err(AlphaLifecycleContractError::invalid_payload(
+            "timestamps must use UTC `Z` offset",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn compose_alpha_lifecycle_action_id(
+    alpha_id: &str,
+    acted_at_utc: &str,
+) -> Result<String, AlphaLifecycleContractError> {
+    let normalized_alpha_id = normalize_research_identifier(alpha_id);
+    if normalized_alpha_id.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "alpha_id cannot be blank",
+            vec![AlphaLifecycleValidationIssue {
+                field: "alpha_id".to_string(),
+                code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                message: "alpha_id cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let acted_at = parse_alpha_lifecycle_utc_timestamp(acted_at_utc)?;
+    Ok(format!(
+        "{}::{}",
+        normalized_alpha_id,
+        acted_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn compose_alpha_lifecycle_action_id_with_context(
+    alpha_id: &str,
+    action_type: &str,
+    correlation_id: &str,
+    acted_at_utc: &str,
+) -> Result<String, AlphaLifecycleContractError> {
+    let normalized_alpha_id = normalize_research_identifier(alpha_id);
+    if normalized_alpha_id.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "alpha_id cannot be blank",
+            vec![AlphaLifecycleValidationIssue {
+                field: "alpha_id".to_string(),
+                code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                message: "alpha_id cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let normalized_action_type = normalize_research_identifier(action_type);
+    if normalized_action_type.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "action_type cannot be blank",
+            vec![AlphaLifecycleValidationIssue {
+                field: "action_type".to_string(),
+                code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                message: "action_type cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let normalized_correlation_id = normalize_research_identifier(correlation_id);
+    if normalized_correlation_id.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "correlation_id cannot be blank",
+            vec![AlphaLifecycleValidationIssue {
+                field: "correlation_id".to_string(),
+                code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                message: "correlation_id cannot be blank".to_string(),
+            }],
+        ));
+    }
+    let acted_at = parse_alpha_lifecycle_utc_timestamp(acted_at_utc)?;
+    Ok(format!(
+        "{}::{}::{}::{}",
+        normalized_alpha_id,
+        normalized_action_type,
+        normalized_correlation_id,
+        acted_at.unix_timestamp_nanos()
+    ))
+}
+
+pub fn canonicalize_alpha_lifecycle_action_record(
+    record: &AlphaLifecycleActionRecord,
+) -> Result<AlphaLifecycleActionRecord, AlphaLifecycleContractError> {
+    let normalized_reason_code = normalize_research_identifier(&record.reason_code);
+    let reason_code = AlphaLifecycleReasonCode::parse(&normalized_reason_code)
+        .map(|reason| reason.code().to_string())
+        .unwrap_or(normalized_reason_code);
+
+    let normalized = AlphaLifecycleActionRecord {
+        action_id: normalize_research_identifier(&record.action_id),
+        alpha_id: normalize_research_identifier(&record.alpha_id),
+        action_type: record.action_type,
+        action_status: record.action_status,
+        reason_code,
+        trigger_evidence: record.trigger_evidence.clone(),
+        stop_research_criteria: record
+            .stop_research_criteria
+            .as_ref()
+            .map(canonicalize_stop_research_criteria_snapshot)
+            .transpose()?,
+        remediation_guidance: record
+            .remediation_guidance
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        actor_id: record.actor_id.trim().to_string(),
+        correlation_id: record.correlation_id.trim().to_string(),
+        acted_at_utc: record.acted_at_utc.trim().to_string(),
+        approval_request_id: record
+            .approval_request_id
+            .as_ref()
+            .map(|value| normalize_research_identifier(value))
+            .filter(|value| !value.is_empty()),
+        approval_reference: record
+            .approval_reference
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    validate_alpha_lifecycle_action_record(&normalized)?;
+    Ok(normalized)
+}
+
+pub fn validate_alpha_lifecycle_action_record(
+    record: &AlphaLifecycleActionRecord,
+) -> Result<(), AlphaLifecycleContractError> {
+    let mut field_errors = Vec::new();
+    validate_non_empty_alpha_lifecycle_field(&mut field_errors, "action_id", &record.action_id);
+    validate_non_empty_alpha_lifecycle_field(&mut field_errors, "alpha_id", &record.alpha_id);
+    validate_non_empty_alpha_lifecycle_field(&mut field_errors, "reason_code", &record.reason_code);
+    validate_non_empty_alpha_lifecycle_field(&mut field_errors, "actor_id", &record.actor_id);
+    validate_non_empty_alpha_lifecycle_field(
+        &mut field_errors,
+        "correlation_id",
+        &record.correlation_id,
+    );
+    validate_non_empty_alpha_lifecycle_field(
+        &mut field_errors,
+        "acted_at_utc",
+        &record.acted_at_utc,
+    );
+
+    if parse_alpha_lifecycle_utc_timestamp(&record.acted_at_utc).is_err() {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "acted_at_utc".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "acted_at_utc must be RFC3339 UTC".to_string(),
+        });
+    }
+    if AlphaLifecycleReasonCode::parse(&record.reason_code).is_err() {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "reason_code".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "reason_code is not recognized".to_string(),
+        });
+    }
+    if !matches!(record.trigger_evidence, Value::Object(_)) {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "trigger_evidence".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "trigger_evidence must be a JSON object".to_string(),
+        });
+    }
+    if record.approval_reference.is_some() && record.approval_request_id.is_none() {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "approval_request_id".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "approval_request_id is required when approval_reference is provided"
+                .to_string(),
+        });
+    }
+    if record.action_status == AlphaLifecycleActionStatus::Unapplied
+        && record.remediation_guidance.is_none()
+    {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "remediation_guidance".to_string(),
+            code: AlphaLifecycleReasonCode::StateUnavailable.code(),
+            message: "remediation_guidance is required for unapplied actions".to_string(),
+        });
+    }
+    if record.action_type == AlphaLifecycleActionType::StopResearch
+        && record.stop_research_criteria.is_none()
+    {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "stop_research_criteria".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "stop_research_criteria is required for stop_research actions".to_string(),
+        });
+    }
+    if record.action_type != AlphaLifecycleActionType::StopResearch
+        && record.stop_research_criteria.is_some()
+    {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "stop_research_criteria".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "stop_research_criteria is only allowed for stop_research actions".to_string(),
+        });
+    }
+
+    if let Some(criteria) = record.stop_research_criteria.as_ref()
+        && let Err(error) = validate_stop_research_criteria_snapshot(criteria)
+    {
+        field_errors.extend(error.field_errors);
+    }
+
+    if !field_errors.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "alpha lifecycle action payload failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+pub fn evaluate_fr47_deallocation_trigger(
+    breaches: &[AlphaThresholdBreachRecord],
+    policies: &[AlphaLifecycleDeallocationPolicy],
+) -> Result<AlphaLifecycleDeallocationEvaluation, AlphaLifecycleContractError> {
+    if policies.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "at least one deallocation policy is required",
+            vec![AlphaLifecycleValidationIssue {
+                field: "deallocation_policies".to_string(),
+                code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                message: "at least one deallocation policy is required".to_string(),
+            }],
+        ));
+    }
+
+    let mut canonical_policies = policies
+        .iter()
+        .map(canonicalize_alpha_lifecycle_deallocation_policy)
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical_policies.sort_by(|left, right| {
+        left.metric_key
+            .as_str()
+            .cmp(right.metric_key.as_str())
+            .then_with(|| left.threshold_value.total_cmp(&right.threshold_value))
+    });
+    let mut seen_metric_keys = std::collections::BTreeSet::new();
+    for policy in &canonical_policies {
+        if !seen_metric_keys.insert(policy.metric_key) {
+            return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+                "duplicate metric policy entries are not allowed",
+                vec![AlphaLifecycleValidationIssue {
+                    field: "deallocation_policies".to_string(),
+                    code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                    message: format!(
+                        "duplicate deallocation policy for metric_key `{}`",
+                        policy.metric_key.as_str()
+                    ),
+                }],
+            ));
+        }
+    }
+
+    let mut canonical_breaches = breaches
+        .iter()
+        .map(|breach| {
+            canonicalize_alpha_threshold_breach_record(breach)
+                .map_err(map_alpha_health_contract_error_to_lifecycle)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical_breaches.sort_by(|left, right| {
+        right
+            .breached_at_utc
+            .cmp(&left.breached_at_utc)
+            .then_with(|| left.breach_id.cmp(&right.breach_id))
+    });
+
+    let mut evaluated_metric_keys = std::collections::BTreeSet::new();
+    for breach in canonical_breaches {
+        let metric_key = breach.metric_key.as_str().to_string();
+        if !evaluated_metric_keys.insert(metric_key.clone()) {
+            continue;
+        }
+        let Some(policy) = canonical_policies
+            .iter()
+            .find(|policy| policy.metric_key.as_str() == metric_key)
+        else {
+            continue;
+        };
+        if compare_threshold(
+            policy.comparator,
+            breach.observed_value,
+            policy.threshold_value,
+        ) {
+            return Ok(AlphaLifecycleDeallocationEvaluation {
+                triggered: true,
+                triggered_criteria: vec![format!(
+                    "deallocation_threshold:{}",
+                    breach.metric_key.as_str()
+                )],
+                trigger_breach: Some(breach),
+            });
+        }
+    }
+
+    Ok(AlphaLifecycleDeallocationEvaluation {
+        triggered: false,
+        triggered_criteria: Vec::new(),
+        trigger_breach: None,
+    })
+}
+
+pub fn evaluate_fr48_stop_research_criteria(
+    trade_count_30d: i64,
+    out_of_sample_sharpe_30d: f64,
+    promotion_failure_rate_last_10: f64,
+) -> Result<StopResearchCriteriaSnapshot, AlphaLifecycleContractError> {
+    let mut field_errors = Vec::new();
+
+    if trade_count_30d < 0 {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "trade_count_30d".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "trade_count_30d must be greater than or equal to 0".to_string(),
+        });
+    }
+    validate_finite_alpha_lifecycle_value(
+        out_of_sample_sharpe_30d,
+        "out_of_sample_sharpe_30d",
+        &mut field_errors,
+    );
+    validate_finite_alpha_lifecycle_value(
+        promotion_failure_rate_last_10,
+        "promotion_failure_rate_last_10",
+        &mut field_errors,
+    );
+    if !(0.0..=1.0).contains(&promotion_failure_rate_last_10) {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "promotion_failure_rate_last_10".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "promotion_failure_rate_last_10 must be between 0 and 1".to_string(),
+        });
+    }
+    if !field_errors.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "stop-research criteria failed validation",
+            field_errors,
+        ));
+    }
+
+    let mut triggered_criteria = Vec::new();
+    if trade_count_30d < FR48_STOP_RESEARCH_MIN_TRADE_COUNT_30D {
+        triggered_criteria.push("trade_count_30d_below_minimum".to_string());
+    }
+    if out_of_sample_sharpe_30d < FR48_STOP_RESEARCH_MIN_OUT_OF_SAMPLE_SHARPE_30D {
+        triggered_criteria.push("out_of_sample_sharpe_30d_below_minimum".to_string());
+    }
+    if promotion_failure_rate_last_10 > FR48_STOP_RESEARCH_MAX_PROMOTION_FAILURE_RATE_LAST_10 {
+        triggered_criteria.push("promotion_failure_rate_last_10_above_maximum".to_string());
+    }
+
+    Ok(StopResearchCriteriaSnapshot {
+        trade_count_30d,
+        out_of_sample_sharpe_30d,
+        promotion_failure_rate_last_10,
+        triggered_criteria,
+    })
+}
+
+pub fn stop_research_triggered(snapshot: &StopResearchCriteriaSnapshot) -> bool {
+    !snapshot.triggered_criteria.is_empty()
+}
+
+pub fn build_stop_research_trigger_evidence(snapshot: &StopResearchCriteriaSnapshot) -> Value {
+    json!({
+        "criterion_keys": snapshot.triggered_criteria,
+        "trade_count_30d": snapshot.trade_count_30d,
+        "out_of_sample_sharpe_30d": snapshot.out_of_sample_sharpe_30d,
+        "promotion_failure_rate_last_10": snapshot.promotion_failure_rate_last_10,
+    })
+}
+
+fn canonicalize_alpha_lifecycle_deallocation_policy(
+    policy: &AlphaLifecycleDeallocationPolicy,
+) -> Result<AlphaLifecycleDeallocationPolicy, AlphaLifecycleContractError> {
+    let normalized = AlphaLifecycleDeallocationPolicy {
+        metric_key: policy.metric_key,
+        comparator: policy.comparator,
+        threshold_value: policy.threshold_value,
+    };
+    validate_alpha_lifecycle_deallocation_policy(&normalized)?;
+    Ok(normalized)
+}
+
+fn validate_alpha_lifecycle_deallocation_policy(
+    policy: &AlphaLifecycleDeallocationPolicy,
+) -> Result<(), AlphaLifecycleContractError> {
+    let mut field_errors = Vec::new();
+    validate_finite_alpha_lifecycle_value(
+        policy.threshold_value,
+        "threshold_value",
+        &mut field_errors,
+    );
+    let expected_comparator = expected_alpha_health_comparator(policy.metric_key);
+    if policy.comparator != expected_comparator {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "comparator".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: format!(
+                "{} requires `{}` comparator semantics",
+                policy.metric_key.as_str(),
+                expected_comparator.as_str()
+            ),
+        });
+    }
+    if !field_errors.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "deallocation policy failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_stop_research_criteria_snapshot(
+    snapshot: &StopResearchCriteriaSnapshot,
+) -> Result<StopResearchCriteriaSnapshot, AlphaLifecycleContractError> {
+    let mut normalized_triggered = snapshot
+        .triggered_criteria
+        .iter()
+        .map(|criterion| normalize_research_identifier(criterion))
+        .filter(|criterion| !criterion.is_empty())
+        .collect::<Vec<_>>();
+    normalized_triggered.sort();
+    normalized_triggered.dedup();
+
+    let normalized = StopResearchCriteriaSnapshot {
+        trade_count_30d: snapshot.trade_count_30d,
+        out_of_sample_sharpe_30d: snapshot.out_of_sample_sharpe_30d,
+        promotion_failure_rate_last_10: snapshot.promotion_failure_rate_last_10,
+        triggered_criteria: normalized_triggered,
+    };
+    validate_stop_research_criteria_snapshot(&normalized)?;
+    Ok(normalized)
+}
+
+fn validate_stop_research_criteria_snapshot(
+    snapshot: &StopResearchCriteriaSnapshot,
+) -> Result<(), AlphaLifecycleContractError> {
+    let mut field_errors = Vec::new();
+    if snapshot.trade_count_30d < 0 {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "stop_research_criteria.trade_count_30d".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "trade_count_30d must be greater than or equal to 0".to_string(),
+        });
+    }
+    validate_finite_alpha_lifecycle_value(
+        snapshot.out_of_sample_sharpe_30d,
+        "stop_research_criteria.out_of_sample_sharpe_30d",
+        &mut field_errors,
+    );
+    validate_finite_alpha_lifecycle_value(
+        snapshot.promotion_failure_rate_last_10,
+        "stop_research_criteria.promotion_failure_rate_last_10",
+        &mut field_errors,
+    );
+    if snapshot.promotion_failure_rate_last_10 < 0.0
+        || snapshot.promotion_failure_rate_last_10 > 1.0
+    {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: "stop_research_criteria.promotion_failure_rate_last_10".to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: "promotion_failure_rate_last_10 must be between 0 and 1".to_string(),
+        });
+    }
+    for (index, criterion) in snapshot.triggered_criteria.iter().enumerate() {
+        if criterion.trim().is_empty() {
+            field_errors.push(AlphaLifecycleValidationIssue {
+                field: format!("stop_research_criteria.triggered_criteria[{index}]"),
+                code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                message: "triggered criteria keys must be non-empty".to_string(),
+            });
+        }
+    }
+    if !field_errors.is_empty() {
+        return Err(AlphaLifecycleContractError::invalid_payload_with_issues(
+            "stop-research criteria snapshot failed validation",
+            field_errors,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_empty_alpha_lifecycle_field(
+    field_errors: &mut Vec<AlphaLifecycleValidationIssue>,
+    field: &str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: field.to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: format!("{field} cannot be blank"),
+        });
+    }
+}
+
+fn validate_finite_alpha_lifecycle_value(
+    value: f64,
+    field: &str,
+    field_errors: &mut Vec<AlphaLifecycleValidationIssue>,
+) {
+    if !value.is_finite() {
+        field_errors.push(AlphaLifecycleValidationIssue {
+            field: field.to_string(),
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: format!("{field} must be finite"),
+        });
+    }
+}
+
+fn compare_threshold(comparator: ValidationGateComparator, observed: f64, threshold: f64) -> bool {
+    match comparator {
+        ValidationGateComparator::Lt => observed < threshold,
+        ValidationGateComparator::Lte => observed <= threshold,
+        ValidationGateComparator::Gt => observed > threshold,
+        ValidationGateComparator::Gte => observed >= threshold,
+    }
+}
+
+fn map_alpha_health_contract_error_to_lifecycle(
+    error: AlphaHealthContractError,
+) -> AlphaLifecycleContractError {
+    AlphaLifecycleContractError::invalid_payload_with_issues(
+        error.message,
+        error
+            .field_errors
+            .into_iter()
+            .map(|issue| AlphaLifecycleValidationIssue {
+                field: issue.field,
+                code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                message: issue.message,
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -5066,7 +5854,12 @@ mod tests {
         let error = validate_alpha_health_threshold_definition(&threshold)
             .expect_err("drawdown threshold should require `gt` comparator");
         assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
-        assert!(error.field_errors.iter().any(|issue| issue.field == "comparator"));
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "comparator")
+        );
     }
 
     #[test]
@@ -5075,7 +5868,12 @@ mod tests {
         let error = evaluate_alpha_health_thresholds(&metric, &[])
             .expect_err("empty thresholds should fail validation");
         assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
-        assert!(error.field_errors.iter().any(|issue| issue.field == "thresholds"));
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "thresholds")
+        );
     }
 
     #[test]
@@ -5096,7 +5894,12 @@ mod tests {
         let error = evaluate_alpha_health_thresholds(&metric, &thresholds)
             .expect_err("duplicate threshold metric keys should fail validation");
         assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
-        assert!(error.field_errors.iter().any(|issue| issue.field == "thresholds"));
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "thresholds")
+        );
     }
 
     #[test]
@@ -5117,11 +5920,9 @@ mod tests {
 
     #[test]
     fn alpha_health_identifier_composition_is_canonical_and_deterministic() {
-        let metric_id = compose_alpha_health_metric_id(
-            " Alpha::Mean-Reversion ",
-            "2026-04-08T01:00:00Z",
-        )
-        .expect("metric id composition should succeed");
+        let metric_id =
+            compose_alpha_health_metric_id(" Alpha::Mean-Reversion ", "2026-04-08T01:00:00Z")
+                .expect("metric id composition should succeed");
         assert!(metric_id.starts_with("alpha::mean-reversion::"));
 
         let breach_id = compose_alpha_threshold_breach_id(
@@ -5131,5 +5932,246 @@ mod tests {
         )
         .expect("breach id composition should succeed");
         assert!(breach_id.contains("alpha::mean-reversion::rolling_sharpe::"));
+    }
+
+    fn sample_alpha_lifecycle_breach() -> AlphaThresholdBreachRecord {
+        AlphaThresholdBreachRecord {
+            breach_id: "alpha::mean-reversion::rolling_drawdown::1712534400000000000".to_string(),
+            metric_id: "alpha::mean-reversion::1712534400000000000".to_string(),
+            alpha_id: "alpha::mean-reversion".to_string(),
+            metric_key: AlphaHealthMetricKey::RollingDrawdown,
+            comparator: ValidationGateComparator::Gt,
+            observed_value: 0.11,
+            threshold_value: 0.1,
+            breach_reason: "rolling_drawdown exceeded configured ceiling".to_string(),
+            reason_code: AlphaHealthReasonCode::ThresholdBreachDetected
+                .code()
+                .to_string(),
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-alpha-lifecycle-001".to_string(),
+            breached_at_utc: "2026-04-08T01:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn alpha_lifecycle_reason_code_parse_accepts_fail_closed_families() {
+        assert_eq!(
+            AlphaLifecycleReasonCode::parse("alpha_lifecycle_action_dependency_unavailable")
+                .expect("known lifecycle reason code should parse"),
+            AlphaLifecycleReasonCode::DependencyUnavailable
+        );
+        assert_eq!(
+            AlphaLifecycleReasonCode::parse("alpha_lifecycle_action_state_unavailable")
+                .expect("known lifecycle reason code should parse"),
+            AlphaLifecycleReasonCode::StateUnavailable
+        );
+        assert_eq!(
+            AlphaLifecycleReasonCode::parse("alpha_lifecycle_action_persistence_unavailable")
+                .expect("known lifecycle reason code should parse"),
+            AlphaLifecycleReasonCode::PersistenceUnavailable
+        );
+    }
+
+    #[test]
+    fn alpha_lifecycle_action_identifier_composition_is_canonical_and_deterministic() {
+        let action_id =
+            compose_alpha_lifecycle_action_id(" Alpha::Mean-Reversion ", "2026-04-08T01:00:00Z")
+                .expect("action id composition should succeed");
+        assert!(action_id.starts_with("alpha::mean-reversion::"));
+    }
+
+    #[test]
+    fn alpha_lifecycle_action_identifier_with_context_prevents_collisions() {
+        let first = compose_alpha_lifecycle_action_id_with_context(
+            " Alpha::Mean-Reversion ",
+            "deallocate",
+            "Corr-001",
+            "2026-04-08T01:00:00Z",
+        )
+        .expect("contextual action id composition should succeed");
+        let second = compose_alpha_lifecycle_action_id_with_context(
+            "Alpha::Mean-Reversion",
+            "stop_research",
+            "Corr-002",
+            "2026-04-08T01:00:00Z",
+        )
+        .expect("contextual action id composition should succeed");
+        assert!(first.starts_with("alpha::mean-reversion::deallocate::corr-001::"));
+        assert!(second.starts_with("alpha::mean-reversion::stop_research::corr-002::"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn alpha_lifecycle_fr47_deallocation_trigger_uses_canonical_breach_evidence() {
+        let breach = sample_alpha_lifecycle_breach();
+        let evaluation = evaluate_fr47_deallocation_trigger(
+            std::slice::from_ref(&breach),
+            &[AlphaLifecycleDeallocationPolicy {
+                metric_key: AlphaHealthMetricKey::RollingDrawdown,
+                comparator: ValidationGateComparator::Gt,
+                threshold_value: 0.1,
+            }],
+        )
+        .expect("deallocation evaluation should succeed");
+        assert!(evaluation.triggered);
+        assert_eq!(
+            evaluation.triggered_criteria,
+            vec!["deallocation_threshold:rolling_drawdown".to_string()]
+        );
+        assert_eq!(
+            evaluation
+                .trigger_breach
+                .expect("trigger breach should be present")
+                .breach_id,
+            breach.breach_id
+        );
+    }
+
+    #[test]
+    fn alpha_lifecycle_fr47_deallocation_boundary_equality_is_allow_path() {
+        let mut breach = sample_alpha_lifecycle_breach();
+        breach.observed_value = 0.1;
+        let evaluation = evaluate_fr47_deallocation_trigger(
+            &[breach],
+            &[AlphaLifecycleDeallocationPolicy {
+                metric_key: AlphaHealthMetricKey::RollingDrawdown,
+                comparator: ValidationGateComparator::Gt,
+                threshold_value: 0.1,
+            }],
+        )
+        .expect("deallocation evaluation should succeed");
+        assert!(!evaluation.triggered);
+        assert!(evaluation.triggered_criteria.is_empty());
+    }
+
+    #[test]
+    fn alpha_lifecycle_fr47_uses_latest_breach_per_metric_for_trigger_evaluation() {
+        let mut latest_breach = sample_alpha_lifecycle_breach();
+        latest_breach.breach_id = "alpha::mean-reversion::rolling_drawdown::latest".to_string();
+        latest_breach.observed_value = 0.08;
+        latest_breach.breached_at_utc = "2026-04-08T02:00:00Z".to_string();
+
+        let mut older_breach = sample_alpha_lifecycle_breach();
+        older_breach.breach_id = "alpha::mean-reversion::rolling_drawdown::older".to_string();
+        older_breach.observed_value = 0.12;
+        older_breach.breached_at_utc = "2026-04-08T01:00:00Z".to_string();
+
+        let evaluation = evaluate_fr47_deallocation_trigger(
+            &[older_breach, latest_breach],
+            &[AlphaLifecycleDeallocationPolicy {
+                metric_key: AlphaHealthMetricKey::RollingDrawdown,
+                comparator: ValidationGateComparator::Gt,
+                threshold_value: 0.1,
+            }],
+        )
+        .expect("deallocation evaluation should succeed");
+
+        assert!(!evaluation.triggered);
+        assert!(evaluation.triggered_criteria.is_empty());
+        assert!(evaluation.trigger_breach.is_none());
+    }
+
+    #[test]
+    fn alpha_lifecycle_fr48_stop_research_boundaries_keep_equality_on_allow_path() {
+        let criteria = evaluate_fr48_stop_research_criteria(200, 0.2, 0.70)
+            .expect("boundary criteria should evaluate");
+        assert!(criteria.triggered_criteria.is_empty());
+        assert!(!stop_research_triggered(&criteria));
+    }
+
+    #[test]
+    fn alpha_lifecycle_fr48_stop_research_triggers_when_any_criterion_matches() {
+        let criteria = evaluate_fr48_stop_research_criteria(199, 0.19, 0.71)
+            .expect("criteria evaluation should succeed");
+        assert!(stop_research_triggered(&criteria));
+        assert_eq!(
+            criteria.triggered_criteria,
+            vec![
+                "trade_count_30d_below_minimum".to_string(),
+                "out_of_sample_sharpe_30d_below_minimum".to_string(),
+                "promotion_failure_rate_last_10_above_maximum".to_string(),
+            ]
+        );
+
+        let evidence = build_stop_research_trigger_evidence(&criteria);
+        assert_eq!(
+            evidence["criterion_keys"],
+            serde_json::json!([
+                "trade_count_30d_below_minimum",
+                "out_of_sample_sharpe_30d_below_minimum",
+                "promotion_failure_rate_last_10_above_maximum"
+            ])
+        );
+    }
+
+    #[test]
+    fn alpha_lifecycle_record_validation_requires_remediation_for_unapplied_status() {
+        let record = AlphaLifecycleActionRecord {
+            action_id: "alpha::mean-reversion::1712534400000000000".to_string(),
+            alpha_id: "alpha::mean-reversion".to_string(),
+            action_type: AlphaLifecycleActionType::Deallocate,
+            action_status: AlphaLifecycleActionStatus::Unapplied,
+            reason_code: AlphaLifecycleReasonCode::AuthorizationFailed
+                .code()
+                .to_string(),
+            trigger_evidence: serde_json::json!({
+                "criterion_keys": ["deallocation_threshold:rolling_drawdown"]
+            }),
+            stop_research_criteria: None,
+            remediation_guidance: None,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-alpha-lifecycle-001".to_string(),
+            acted_at_utc: "2026-04-08T01:00:00Z".to_string(),
+            approval_request_id: None,
+            approval_reference: None,
+        };
+        let error = validate_alpha_lifecycle_action_record(&record)
+            .expect_err("unapplied actions require remediation guidance");
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "remediation_guidance")
+        );
+    }
+
+    #[test]
+    fn alpha_lifecycle_record_validation_rejects_stop_research_criteria_for_deallocate_actions() {
+        let record = AlphaLifecycleActionRecord {
+            action_id: "alpha::mean-reversion::1712534400000000000".to_string(),
+            alpha_id: "alpha::mean-reversion".to_string(),
+            action_type: AlphaLifecycleActionType::Deallocate,
+            action_status: AlphaLifecycleActionStatus::Applied,
+            reason_code: AlphaLifecycleReasonCode::DeallocationThresholdBreached
+                .code()
+                .to_string(),
+            trigger_evidence: serde_json::json!({
+                "criterion_keys": ["deallocation_threshold:rolling_drawdown"]
+            }),
+            stop_research_criteria: Some(StopResearchCriteriaSnapshot {
+                trade_count_30d: 180,
+                out_of_sample_sharpe_30d: 0.19,
+                promotion_failure_rate_last_10: 0.8,
+                triggered_criteria: vec![
+                    "trade_count_30d_below_minimum".to_string(),
+                    "out_of_sample_sharpe_30d_below_minimum".to_string(),
+                ],
+            }),
+            remediation_guidance: None,
+            actor_id: "ops-1".to_string(),
+            correlation_id: "corr-alpha-lifecycle-001".to_string(),
+            acted_at_utc: "2026-04-08T01:00:00Z".to_string(),
+            approval_request_id: None,
+            approval_reference: None,
+        };
+
+        let error = validate_alpha_lifecycle_action_record(&record)
+            .expect_err("deallocate actions must not carry stop_research criteria");
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "stop_research_criteria")
+        );
     }
 }

@@ -447,27 +447,24 @@ impl ReportExportWorkflowService {
                     schedule_id.as_deref(),
                     schedule_window_key.as_deref(),
                     report_run_id.as_deref(),
-                ) {
-                    if let Some(existing) = self.repository.load_job_by_weekly_binding(
-                        schedule_id,
-                        schedule_window_key,
-                        report_run_id,
-                    )? {
-                        let artifacts = self.repository.load_artifacts_for_job(
-                            &existing.job_id,
-                            Some(MAX_EXPORT_LIST_LIMIT),
-                        )?;
-                        emit_export_telemetry(ExportJobTelemetryEvent {
-                            event_name: "report_export_job_transition_v1",
-                            trigger_source: existing.trigger_source.as_str(),
-                            status: existing.status.as_str(),
-                            reason_code: ReportingExportReasonCode::DuplicateSuppressed.code(),
-                            job_id: &existing.job_id,
-                            correlation_id: &existing.correlation_id,
-                            timestamp_utc: &requested_at_utc,
-                        });
-                        return Ok(to_job_evidence(existing, artifacts));
-                    }
+                ) && let Some(existing) = self.repository.load_job_by_weekly_binding(
+                    schedule_id,
+                    schedule_window_key,
+                    report_run_id,
+                )? {
+                    let artifacts = self
+                        .repository
+                        .load_artifacts_for_job(&existing.job_id, Some(MAX_EXPORT_LIST_LIMIT))?;
+                    emit_export_telemetry(ExportJobTelemetryEvent {
+                        event_name: "report_export_job_transition_v1",
+                        trigger_source: existing.trigger_source.as_str(),
+                        status: existing.status.as_str(),
+                        reason_code: ReportingExportReasonCode::DuplicateSuppressed.code(),
+                        job_id: &existing.job_id,
+                        correlation_id: &existing.correlation_id,
+                        timestamp_utc: &requested_at_utc,
+                    });
+                    return Ok(to_job_evidence(existing, artifacts));
                 }
                 return Err(error);
             }

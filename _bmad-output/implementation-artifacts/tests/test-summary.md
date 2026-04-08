@@ -972,3 +972,35 @@
 
 - `npm run --silent qa:test:story-6-8` ✅ (2026-04-08 08:37:00 UTC QA refresh with blocked-readiness + fail-closed accessibility contract expansion)
 - `source "$HOME/.cargo/env" && npm test` ✅
+
+---
+
+## Story 6.9 QA Automation Refresh
+
+### Generated Tests
+
+- [x] `crates/domain/src/research.rs` (`research::tests::alpha_lifecycle_`) — validates FR47/FR48 evaluator semantics, canonical lifecycle id composition, fail-closed reason-code parsing, and exact-boundary allow-path behavior.
+- [x] `crates/persistence/src/postgres/alpha_lifecycle_actions.rs` (`postgres::alpha_lifecycle_actions::tests::`) — validates schema isolation (`alpha_lifecycle_actions` only), deterministic list ordering, canonical identifier validation, and constraint/error classification.
+- [x] `services/research-gateway/src/promotion/lifecycle_actions.rs` (`promotion::lifecycle_actions::tests::`) — validates deallocation trigger application, stop-research boundary behavior, promotion-history failure-rate derivation, deterministic listing, deallocation reflection evidence hints, and fail-closed dependency handling.
+- [x] `services/control-api/src/routes/mod.rs` (`routes::tests::alpha_lifecycle_action_`) — validates authenticated lifecycle-action start/read/list routes, canonical `data/meta/error` envelopes, deterministic status/error mapping (`400/403/409/503/500`), malformed payload handling, and unauthorized security-signal continuity.
+- [x] `tests/api/story-6-9-automatic-lifecycle-actions-api.test.mjs` — validates route wiring, DTO/envelope contracts, middleware/main orchestrator wiring, readiness-consumer lifecycle-action seam reuse, read-path conflict/audit regression continuity, route-test inventory continuity, and QA command wiring.
+- [x] `tests/e2e/story-6-9-automatic-lifecycle-actions.e2e.test.mjs` — validates migration/runbook scope and semantics, domain/persistence contract continuity, orchestration seam reuse + fail-closed behavior, FR48 candidate lookup + ambiguity/incomplete-window fail-closed seams, readiness deallocation reflection compatibility, and audit parameter continuity.
+
+### Coverage
+
+- Story 6.9 now has deterministic automated coverage for:
+  - FR47 deallocation trigger behavior sourced from canonical Story 6.7 breach evidence and persisted lifecycle-action records.
+  - FR48 stop-research trigger semantics with exact threshold-equality allow-path boundaries.
+  - Story 6.5 + 6.7 seam reuse in lifecycle orchestration with fail-closed dependency handling.
+  - Story 6.8 lifecycle-state consumer continuity via canonical `alpha-lifecycle-actions` read integration for `deallocated` reflection.
+  - Authenticated control-plane route envelopes, machine-readable error classes, and privileged audit/security-signal continuity.
+- Automated Story 6.9 regression inventory in this QA refresh: **60 tests passing** (`rust targeted: 42`, `api/e2e node tests: 18`).
+
+### Execution Result
+
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-9` ✅
+- `node --test tests/api/story-6-8-alpha-governance-readiness-api.test.mjs tests/e2e/story-6-8-alpha-governance-readiness.e2e.test.mjs` ✅ (Story 6.8 continuity verification after lifecycle-action seam integration)
+- `source "$HOME/.cargo/env" && npm run --silent ci:web` ✅
+- `source "$HOME/.cargo/env" && npm run --silent ci:rust` ✅
+- `source "$HOME/.cargo/env" && npm run --silent ci:web && npm run --silent qa:test:story-6-9` ✅
+- `source "$HOME/.cargo/env" && npm run --silent qa:test:story-6-9` ✅ (2026-04-09 00:29:50 automated QA refresh after Story 6.9 API/E2E critical-flow assertion expansion)

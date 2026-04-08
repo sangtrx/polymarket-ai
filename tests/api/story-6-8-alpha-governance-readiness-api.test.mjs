@@ -387,6 +387,17 @@ test("Story 6.8 API composes research reads and derives deterministic readiness 
         "/control/research/alpha-threshold-breaches",
       ),
     ],
+    [
+      "/control/research/alpha-lifecycle-actions",
+      successEnvelope(
+        {
+          kind: "actions",
+          alpha_id: "alpha::mean-reversion",
+          actions: [],
+        },
+        "/control/research/alpha-lifecycle-actions",
+      ),
+    ],
   ]);
 
   const fetchImpl = async (url, init) => {
@@ -412,7 +423,7 @@ test("Story 6.8 API composes research reads and derives deterministic readiness 
     fetchImpl,
   });
 
-  assert.equal(requests.length, 6);
+  assert.equal(requests.length, 7);
   assert.equal(result.candidateId, "candidate::alpha-1");
   assert.equal(result.alphaId, "alpha::mean-reversion");
   assert.equal(result.lifecycleState, "production");
@@ -599,6 +610,17 @@ test("Story 6.8 API derives blocked readiness with explicit missing-artifact evi
         "/control/research/alpha-threshold-breaches",
       ),
     ],
+    [
+      "/control/research/alpha-lifecycle-actions",
+      successEnvelope(
+        {
+          kind: "actions",
+          alpha_id: "alpha::mean-reversion",
+          actions: [],
+        },
+        "/control/research/alpha-lifecycle-actions",
+      ),
+    ],
   ]);
 
   const fetchImpl = async (url) => {
@@ -645,6 +667,816 @@ test("Story 6.8 API derives blocked readiness with explicit missing-artifact evi
   assert.ok(result.missingArtifacts.includes("alpha_health_window:1h"));
   assert.ok(result.missingArtifacts.includes("alpha_health_window:30d"));
   assert.match(result.recommendedNextAction, /missing FR7 validation stages/);
+});
+
+test("Story 6.8 API reflects applied stop_research lifecycle actions as deallocated", async () => {
+  const { queryAlphaGovernanceReadiness } = loadCompiledModule();
+  const endpointPayloads = new Map([
+    [
+      "/control/research/promotion-decisions",
+      successEnvelope(
+        {
+          kind: "decisions",
+          candidate_id: "candidate::alpha-1",
+          decisions: [
+            {
+              decision_id: "decision-stop-research-001",
+              candidate_id: "candidate::alpha-1",
+              validation_run_id: "run-stop-research-001",
+              lifecycle_action: "promote",
+              decision_state: "allowed",
+              reason_code: "promotion_decision_allowed",
+              observed_metrics: {},
+              evidence_packet: {},
+              threshold_results: [],
+              missing_evidence_fields: [],
+              gate_evaluation: { outcome: "allow" },
+              shadow_readiness: { reason_code: "shadow_ready" },
+              actor_id: "ops-1",
+              correlation_id: "corr-governance-readiness-001",
+              decided_at_utc: "2026-04-08T09:00:00.000Z",
+            },
+          ],
+        },
+        "/control/research/promotion-decisions",
+      ),
+    ],
+    [
+      "/control/research/shadow-evaluations",
+      successEnvelope(
+        {
+          kind: "evaluations",
+          candidate_id: "candidate::alpha-1",
+          evaluations: [],
+        },
+        "/control/research/shadow-evaluations",
+      ),
+    ],
+    [
+      "/control/research/validation-runs",
+      successEnvelope(
+        {
+          kind: "runs",
+          candidate_id: "candidate::alpha-1",
+          runs: [],
+        },
+        "/control/research/validation-runs",
+      ),
+    ],
+    [
+      "/control/research/alpha-health-metrics",
+      successEnvelope(
+        {
+          kind: "metrics",
+          alpha_id: "alpha::mean-reversion",
+          metrics: [],
+        },
+        "/control/research/alpha-health-metrics",
+      ),
+    ],
+    [
+      "/control/research/alpha-threshold-breaches",
+      successEnvelope(
+        {
+          kind: "breaches",
+          alpha_id: "alpha::mean-reversion",
+          breaches: [],
+        },
+        "/control/research/alpha-threshold-breaches",
+      ),
+    ],
+    [
+      "/control/research/alpha-lifecycle-actions",
+      successEnvelope(
+        {
+          kind: "actions",
+          alpha_id: "alpha::mean-reversion",
+          actions: [
+            {
+              action_id: "action-stop-research-001",
+              alpha_id: "alpha::mean-reversion",
+              action_type: "stop_research",
+              action_status: "applied",
+              reason_code: "alpha_lifecycle_action_stop_research_criteria_met",
+              correlation_id: "corr-stop-research-001",
+              acted_at_utc: "2026-04-08T09:59:00.000Z",
+            },
+          ],
+        },
+        "/control/research/alpha-lifecycle-actions",
+      ),
+    ],
+  ]);
+
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    const payload = endpointPayloads.get(parsed.pathname);
+    assert.ok(payload, `Unexpected endpoint request: ${parsed.pathname}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  };
+
+  const result = await queryAlphaGovernanceReadiness({
+    baseUrl: "http://127.0.0.1:8080",
+    candidateId: "candidate::alpha-1",
+    alphaId: "alpha::mean-reversion",
+    fetchImpl,
+  });
+
+  assert.equal(result.lifecycleState, "deallocated");
+  assert.equal(result.asOfUtc, "2026-04-08T09:59:00.000Z");
+});
+
+test("Story 6.8 API uses newest lifecycle event when promotion is newer than deallocation", async () => {
+  const { queryAlphaGovernanceReadiness } = loadCompiledModule();
+  const endpointPayloads = new Map([
+    [
+      "/control/research/promotion-decisions",
+      successEnvelope(
+        {
+          kind: "decisions",
+          candidate_id: "candidate::alpha-1",
+          decisions: [
+            {
+              decision_id: "decision-newer-promote-001",
+              candidate_id: "candidate::alpha-1",
+              validation_run_id: "run-newer-promote-001",
+              lifecycle_action: "promote",
+              decision_state: "allowed",
+              reason_code: "promotion_decision_allowed",
+              observed_metrics: {},
+              evidence_packet: {},
+              threshold_results: [],
+              missing_evidence_fields: [],
+              gate_evaluation: { outcome: "allow" },
+              shadow_readiness: { reason_code: "shadow_ready" },
+              actor_id: "ops-1",
+              correlation_id: "corr-governance-readiness-001",
+              decided_at_utc: "2026-04-08T09:00:00.000Z",
+            },
+          ],
+        },
+        "/control/research/promotion-decisions",
+      ),
+    ],
+    [
+      "/control/research/shadow-evaluations",
+      successEnvelope(
+        {
+          kind: "evaluations",
+          candidate_id: "candidate::alpha-1",
+          evaluations: [],
+        },
+        "/control/research/shadow-evaluations",
+      ),
+    ],
+    [
+      "/control/research/validation-runs",
+      successEnvelope(
+        {
+          kind: "runs",
+          candidate_id: "candidate::alpha-1",
+          runs: [],
+        },
+        "/control/research/validation-runs",
+      ),
+    ],
+    [
+      "/control/research/alpha-health-metrics",
+      successEnvelope(
+        {
+          kind: "metrics",
+          alpha_id: "alpha::mean-reversion",
+          metrics: [],
+        },
+        "/control/research/alpha-health-metrics",
+      ),
+    ],
+    [
+      "/control/research/alpha-threshold-breaches",
+      successEnvelope(
+        {
+          kind: "breaches",
+          alpha_id: "alpha::mean-reversion",
+          breaches: [],
+        },
+        "/control/research/alpha-threshold-breaches",
+      ),
+    ],
+    [
+      "/control/research/alpha-lifecycle-actions",
+      successEnvelope(
+        {
+          kind: "actions",
+          alpha_id: "alpha::mean-reversion",
+          actions: [
+            {
+              action_id: "action-deallocate-older-001",
+              alpha_id: "alpha::mean-reversion",
+              action_type: "deallocate",
+              action_status: "applied",
+              reason_code: "alpha_lifecycle_action_deallocation_threshold_breached",
+              correlation_id: "corr-deallocate-older-001",
+              acted_at_utc: "2026-04-08T08:00:00.000Z",
+            },
+          ],
+        },
+        "/control/research/alpha-lifecycle-actions",
+      ),
+    ],
+  ]);
+
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    const payload = endpointPayloads.get(parsed.pathname);
+    assert.ok(payload, `Unexpected endpoint request: ${parsed.pathname}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  };
+
+  const result = await queryAlphaGovernanceReadiness({
+    baseUrl: "http://127.0.0.1:8080",
+    candidateId: "candidate::alpha-1",
+    alphaId: "alpha::mean-reversion",
+    fetchImpl,
+  });
+
+  assert.equal(result.lifecycleState, "candidate-live");
+});
+
+test("Story 6.8 API does not retain deallocated state when a newer lifecycle action is unapplied", async () => {
+  const { queryAlphaGovernanceReadiness } = loadCompiledModule();
+  const endpointPayloads = new Map([
+    [
+      "/control/research/promotion-decisions",
+      successEnvelope(
+        {
+          kind: "decisions",
+          candidate_id: "candidate::alpha-1",
+          decisions: [
+            {
+              decision_id: "decision-unapplied-001",
+              candidate_id: "candidate::alpha-1",
+              validation_run_id: "run-unapplied-001",
+              lifecycle_action: "promote",
+              decision_state: "allowed",
+              reason_code: "promotion_decision_allowed",
+              observed_metrics: {},
+              evidence_packet: {},
+              threshold_results: [],
+              missing_evidence_fields: [],
+              gate_evaluation: { outcome: "allow" },
+              shadow_readiness: { reason_code: "shadow_ready" },
+              actor_id: "ops-1",
+              correlation_id: "corr-governance-readiness-001",
+              decided_at_utc: "2026-04-08T09:00:00.000Z",
+            },
+          ],
+        },
+        "/control/research/promotion-decisions",
+      ),
+    ],
+    [
+      "/control/research/shadow-evaluations",
+      successEnvelope(
+        {
+          kind: "evaluations",
+          candidate_id: "candidate::alpha-1",
+          evaluations: [],
+        },
+        "/control/research/shadow-evaluations",
+      ),
+    ],
+    [
+      "/control/research/validation-runs",
+      successEnvelope(
+        {
+          kind: "runs",
+          candidate_id: "candidate::alpha-1",
+          runs: [],
+        },
+        "/control/research/validation-runs",
+      ),
+    ],
+    [
+      "/control/research/alpha-health-metrics",
+      successEnvelope(
+        {
+          kind: "metrics",
+          alpha_id: "alpha::mean-reversion",
+          metrics: [],
+        },
+        "/control/research/alpha-health-metrics",
+      ),
+    ],
+    [
+      "/control/research/alpha-threshold-breaches",
+      successEnvelope(
+        {
+          kind: "breaches",
+          alpha_id: "alpha::mean-reversion",
+          breaches: [],
+        },
+        "/control/research/alpha-threshold-breaches",
+      ),
+    ],
+    [
+      "/control/research/alpha-lifecycle-actions",
+      successEnvelope(
+        {
+          kind: "actions",
+          alpha_id: "alpha::mean-reversion",
+          actions: [
+            {
+              action_id: "action-deallocate-applied-001",
+              alpha_id: "alpha::mean-reversion",
+              action_type: "deallocate",
+              action_status: "applied",
+              reason_code: "alpha_lifecycle_action_deallocation_threshold_breached",
+              correlation_id: "corr-deallocate-applied-001",
+              acted_at_utc: "2026-04-08T09:59:00.000Z",
+            },
+            {
+              action_id: "action-deallocate-unapplied-001",
+              alpha_id: "alpha::mean-reversion",
+              action_type: "deallocate",
+              action_status: "unapplied",
+              reason_code: "alpha_lifecycle_action_authorization_failed",
+              correlation_id: "corr-deallocate-unapplied-001",
+              acted_at_utc: "2026-04-08T10:05:00.000Z",
+            },
+          ],
+        },
+        "/control/research/alpha-lifecycle-actions",
+      ),
+    ],
+  ]);
+
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    const payload = endpointPayloads.get(parsed.pathname);
+    assert.ok(payload, `Unexpected endpoint request: ${parsed.pathname}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  };
+
+  const result = await queryAlphaGovernanceReadiness({
+    baseUrl: "http://127.0.0.1:8080",
+    candidateId: "candidate::alpha-1",
+    alphaId: "alpha::mean-reversion",
+    fetchImpl,
+  });
+
+  assert.equal(result.lifecycleState, "candidate-live");
+  assert.equal(result.asOfUtc, "2026-04-08T10:05:00.000Z");
+});
+
+test("Story 6.8 API fails closed when lifecycle-action read endpoint is unavailable", async () => {
+  const { queryAlphaGovernanceReadiness } = loadCompiledModule();
+  const endpointPayloads = new Map([
+    [
+      "/control/research/promotion-decisions",
+      successEnvelope(
+        {
+          kind: "decisions",
+          candidate_id: "candidate::alpha-1",
+          decisions: [
+            {
+              decision_id: "decision-compat-001",
+              candidate_id: "candidate::alpha-1",
+              validation_run_id: "run-compat-001",
+              lifecycle_action: "promote",
+              decision_state: "allowed",
+              reason_code: "promotion_decision_allowed",
+              observed_metrics: {},
+              evidence_packet: {},
+              threshold_results: [],
+              missing_evidence_fields: [],
+              gate_evaluation: { outcome: "allow" },
+              shadow_readiness: { reason_code: "shadow_ready" },
+              actor_id: "ops-1",
+              correlation_id: "corr-governance-readiness-001",
+              decided_at_utc: "2026-04-08T09:00:00.000Z",
+            },
+          ],
+        },
+        "/control/research/promotion-decisions",
+      ),
+    ],
+    [
+      "/control/research/shadow-evaluations",
+      successEnvelope(
+        {
+          kind: "evaluations",
+          candidate_id: "candidate::alpha-1",
+          evaluations: [],
+        },
+        "/control/research/shadow-evaluations",
+      ),
+    ],
+    [
+      "/control/research/validation-runs",
+      successEnvelope(
+        {
+          kind: "runs",
+          candidate_id: "candidate::alpha-1",
+          runs: [],
+        },
+        "/control/research/validation-runs",
+      ),
+    ],
+    [
+      "/control/research/alpha-health-metrics",
+      successEnvelope(
+        {
+          kind: "metrics",
+          alpha_id: "alpha::mean-reversion",
+          metrics: [],
+        },
+        "/control/research/alpha-health-metrics",
+      ),
+    ],
+    [
+      "/control/research/alpha-threshold-breaches",
+      successEnvelope(
+        {
+          kind: "breaches",
+          alpha_id: "alpha::mean-reversion",
+          breaches: [],
+        },
+        "/control/research/alpha-threshold-breaches",
+      ),
+    ],
+  ]);
+
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/control/research/alpha-lifecycle-actions") {
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({
+          data: null,
+          meta: {
+            action: "governance_readiness_query",
+            actor_id: "ops-1",
+            role: "operational_control",
+            correlation_id: "corr-governance-readiness-001",
+            timestamp_utc: "2026-04-08T08:00:00.000Z",
+            endpoint: parsed.pathname,
+          },
+          error: {
+            error_code: "alpha_lifecycle_action_not_found",
+            message: "alpha lifecycle actions endpoint unavailable",
+          },
+        }),
+      };
+    }
+
+    const payload = endpointPayloads.get(parsed.pathname);
+    assert.ok(payload, `Unexpected endpoint request: ${parsed.pathname}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  };
+
+  await assert.rejects(
+    queryAlphaGovernanceReadiness({
+      baseUrl: "http://127.0.0.1:8080",
+      candidateId: "candidate::alpha-1",
+      alphaId: "alpha::mean-reversion",
+      fetchImpl,
+    }),
+    (error) => {
+      assert.equal(error.status, 404);
+      assert.equal(error.errorCode, "alpha_lifecycle_action_not_found");
+      return true;
+    },
+  );
+});
+
+test("Story 6.8 API fails closed when lifecycle-action dependency is unavailable", async () => {
+  const { queryAlphaGovernanceReadiness } = loadCompiledModule();
+  const endpointPayloads = new Map([
+    [
+      "/control/research/promotion-decisions",
+      successEnvelope(
+        {
+          kind: "decisions",
+          candidate_id: "candidate::alpha-1",
+          decisions: [],
+        },
+        "/control/research/promotion-decisions",
+      ),
+    ],
+    [
+      "/control/research/shadow-evaluations",
+      successEnvelope(
+        {
+          kind: "evaluations",
+          candidate_id: "candidate::alpha-1",
+          evaluations: [],
+        },
+        "/control/research/shadow-evaluations",
+      ),
+    ],
+    [
+      "/control/research/validation-runs",
+      successEnvelope(
+        {
+          kind: "runs",
+          candidate_id: "candidate::alpha-1",
+          runs: [],
+        },
+        "/control/research/validation-runs",
+      ),
+    ],
+    [
+      "/control/research/alpha-health-metrics",
+      successEnvelope(
+        {
+          kind: "metrics",
+          alpha_id: "alpha::mean-reversion",
+          metrics: [],
+        },
+        "/control/research/alpha-health-metrics",
+      ),
+    ],
+    [
+      "/control/research/alpha-threshold-breaches",
+      successEnvelope(
+        {
+          kind: "breaches",
+          alpha_id: "alpha::mean-reversion",
+          breaches: [],
+        },
+        "/control/research/alpha-threshold-breaches",
+      ),
+    ],
+  ]);
+
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/control/research/alpha-lifecycle-actions") {
+      return {
+        ok: false,
+        status: 503,
+        json: async () => ({
+          data: null,
+          meta: {
+            action: "governance_readiness_query",
+            actor_id: "ops-1",
+            role: "operational_control",
+            correlation_id: "corr-governance-readiness-001",
+            timestamp_utc: "2026-04-08T08:00:00.000Z",
+            endpoint: parsed.pathname,
+          },
+          error: {
+            error_code: "alpha_lifecycle_action_dependency_unavailable",
+            message: "alpha lifecycle dependencies unavailable",
+          },
+        }),
+      };
+    }
+
+    const payload = endpointPayloads.get(parsed.pathname);
+    assert.ok(payload, `Unexpected endpoint request: ${parsed.pathname}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  };
+
+  await assert.rejects(
+    queryAlphaGovernanceReadiness({
+      baseUrl: "http://127.0.0.1:8080",
+      candidateId: "candidate::alpha-1",
+      alphaId: "alpha::mean-reversion",
+      fetchImpl,
+    }),
+    (error) => {
+      assert.equal(error.status, 503);
+      assert.equal(
+        error.errorCode,
+        "alpha_lifecycle_action_dependency_unavailable",
+      );
+      return true;
+    },
+  );
+});
+
+test("Story 6.8 API fails closed when lifecycle-action payload alpha_id mismatches request", async () => {
+  const { queryAlphaGovernanceReadiness } = loadCompiledModule();
+  const endpointPayloads = new Map([
+    [
+      "/control/research/promotion-decisions",
+      successEnvelope(
+        {
+          kind: "decisions",
+          candidate_id: "candidate::alpha-1",
+          decisions: [],
+        },
+        "/control/research/promotion-decisions",
+      ),
+    ],
+    [
+      "/control/research/shadow-evaluations",
+      successEnvelope(
+        {
+          kind: "evaluations",
+          candidate_id: "candidate::alpha-1",
+          evaluations: [],
+        },
+        "/control/research/shadow-evaluations",
+      ),
+    ],
+    [
+      "/control/research/validation-runs",
+      successEnvelope(
+        {
+          kind: "runs",
+          candidate_id: "candidate::alpha-1",
+          runs: [],
+        },
+        "/control/research/validation-runs",
+      ),
+    ],
+    [
+      "/control/research/alpha-health-metrics",
+      successEnvelope(
+        {
+          kind: "metrics",
+          alpha_id: "alpha::mean-reversion",
+          metrics: [],
+        },
+        "/control/research/alpha-health-metrics",
+      ),
+    ],
+    [
+      "/control/research/alpha-threshold-breaches",
+      successEnvelope(
+        {
+          kind: "breaches",
+          alpha_id: "alpha::mean-reversion",
+          breaches: [],
+        },
+        "/control/research/alpha-threshold-breaches",
+      ),
+    ],
+    [
+      "/control/research/alpha-lifecycle-actions",
+      successEnvelope(
+        {
+          kind: "actions",
+          alpha_id: "alpha::different",
+          actions: [],
+        },
+        "/control/research/alpha-lifecycle-actions",
+      ),
+    ],
+  ]);
+
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    const payload = endpointPayloads.get(parsed.pathname);
+    assert.ok(payload, `Unexpected endpoint request: ${parsed.pathname}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  };
+
+  await assert.rejects(
+    queryAlphaGovernanceReadiness({
+      baseUrl: "http://127.0.0.1:8080",
+      candidateId: "candidate::alpha-1",
+      alphaId: "alpha::mean-reversion",
+      fetchImpl,
+    }),
+    (error) => {
+      assert.equal(error.errorCode, "governance_readiness_contract_mismatch");
+      return true;
+    },
+  );
+});
+
+test("Story 6.8 API fails closed when lifecycle-action entry alpha_id mismatches request", async () => {
+  const { queryAlphaGovernanceReadiness } = loadCompiledModule();
+  const endpointPayloads = new Map([
+    [
+      "/control/research/promotion-decisions",
+      successEnvelope(
+        {
+          kind: "decisions",
+          candidate_id: "candidate::alpha-1",
+          decisions: [],
+        },
+        "/control/research/promotion-decisions",
+      ),
+    ],
+    [
+      "/control/research/shadow-evaluations",
+      successEnvelope(
+        {
+          kind: "evaluations",
+          candidate_id: "candidate::alpha-1",
+          evaluations: [],
+        },
+        "/control/research/shadow-evaluations",
+      ),
+    ],
+    [
+      "/control/research/validation-runs",
+      successEnvelope(
+        {
+          kind: "runs",
+          candidate_id: "candidate::alpha-1",
+          runs: [],
+        },
+        "/control/research/validation-runs",
+      ),
+    ],
+    [
+      "/control/research/alpha-health-metrics",
+      successEnvelope(
+        {
+          kind: "metrics",
+          alpha_id: "alpha::mean-reversion",
+          metrics: [],
+        },
+        "/control/research/alpha-health-metrics",
+      ),
+    ],
+    [
+      "/control/research/alpha-threshold-breaches",
+      successEnvelope(
+        {
+          kind: "breaches",
+          alpha_id: "alpha::mean-reversion",
+          breaches: [],
+        },
+        "/control/research/alpha-threshold-breaches",
+      ),
+    ],
+    [
+      "/control/research/alpha-lifecycle-actions",
+      successEnvelope(
+        {
+          kind: "actions",
+          alpha_id: "alpha::mean-reversion",
+          actions: [
+            {
+              action_id: "action-deallocate-001",
+              alpha_id: "alpha::different",
+              action_type: "deallocate",
+              action_status: "applied",
+              reason_code: "alpha_lifecycle_action_deallocation_threshold_breached",
+              correlation_id: "corr-action-001",
+              acted_at_utc: "2026-04-08T09:59:00.000Z",
+            },
+          ],
+        },
+        "/control/research/alpha-lifecycle-actions",
+      ),
+    ],
+  ]);
+
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    const payload = endpointPayloads.get(parsed.pathname);
+    assert.ok(payload, `Unexpected endpoint request: ${parsed.pathname}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  };
+
+  await assert.rejects(
+    queryAlphaGovernanceReadiness({
+      baseUrl: "http://127.0.0.1:8080",
+      candidateId: "candidate::alpha-1",
+      alphaId: "alpha::mean-reversion",
+      fetchImpl,
+    }),
+    (error) => {
+      assert.equal(error.errorCode, "governance_readiness_contract_mismatch");
+      return true;
+    },
+  );
 });
 
 test("Story 6.8 API fails closed with governance_readiness_contract_mismatch on malformed envelopes", async () => {

@@ -31,6 +31,9 @@ use research_gateway::promotion::counterfactual_replay::{
 use research_gateway::promotion::decisions::{
     PromotionDecisionOrchestrator, PromotionDecisionService,
 };
+use research_gateway::promotion::lifecycle_actions::{
+    AlphaLifecycleActionOrchestrator, AlphaLifecycleActionService,
+};
 use research_gateway::validation::gate_policies::{
     ValidationGatePolicyOrchestrator, ValidationGatePolicyService,
 };
@@ -252,6 +255,7 @@ pub struct ControlApiState {
     pub research_alpha_health_orchestrator: Arc<dyn AlphaHealthOrchestrator>,
     pub research_counterfactual_replay_orchestrator: Arc<dyn CounterfactualReplayOrchestrator>,
     pub research_promotion_decision_orchestrator: Arc<dyn PromotionDecisionOrchestrator>,
+    pub research_alpha_lifecycle_action_orchestrator: Arc<dyn AlphaLifecycleActionOrchestrator>,
     pub recovery_orchestrator: Arc<dyn RecoveryOrchestrator>,
     pub attribution_pool: Option<PgPool>,
 }
@@ -373,6 +377,9 @@ impl ControlApiState {
                 CounterfactualReplayService::default(),
             ),
             research_promotion_decision_orchestrator: Arc::new(PromotionDecisionService::default()),
+            research_alpha_lifecycle_action_orchestrator: Arc::new(
+                AlphaLifecycleActionService::default(),
+            ),
             recovery_orchestrator,
             attribution_pool: None,
         }
@@ -466,6 +473,16 @@ impl ControlApiState {
         research_promotion_decision_orchestrator: Arc<dyn PromotionDecisionOrchestrator>,
     ) -> Self {
         self.research_promotion_decision_orchestrator = research_promotion_decision_orchestrator;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_research_alpha_lifecycle_action_orchestrator(
+        mut self,
+        research_alpha_lifecycle_action_orchestrator: Arc<dyn AlphaLifecycleActionOrchestrator>,
+    ) -> Self {
+        self.research_alpha_lifecycle_action_orchestrator =
+            research_alpha_lifecycle_action_orchestrator;
         self
     }
 

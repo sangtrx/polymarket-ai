@@ -691,24 +691,23 @@ pub fn validate_recovery_gate_run_evidence(
             observed_at_utc,
         );
     }
-    if let Some(age_seconds) = run.freshness_age_seconds {
-        if evaluate_freshness_readiness(age_seconds).is_err() {
-            field_errors.push(RecoveryValidationIssue {
-                field: "freshness_age_seconds",
-                code: RecoveryReasonCode::InvalidPayload.code(),
-                message: "freshness_age_seconds must be finite and >= 0".to_string(),
-            });
-        }
+    if let Some(age_seconds) = run.freshness_age_seconds
+        && evaluate_freshness_readiness(age_seconds).is_err()
+    {
+        field_errors.push(RecoveryValidationIssue {
+            field: "freshness_age_seconds",
+            code: RecoveryReasonCode::InvalidPayload.code(),
+            message: "freshness_age_seconds must be finite and >= 0".to_string(),
+        });
     }
-    if let Some(mismatch_rate) = run.reconciliation_mismatch_rate {
-        if evaluate_reconciliation_readiness(mismatch_rate).is_err() {
-            field_errors.push(RecoveryValidationIssue {
-                field: "reconciliation_mismatch_rate",
-                code: RecoveryReasonCode::InvalidPayload.code(),
-                message: "reconciliation_mismatch_rate must be finite and between 0 and 1"
-                    .to_string(),
-            });
-        }
+    if let Some(mismatch_rate) = run.reconciliation_mismatch_rate
+        && evaluate_reconciliation_readiness(mismatch_rate).is_err()
+    {
+        field_errors.push(RecoveryValidationIssue {
+            field: "reconciliation_mismatch_rate",
+            code: RecoveryReasonCode::InvalidPayload.code(),
+            message: "reconciliation_mismatch_rate must be finite and between 0 and 1".to_string(),
+        });
     }
     match (
         run.approved_checksum.as_deref(),
@@ -738,10 +737,10 @@ pub fn validate_recovery_gate_run_evidence(
                 .to_string(),
         }),
     }
-    if let Some(signoff) = run.signoff.as_ref() {
-        if let Err(error) = validate_operator_signoff(signoff) {
-            field_errors.extend(error.field_errors);
-        }
+    if let Some(signoff) = run.signoff.as_ref()
+        && let Err(error) = validate_operator_signoff(signoff)
+    {
+        field_errors.extend(error.field_errors);
     }
     if RecoveryReasonCode::parse(&run.reason_code).is_err() {
         field_errors.push(RecoveryValidationIssue {

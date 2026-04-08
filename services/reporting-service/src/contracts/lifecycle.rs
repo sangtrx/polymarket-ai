@@ -181,7 +181,7 @@ pub fn validate_contract_lifecycle(
         .lifecycle_window
         .replacement_contract_version
         .as_deref()
-        .map(|value| normalize_contract_version(value))
+        .map(normalize_contract_version)
         .transpose()?;
     if descriptor.lifecycle_status == ContractLifecycleStatus::Replaced
         && replacement_contract_version.is_none()

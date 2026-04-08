@@ -49,9 +49,10 @@ use domain::reporting_schedule::{
     parse_utc_timestamp,
 };
 use domain::research::{
-    AlphaHealthReasonCode, AlphaHypothesisReasonCode, CounterfactualReplayReasonCode,
-    PromotionDecisionReasonCode, PromotionDecisionState, ShadowEvaluationReasonCode,
-    ValidationGateReasonCode, ValidationWorkflowReasonCode, normalize_research_identifier,
+    AlphaHealthReasonCode, AlphaHypothesisReasonCode, AlphaLifecycleReasonCode,
+    AlphaLifecycleValidationIssue, CounterfactualReplayReasonCode, PromotionDecisionReasonCode,
+    PromotionDecisionState, ShadowEvaluationReasonCode, ValidationGateReasonCode,
+    ValidationWorkflowReasonCode, normalize_research_identifier,
 };
 use domain::risk::{
     EmergencyControlAction, EmergencyControlReasonCode, MarketBucketReasonCode,
@@ -121,6 +122,10 @@ use research_gateway::promotion::counterfactual_replay::{
 use research_gateway::promotion::decisions::{
     ListPromotionDecisionsInput, PromotionDecisionEvidence, PromotionDecisionServiceError,
     ReadPromotionDecisionInput, StartPromotionDecisionInput,
+};
+use research_gateway::promotion::lifecycle_actions::{
+    AlphaLifecycleActionEvidence, AlphaLifecycleActionServiceError, ListAlphaLifecycleActionsInput,
+    ReadAlphaLifecycleActionInput, StartAlphaLifecycleActionInput,
 };
 use research_gateway::validation::gate_policies::{
     EvaluateValidationGatePoliciesInput, ListValidationGatePoliciesInput,
@@ -291,6 +296,14 @@ pub fn app_router(state: ControlApiState) -> Router {
         .route(
             "/control/research/promotion-decisions/{decision_id}",
             get(read_promotion_decision),
+        )
+        .route(
+            "/control/research/alpha-lifecycle-actions",
+            post(start_alpha_lifecycle_action).get(list_alpha_lifecycle_actions),
+        )
+        .route(
+            "/control/research/alpha-lifecycle-actions/{action_id}",
+            get(read_alpha_lifecycle_action),
         )
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -2780,6 +2793,232 @@ pub async fn list_promotion_decisions(
     )
 }
 
+pub async fn start_alpha_lifecycle_action(
+    State(state): State<ControlApiState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    payload: Result<axum::Json<AlphaLifecycleActionStartPayload>, JsonRejection>,
+) -> Response {
+    let endpoint = "/control/research/alpha-lifecycle-actions".to_string();
+    let authorization = match authorize_alpha_lifecycle_action_mutation(
+        &state,
+        &actor,
+        &endpoint,
+        "alpha_lifecycle_action_start",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let payload = match payload {
+        Ok(axum::Json(payload)) => payload,
+        Err(rejection) => {
+            return alpha_lifecycle_action_payload_rejection_response(
+                &state,
+                &actor,
+                "alpha_lifecycle_action_start",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = payload
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let approval_request_id = payload
+        .approval_request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let approval_reference = payload
+        .approval_reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let evidence = match state
+        .research_alpha_lifecycle_action_orchestrator
+        .start_alpha_lifecycle_action(StartAlphaLifecycleActionInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            alpha_id: payload.alpha_id,
+            action_type: payload.action_type,
+            deallocation_policies: payload.deallocation_policies,
+            trade_count_30d: payload.trade_count_30d,
+            out_of_sample_sharpe_30d: payload.out_of_sample_sharpe_30d,
+            promotion_failure_rate_last_10: payload.promotion_failure_rate_last_10,
+            approval_request_id,
+            approval_reference,
+            history_limit: payload.history_limit,
+            correlation_id: effective_correlation_id.clone(),
+            requested_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return alpha_lifecycle_action_service_error_response(
+                &state,
+                error,
+                "alpha_lifecycle_action_start",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    alpha_lifecycle_action_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "POST",
+        "alpha_lifecycle_action_start",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn read_alpha_lifecycle_action(
+    State(state): State<ControlApiState>,
+    Path(action_id): Path<String>,
+    Query(query): Query<AlphaLifecycleActionReadQuery>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = format!("/control/research/alpha-lifecycle-actions/{action_id}");
+    let authorization = match authorize_alpha_lifecycle_action_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "alpha_lifecycle_action_read",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+
+    let evidence = match state
+        .research_alpha_lifecycle_action_orchestrator
+        .read_alpha_lifecycle_action(ReadAlphaLifecycleActionInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            action_id,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return alpha_lifecycle_action_service_error_response(
+                &state,
+                error,
+                "alpha_lifecycle_action_read",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id,
+            );
+        }
+    };
+
+    alpha_lifecycle_action_detail_response(
+        &state,
+        &actor,
+        evidence,
+        endpoint,
+        "GET",
+        "alpha_lifecycle_action_read",
+        authorization.timestamp_utc,
+    )
+}
+
+pub async fn list_alpha_lifecycle_actions(
+    State(state): State<ControlApiState>,
+    query: Result<Query<AlphaLifecycleActionsQuery>, QueryRejection>,
+    Extension(actor): Extension<AuthenticatedActor>,
+) -> Response {
+    let endpoint = "/control/research/alpha-lifecycle-actions".to_string();
+    let authorization = match authorize_alpha_lifecycle_action_read(
+        &state,
+        &actor,
+        &endpoint,
+        "GET",
+        "alpha_lifecycle_action_list",
+    ) {
+        Ok(decision) => decision,
+        Err(response) => return *response,
+    };
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(rejection) => {
+            return alpha_lifecycle_action_query_rejection_response(
+                &state,
+                &actor,
+                "alpha_lifecycle_action_list",
+                authorization.timestamp_utc.clone(),
+                endpoint,
+                rejection,
+            );
+        }
+    };
+    let effective_correlation_id = query
+        .correlation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actor.correlation_id.clone());
+    let alpha_id = query.alpha_id.clone();
+    let canonical_alpha_id = normalize_research_identifier(&alpha_id);
+
+    let actions = match state
+        .research_alpha_lifecycle_action_orchestrator
+        .list_alpha_lifecycle_actions(ListAlphaLifecycleActionsInput {
+            actor_id: actor.actor_id.clone(),
+            actor_role: actor.role.clone(),
+            alpha_id: alpha_id.clone(),
+            limit: query.limit,
+            acted_after_utc: query.acted_after_utc,
+            acted_before_utc: query.acted_before_utc,
+            correlation_id: effective_correlation_id.clone(),
+            queried_at_utc: authorization.timestamp_utc.clone(),
+        }) {
+        Ok(actions) => actions,
+        Err(error) => {
+            return alpha_lifecycle_action_service_error_response(
+                &state,
+                error,
+                "alpha_lifecycle_action_list",
+                &actor,
+                authorization.timestamp_utc,
+                endpoint,
+                effective_correlation_id.clone(),
+            );
+        }
+    };
+
+    alpha_lifecycle_action_list_response(
+        &state,
+        &actor,
+        canonical_alpha_id,
+        actions,
+        endpoint,
+        "alpha_lifecycle_action_list",
+        effective_correlation_id,
+        authorization.timestamp_utc,
+    )
+}
+
 pub async fn upsert_allocation_policy(
     State(state): State<ControlApiState>,
     Path(policy_key): Path<String>,
@@ -3639,18 +3878,18 @@ pub async fn dispatch_incident_alert(
         );
     }
 
-    if let Some(pool) = state.attribution_pool.as_ref() {
-        if let Err(error) = create_incident_alert(pool, &alert).await {
-            return incident_alert_service_error_response(
-                error.code,
-                error.message,
-                error.field_errors,
-                "incident_alert_dispatch",
-                &actor,
-                authorization.timestamp_utc.clone(),
-                endpoint,
-            );
-        }
+    if let Some(pool) = state.attribution_pool.as_ref()
+        && let Err(error) = create_incident_alert(pool, &alert).await
+    {
+        return incident_alert_service_error_response(
+            error.code,
+            error.message,
+            error.field_errors,
+            "incident_alert_dispatch",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
     }
 
     let simulation = match simulate_alert_dispatch(&alert, &payload) {
@@ -5522,18 +5761,17 @@ pub async fn upsert_report_schedule(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        && let Err(error) = parse_utc_timestamp("scheduled_at_utc", scheduled_at_utc)
     {
-        if let Err(error) = parse_utc_timestamp("scheduled_at_utc", scheduled_at_utc) {
-            return report_schedule_service_error_response(
-                error.code,
-                error.message,
-                error.field_errors,
-                "report_schedule_upsert",
-                &actor,
-                authorization.timestamp_utc.clone(),
-                endpoint,
-            );
-        }
+        return report_schedule_service_error_response(
+            error.code,
+            error.message,
+            error.field_errors,
+            "report_schedule_upsert",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
     }
 
     let evidence =
@@ -5599,18 +5837,17 @@ pub async fn pause_report_schedule(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        && let Err(error) = parse_utc_timestamp("observed_at_utc", observed_at_utc)
     {
-        if let Err(error) = parse_utc_timestamp("observed_at_utc", observed_at_utc) {
-            return report_schedule_service_error_response(
-                error.code,
-                error.message,
-                error.field_errors,
-                "report_schedule_pause",
-                &actor,
-                authorization.timestamp_utc.clone(),
-                endpoint,
-            );
-        }
+        return report_schedule_service_error_response(
+            error.code,
+            error.message,
+            error.field_errors,
+            "report_schedule_pause",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
     }
 
     let evidence =
@@ -5674,18 +5911,17 @@ pub async fn resume_report_schedule(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        && let Err(error) = parse_utc_timestamp("observed_at_utc", observed_at_utc)
     {
-        if let Err(error) = parse_utc_timestamp("observed_at_utc", observed_at_utc) {
-            return report_schedule_service_error_response(
-                error.code,
-                error.message,
-                error.field_errors,
-                "report_schedule_resume",
-                &actor,
-                authorization.timestamp_utc.clone(),
-                endpoint,
-            );
-        }
+        return report_schedule_service_error_response(
+            error.code,
+            error.message,
+            error.field_errors,
+            "report_schedule_resume",
+            &actor,
+            authorization.timestamp_utc.clone(),
+            endpoint,
+        );
     }
 
     let evidence =
@@ -6208,6 +6444,7 @@ fn report_export_job_response(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_export_artifact_list_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -7260,6 +7497,125 @@ fn authorize_promotion_decision_read(
             code: PromotionDecisionReasonCode::UnauthorizedRole.code(),
             message: machine_error.message,
             field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
+fn authorize_alpha_lifecycle_action_mutation(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ExecuteControlPlaneAction);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": "POST",
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(alpha_lifecycle_action_service_error_response(
+        state,
+        AlphaLifecycleActionServiceError {
+            code: AlphaLifecycleReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: vec![AlphaLifecycleValidationIssue {
+                field: "remediation_guidance".to_string(),
+                code: AlphaLifecycleReasonCode::UnauthorizedRole.code(),
+                message:
+                    "use an operational_control or administrative_actions role and retry with an approved request context"
+                        .to_string(),
+            }],
+        },
+        action,
+        actor,
+        decision.timestamp_utc,
+        endpoint.to_string(),
+        decision.correlation_id.clone(),
+    )))
+}
+
+fn authorize_alpha_lifecycle_action_read(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    endpoint: &str,
+    http_method: &'static str,
+    action: &'static str,
+) -> Result<AuthorizationDecision, Box<Response>> {
+    let decision = state
+        .authorization_guard
+        .evaluate(actor, ControlAction::ReadAnalyticsDashboard);
+    emit_authorization_telemetry(&decision, actor.authentication_outcome.as_str());
+
+    let audit_record = PrivilegedAuditRecord::from_authorization_decision(
+        &decision,
+        actor.authentication_outcome.as_str(),
+        json!({
+            "endpoint": endpoint,
+            "http_method": http_method,
+        }),
+    );
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return Err(Box::new(audit_append_failure_response(
+            audit_error,
+            decision.action.clone(),
+            decision.actor_id.clone(),
+            decision.role.clone(),
+            actor.authentication_outcome.as_str(),
+            decision.correlation_id.clone(),
+            decision.timestamp_utc.clone(),
+        )));
+    }
+
+    if decision.outcome == AuthorizationOutcome::Allow {
+        return Ok(decision);
+    }
+
+    let machine_error = decision
+        .machine_error()
+        .expect("denied authorization decisions always produce machine errors");
+    Err(Box::new(alpha_lifecycle_action_service_error_response(
+        state,
+        AlphaLifecycleActionServiceError {
+            code: AlphaLifecycleReasonCode::UnauthorizedRole.code(),
+            message: machine_error.message,
+            field_errors: vec![AlphaLifecycleValidationIssue {
+                field: "remediation_guidance".to_string(),
+                code: AlphaLifecycleReasonCode::UnauthorizedRole.code(),
+                message:
+                    "use a read_only_analytics, operational_control, or administrative_actions role"
+                        .to_string(),
+            }],
         },
         action,
         actor,
@@ -9256,6 +9612,7 @@ fn validation_run_detail_response(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validation_run_list_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -9608,6 +9965,7 @@ fn shadow_evaluation_detail_response(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shadow_evaluation_list_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -9931,6 +10289,7 @@ fn alpha_health_metric_detail_response(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn alpha_health_metric_list_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -10062,6 +10421,7 @@ fn alpha_threshold_breach_detail_response(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn alpha_threshold_breach_list_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -10273,9 +10633,7 @@ fn alpha_health_service_error_status(code: &str) -> StatusCode {
         code if code == AlphaHealthReasonCode::UnauthorizedRole.code() => StatusCode::FORBIDDEN,
         "alpha_health_constraint_violation"
         | "alpha_health_metric_constraint_violation"
-        | "alpha_threshold_breach_constraint_violation" => {
-            StatusCode::CONFLICT
-        }
+        | "alpha_threshold_breach_constraint_violation" => StatusCode::CONFLICT,
         code if code == AlphaHealthReasonCode::MetricNotFound.code()
             || code == AlphaHealthReasonCode::BreachNotFound.code() =>
         {
@@ -10295,7 +10653,9 @@ fn alpha_health_service_error_status(code: &str) -> StatusCode {
     }
 }
 
-fn alpha_health_metric_to_item(metric: domain::research::AlphaHealthMetricRecord) -> AlphaHealthMetricItem {
+fn alpha_health_metric_to_item(
+    metric: domain::research::AlphaHealthMetricRecord,
+) -> AlphaHealthMetricItem {
     AlphaHealthMetricItem {
         metric_id: metric.metric_id,
         alpha_id: metric.alpha_id,
@@ -10429,6 +10789,7 @@ fn counterfactual_replay_detail_response(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn counterfactual_replay_list_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -10862,6 +11223,7 @@ fn promotion_decision_detail_response(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn promotion_decision_list_response(
     state: &ControlApiState,
     actor: &AuthenticatedActor,
@@ -11105,6 +11467,367 @@ fn promotion_decision_to_item(
         decided_at_utc: decision.decided_at_utc,
         approval_request_id: decision.approval_request_id,
         approval_reference: decision.approval_reference,
+    }
+}
+
+fn alpha_lifecycle_action_detail_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    evidence: AlphaLifecycleActionEvidence,
+    endpoint: String,
+    http_method: &'static str,
+    action: &'static str,
+    timestamp_utc: String,
+) -> Response {
+    let correlation_id = evidence.action.correlation_id.clone();
+    let reason_code = evidence.reason_code.clone();
+    let record = evidence.action;
+    let action_id = record.action_id.clone();
+    let alpha_id = record.alpha_id.clone();
+    let action_type = record.action_type.as_str().to_string();
+    let action_status = record.action_status.as_str().to_string();
+    let criterion_count = record
+        .trigger_evidence
+        .get("criterion_keys")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let approval_reference = record.approval_reference.clone();
+    let audit_outcome = if http_method == "GET" || record.action_status.as_str() == "applied" {
+        PrivilegedAuditOutcome::Allow
+    } else {
+        PrivilegedAuditOutcome::AuthorizationDenied
+    };
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "action_id": action_id,
+            "alpha_id": alpha_id,
+            "action_type": action_type,
+            "action_status": action_status,
+            "criterion_count": criterion_count,
+        }),
+        approval_reference,
+        timestamp: timestamp_utc.clone(),
+        outcome: audit_outcome,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    let status = if http_method == "POST" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        axum::Json(AlphaLifecycleActionEnvelope {
+            data: Some(AlphaLifecycleActionData::Action {
+                action: alpha_lifecycle_action_to_item(record),
+                reason_code: evidence.reason_code,
+            }),
+            meta: AlphaLifecycleActionMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alpha_lifecycle_action_list_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    alpha_id: String,
+    actions: Vec<domain::research::AlphaLifecycleActionRecord>,
+    endpoint: String,
+    action: &'static str,
+    correlation_id: String,
+    timestamp_utc: String,
+) -> Response {
+    let action_count = actions.len();
+    let reason_code = AlphaLifecycleReasonCode::ActionListed.code().to_string();
+    let action_items = actions
+        .into_iter()
+        .map(alpha_lifecycle_action_to_item)
+        .collect::<Vec<_>>();
+
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": "GET",
+            "alpha_id": alpha_id,
+            "action_count": action_count,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::Allow,
+        reason_code,
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id,
+            timestamp_utc,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(AlphaLifecycleActionEnvelope {
+            data: Some(AlphaLifecycleActionData::Actions {
+                alpha_id,
+                actions: action_items,
+            }),
+            meta: AlphaLifecycleActionMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_lifecycle_action_payload_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: JsonRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    alpha_lifecycle_action_service_error_response(
+        state,
+        AlphaLifecycleActionServiceError {
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: format!("invalid alpha lifecycle action payload: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn alpha_lifecycle_action_query_rejection_response(
+    state: &ControlApiState,
+    actor: &AuthenticatedActor,
+    action: &'static str,
+    timestamp_utc: String,
+    endpoint: String,
+    rejection: QueryRejection,
+) -> Response {
+    let rejection_message = rejection.body_text();
+    alpha_lifecycle_action_service_error_response(
+        state,
+        AlphaLifecycleActionServiceError {
+            code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+            message: format!("invalid alpha lifecycle action query: {rejection_message}"),
+            field_errors: Vec::new(),
+        },
+        action,
+        actor,
+        timestamp_utc,
+        endpoint,
+        actor.correlation_id.clone(),
+    )
+}
+
+fn alpha_lifecycle_action_service_error_response(
+    state: &ControlApiState,
+    error: AlphaLifecycleActionServiceError,
+    action: &'static str,
+    actor: &AuthenticatedActor,
+    timestamp_utc: String,
+    endpoint: String,
+    correlation_id: String,
+) -> Response {
+    let http_method = if action.ends_with("_read") || action.ends_with("_list") {
+        "GET"
+    } else {
+        "POST"
+    };
+    let audit_record = PrivilegedAuditRecord {
+        actor_id: actor.actor_id.clone(),
+        role: actor.role.clone(),
+        action_type: action.to_string(),
+        parameters: json!({
+            "endpoint": endpoint.clone(),
+            "http_method": http_method,
+            "error_code": error.code,
+        }),
+        approval_reference: None,
+        timestamp: timestamp_utc.clone(),
+        outcome: PrivilegedAuditOutcome::AuthorizationDenied,
+        reason_code: error.code.to_string(),
+        authentication_outcome: actor.authentication_outcome.as_str().to_string(),
+        correlation_id: correlation_id.clone(),
+    };
+    if let Err(audit_error) = state.audit_appender.append_privileged_audit(audit_record) {
+        return audit_append_failure_response(
+            audit_error,
+            action.to_string(),
+            actor.actor_id.clone(),
+            actor.role.clone(),
+            actor.authentication_outcome.as_str(),
+            correlation_id.clone(),
+            timestamp_utc,
+        );
+    }
+
+    let security_signal = if error.code == AlphaLifecycleReasonCode::UnauthorizedRole.code() {
+        Some(AlphaLifecycleActionSecuritySignal {
+            name: if action.ends_with("_read") || action.ends_with("_list") {
+                "unauthorized_alpha_lifecycle_action_read_attempt_v1"
+            } else {
+                "unauthorized_alpha_lifecycle_action_mutation_attempt_v1"
+            },
+            severity: "critical",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else if error.code == AlphaLifecycleReasonCode::DependencyUnavailable.code()
+        || error.code == AlphaLifecycleReasonCode::StateUnavailable.code()
+        || error.code == AlphaLifecycleReasonCode::PersistenceUnavailable.code()
+        || error.code == "alpha_lifecycle_action_constraint_violation"
+        || error.code == "alpha_lifecycle_action_query_failed"
+        || error.code == "alpha_lifecycle_action_row_decode_failed"
+    {
+        Some(AlphaLifecycleActionSecuritySignal {
+            name: "alpha_lifecycle_action_fail_closed_v1",
+            severity: "critical",
+            alert_compatible: true,
+            alert_target_seconds: 30,
+        })
+    } else {
+        None
+    };
+
+    (
+        alpha_lifecycle_action_service_error_status(error.code),
+        axum::Json(AlphaLifecycleActionEnvelope::<AlphaLifecycleActionData> {
+            data: None,
+            meta: AlphaLifecycleActionMeta {
+                action: action.to_string(),
+                actor_id: actor.actor_id.clone(),
+                role: actor.role.clone(),
+                correlation_id,
+                timestamp_utc,
+                endpoint,
+            },
+            error: Some(AlphaLifecycleActionEnvelopeError {
+                error_code: error.code.to_string(),
+                message: error.message,
+                field_errors: error
+                    .field_errors
+                    .into_iter()
+                    .map(|issue| AlphaLifecycleActionFieldError {
+                        field: issue.field,
+                        code: issue.code.to_string(),
+                        message: issue.message,
+                    })
+                    .collect(),
+                security_signal,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+fn alpha_lifecycle_action_service_error_status(code: &str) -> StatusCode {
+    match code {
+        code if code == AlphaLifecycleReasonCode::InvalidPayload.code() => StatusCode::BAD_REQUEST,
+        code if code == AlphaLifecycleReasonCode::UnauthorizedRole.code() => StatusCode::FORBIDDEN,
+        code if code == AlphaLifecycleReasonCode::ActionNotFound.code() => StatusCode::CONFLICT,
+        code if code == AlphaLifecycleReasonCode::ActionDenied.code()
+            || code == AlphaLifecycleReasonCode::DeallocationThresholdBreached.code()
+            || code == AlphaLifecycleReasonCode::StopResearchCriteriaMet.code() =>
+        {
+            StatusCode::CONFLICT
+        }
+        code if code == AlphaLifecycleReasonCode::DependencyUnavailable.code()
+            || code == AlphaLifecycleReasonCode::StateUnavailable.code()
+            || code == AlphaLifecycleReasonCode::PersistenceUnavailable.code()
+            || code == "alpha_lifecycle_action_constraint_violation"
+            || code == "alpha_lifecycle_action_query_failed"
+            || code == "alpha_lifecycle_action_row_decode_failed" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn alpha_lifecycle_action_to_item(
+    action: domain::research::AlphaLifecycleActionRecord,
+) -> AlphaLifecycleActionItem {
+    AlphaLifecycleActionItem {
+        action_id: action.action_id,
+        alpha_id: action.alpha_id,
+        action_type: action.action_type.as_str().to_string(),
+        action_status: action.action_status.as_str().to_string(),
+        reason_code: action.reason_code,
+        trigger_evidence: action.trigger_evidence,
+        stop_research_criteria: action
+            .stop_research_criteria
+            .map(alpha_stop_research_criteria_to_item),
+        remediation_guidance: action.remediation_guidance,
+        actor_id: action.actor_id,
+        correlation_id: action.correlation_id,
+        acted_at_utc: action.acted_at_utc,
+        approval_request_id: action.approval_request_id,
+        approval_reference: action.approval_reference,
+    }
+}
+
+fn alpha_stop_research_criteria_to_item(
+    criteria: domain::research::StopResearchCriteriaSnapshot,
+) -> AlphaLifecycleStopResearchCriteriaItem {
+    AlphaLifecycleStopResearchCriteriaItem {
+        trade_count_30d: criteria.trade_count_30d,
+        out_of_sample_sharpe_30d: criteria.out_of_sample_sharpe_30d,
+        promotion_failure_rate_last_10: criteria.promotion_failure_rate_last_10,
+        triggered_criteria: criteria.triggered_criteria,
     }
 }
 
@@ -14055,6 +14778,47 @@ pub struct PromotionDecisionReadQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AlphaLifecycleActionStartPayload {
+    pub alpha_id: String,
+    pub action_type: String,
+    #[serde(default)]
+    pub deallocation_policies: Vec<domain::research::AlphaLifecycleDeallocationPolicy>,
+    #[serde(default)]
+    pub trade_count_30d: Option<i64>,
+    #[serde(default)]
+    pub out_of_sample_sharpe_30d: Option<f64>,
+    #[serde(default)]
+    pub promotion_failure_rate_last_10: Option<f64>,
+    #[serde(default)]
+    pub approval_request_id: Option<String>,
+    #[serde(default)]
+    pub approval_reference: Option<String>,
+    #[serde(default)]
+    pub history_limit: Option<i64>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlphaLifecycleActionsQuery {
+    pub alpha_id: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub acted_after_utc: Option<String>,
+    #[serde(default)]
+    pub acted_before_utc: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AlphaLifecycleActionReadQuery {
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmergencyControlPayload {
     #[serde(default)]
     pub audit_reference: Option<String>,
@@ -15127,6 +15891,7 @@ pub struct ShadowEvaluationEnvelope<T: Serialize> {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ShadowEvaluationData {
     Evaluation {
         evaluation: ShadowEvaluationItem,
@@ -15320,6 +16085,7 @@ pub struct CounterfactualReplayEnvelope<T: Serialize> {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum CounterfactualReplayData {
     ReplayRun {
         replay_run: CounterfactualReplayRunItem,
@@ -15414,6 +16180,93 @@ pub struct CounterfactualReplayScenarioParametersItem {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AlphaLifecycleActionEnvelope<T: Serialize> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    pub meta: AlphaLifecycleActionMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AlphaLifecycleActionEnvelopeError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+pub enum AlphaLifecycleActionData {
+    Action {
+        action: AlphaLifecycleActionItem,
+        reason_code: String,
+    },
+    Actions {
+        alpha_id: String,
+        actions: Vec<AlphaLifecycleActionItem>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaLifecycleActionMeta {
+    pub action: String,
+    pub actor_id: String,
+    pub role: String,
+    pub correlation_id: String,
+    pub timestamp_utc: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaLifecycleActionEnvelopeError {
+    pub error_code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<AlphaLifecycleActionFieldError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_signal: Option<AlphaLifecycleActionSecuritySignal>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaLifecycleActionFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaLifecycleActionSecuritySignal {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub alert_compatible: bool,
+    pub alert_target_seconds: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaLifecycleActionItem {
+    pub action_id: String,
+    pub alpha_id: String,
+    pub action_type: String,
+    pub action_status: String,
+    pub reason_code: String,
+    pub trigger_evidence: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_research_criteria: Option<AlphaLifecycleStopResearchCriteriaItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_guidance: Option<String>,
+    pub actor_id: String,
+    pub correlation_id: String,
+    pub acted_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlphaLifecycleStopResearchCriteriaItem {
+    pub trade_count_30d: i64,
+    pub out_of_sample_sharpe_30d: f64,
+    pub promotion_failure_rate_last_10: f64,
+    pub triggered_criteria: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PromotionDecisionEnvelope<T: Serialize> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
@@ -15424,6 +16277,7 @@ pub struct PromotionDecisionEnvelope<T: Serialize> {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum PromotionDecisionData {
     Decision {
         decision: PromotionDecisionItem,
@@ -16027,18 +16881,19 @@ mod tests {
     use domain::reporting_schedule::{ReportingCadence, ReportingRunState};
     use domain::research::{
         AlphaHealthAttributionWindowMetrics, AlphaHealthMetricKey, AlphaHealthMetricRecord,
-        AlphaHealthMetricWindow, AlphaHealthReasonCode,
-        AlphaHypothesisReasonCode, AlphaHypothesisValidationIssue, AlphaThresholdBreachRecord,
-        CounterfactualReplayGateOutcome, CounterfactualReplayReasonCode,
-        CounterfactualReplayRunRecord, CounterfactualReplayRunState,
-        CounterfactualReplayScenarioKind, PromotionDecisionReasonCode, PromotionDecisionState,
-        ShadowEvaluationReasonCode, ShadowEvaluationRecord, ShadowEvaluationState,
-        ShadowSimulationDecisionSide, ShadowSimulationOutcome, ShadowSimulationReasonCode,
+        AlphaHealthMetricWindow, AlphaHealthReasonCode, AlphaHypothesisReasonCode,
+        AlphaHypothesisValidationIssue, AlphaLifecycleActionStatus, AlphaLifecycleActionType,
+        AlphaLifecycleReasonCode, AlphaThresholdBreachRecord, CounterfactualReplayGateOutcome,
+        CounterfactualReplayReasonCode, CounterfactualReplayRunRecord,
+        CounterfactualReplayRunState, CounterfactualReplayScenarioKind,
+        PromotionDecisionReasonCode, PromotionDecisionState, ShadowEvaluationReasonCode,
+        ShadowEvaluationRecord, ShadowEvaluationState, ShadowSimulationDecisionSide,
+        ShadowSimulationOutcome, ShadowSimulationReasonCode, StopResearchCriteriaSnapshot,
         ValidationDiagnosticsPayload, ValidationGateComparator, ValidationGateReasonCode,
         ValidationGateValidationIssue, ValidationMetricDelta, ValidationStageComparison,
-        ValidationWorkflowArtifactRecord, ValidationWorkflowReasonCode, ValidationWorkflowRunRecord,
-        ValidationWorkflowRunState, ValidationWorkflowStage, ValidationWorkflowStageOutcome,
-        ValidationWorkflowValidationIssue,
+        ValidationWorkflowArtifactRecord, ValidationWorkflowReasonCode,
+        ValidationWorkflowRunRecord, ValidationWorkflowRunState, ValidationWorkflowStage,
+        ValidationWorkflowStageOutcome, ValidationWorkflowValidationIssue,
     };
     use domain::risk::{
         EmergencyControlMode, EmergencyControlReasonCode, EmergencyControlSource,
@@ -16104,6 +16959,11 @@ mod tests {
     use research_gateway::promotion::decisions::{
         ListPromotionDecisionsInput, PromotionDecisionEvidence, PromotionDecisionOrchestrator,
         PromotionDecisionServiceError, ReadPromotionDecisionInput, StartPromotionDecisionInput,
+    };
+    use research_gateway::promotion::lifecycle_actions::{
+        AlphaLifecycleActionEvidence, AlphaLifecycleActionOrchestrator,
+        AlphaLifecycleActionServiceError, ListAlphaLifecycleActionsInput,
+        ReadAlphaLifecycleActionInput, StartAlphaLifecycleActionInput,
     };
     use research_gateway::validation::gate_policies::{
         EvaluateValidationGatePoliciesInput, ListValidationGatePoliciesInput,
@@ -17718,7 +18578,9 @@ mod tests {
                     input.breach_id,
                     "alpha::mean-reversion::1712457600000000000".to_string(),
                     "alpha::mean-reversion".to_string(),
-                    AlphaHealthReasonCode::ThresholdBreachRead.code().to_string(),
+                    AlphaHealthReasonCode::ThresholdBreachRead
+                        .code()
+                        .to_string(),
                     input.correlation_id.clone(),
                     input.queried_at_utc,
                 ),
@@ -17740,7 +18602,9 @@ mod tests {
                 "alpha::mean-reversion::rolling_drawdown::1712457600000000000".to_string(),
                 "alpha::mean-reversion::1712457600000000000".to_string(),
                 input.alpha_id,
-                AlphaHealthReasonCode::ThresholdBreachListed.code().to_string(),
+                AlphaHealthReasonCode::ThresholdBreachListed
+                    .code()
+                    .to_string(),
                 input.correlation_id,
                 input.queried_at_utc,
             )])
@@ -18109,6 +18973,173 @@ mod tests {
                 input.correlation_id,
                 input.queried_at_utc,
             )])
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StubAlphaLifecycleActionOrchestrator {
+        start_error: Option<(&'static str, &'static str)>,
+        read_error: Option<(&'static str, &'static str)>,
+        list_error: Option<(&'static str, &'static str)>,
+    }
+
+    impl StubAlphaLifecycleActionOrchestrator {
+        fn service_error(
+            code: &'static str,
+            message: &'static str,
+        ) -> AlphaLifecycleActionServiceError {
+            AlphaLifecycleActionServiceError {
+                code,
+                message: message.to_string(),
+                field_errors: if code == AlphaLifecycleReasonCode::InvalidPayload.code() {
+                    vec![domain::research::AlphaLifecycleValidationIssue {
+                        field: "alpha_id".to_string(),
+                        code: AlphaLifecycleReasonCode::InvalidPayload.code(),
+                        message: "alpha_id cannot be blank".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+
+        fn sample_action(
+            action_id: String,
+            alpha_id: String,
+            action_type: AlphaLifecycleActionType,
+            action_status: AlphaLifecycleActionStatus,
+            reason_code: String,
+            correlation_id: String,
+            acted_at_utc: String,
+        ) -> domain::research::AlphaLifecycleActionRecord {
+            let stop_research_criteria = if action_type == AlphaLifecycleActionType::StopResearch {
+                Some(StopResearchCriteriaSnapshot {
+                    trade_count_30d: 142,
+                    out_of_sample_sharpe_30d: 0.18,
+                    promotion_failure_rate_last_10: 0.8,
+                    triggered_criteria: vec!["trade_count_30d_lt_200".to_string()],
+                })
+            } else {
+                None
+            };
+            domain::research::AlphaLifecycleActionRecord {
+                action_id,
+                alpha_id,
+                action_type,
+                action_status,
+                reason_code,
+                trigger_evidence: serde_json::json!({
+                    "criterion_keys": ["rolling_sharpe_breach", "drawdown_breach"],
+                }),
+                stop_research_criteria,
+                remediation_guidance: Some(
+                    "investigate degradation and retrain before re-allocation".to_string(),
+                ),
+                actor_id: "ops-1".to_string(),
+                correlation_id,
+                acted_at_utc,
+                approval_request_id: Some("request::alpha-lifecycle-001".to_string()),
+                approval_reference: Some("approval::alpha-lifecycle-001".to_string()),
+            }
+        }
+    }
+
+    impl AlphaLifecycleActionOrchestrator for StubAlphaLifecycleActionOrchestrator {
+        fn start_alpha_lifecycle_action(
+            &self,
+            input: StartAlphaLifecycleActionInput,
+        ) -> Result<AlphaLifecycleActionEvidence, AlphaLifecycleActionServiceError> {
+            if let Some((code, message)) = self.start_error {
+                return Err(Self::service_error(code, message));
+            }
+
+            let normalized_alpha_id = normalize_research_identifier(&input.alpha_id);
+            let normalized_action_type = normalize_research_identifier(&input.action_type);
+            let action_type = if normalized_action_type == "deallocate" {
+                AlphaLifecycleActionType::Deallocate
+            } else {
+                AlphaLifecycleActionType::StopResearch
+            };
+            let reason_code = if action_type == AlphaLifecycleActionType::Deallocate {
+                AlphaLifecycleReasonCode::DeallocationThresholdBreached
+                    .code()
+                    .to_string()
+            } else {
+                AlphaLifecycleReasonCode::StopResearchCriteriaMet
+                    .code()
+                    .to_string()
+            };
+            let action = Self::sample_action(
+                format!("{normalized_alpha_id}::1712457600000000000"),
+                normalized_alpha_id,
+                action_type,
+                AlphaLifecycleActionStatus::Applied,
+                reason_code,
+                input.correlation_id,
+                input.requested_at_utc,
+            );
+            Ok(AlphaLifecycleActionEvidence {
+                action,
+                reason_code: AlphaLifecycleReasonCode::ActionStarted.code().to_string(),
+            })
+        }
+
+        fn read_alpha_lifecycle_action(
+            &self,
+            input: ReadAlphaLifecycleActionInput,
+        ) -> Result<AlphaLifecycleActionEvidence, AlphaLifecycleActionServiceError> {
+            if let Some((code, message)) = self.read_error {
+                return Err(Self::service_error(code, message));
+            }
+            let action = Self::sample_action(
+                input.action_id,
+                "alpha::mean-reversion".to_string(),
+                AlphaLifecycleActionType::StopResearch,
+                AlphaLifecycleActionStatus::Applied,
+                AlphaLifecycleReasonCode::StopResearchCriteriaMet
+                    .code()
+                    .to_string(),
+                input.correlation_id,
+                input.queried_at_utc,
+            );
+            Ok(AlphaLifecycleActionEvidence {
+                action,
+                reason_code: AlphaLifecycleReasonCode::ActionRead.code().to_string(),
+            })
+        }
+
+        fn list_alpha_lifecycle_actions(
+            &self,
+            input: ListAlphaLifecycleActionsInput,
+        ) -> Result<
+            Vec<domain::research::AlphaLifecycleActionRecord>,
+            AlphaLifecycleActionServiceError,
+        > {
+            if let Some((code, message)) = self.list_error {
+                return Err(Self::service_error(code, message));
+            }
+            Ok(vec![
+                Self::sample_action(
+                    "alpha::mean-reversion::1712457600000000000".to_string(),
+                    normalize_research_identifier(&input.alpha_id),
+                    AlphaLifecycleActionType::StopResearch,
+                    AlphaLifecycleActionStatus::Applied,
+                    AlphaLifecycleReasonCode::StopResearchCriteriaMet
+                        .code()
+                        .to_string(),
+                    input.correlation_id.clone(),
+                    input.queried_at_utc.clone(),
+                ),
+                Self::sample_action(
+                    "alpha::mean-reversion::1712454000000000000".to_string(),
+                    normalize_research_identifier(&input.alpha_id),
+                    AlphaLifecycleActionType::Deallocate,
+                    AlphaLifecycleActionStatus::Denied,
+                    AlphaLifecycleReasonCode::ActionDenied.code().to_string(),
+                    input.correlation_id,
+                    "2026-04-06T23:00:00Z".to_string(),
+                ),
+            ])
         }
     }
 
@@ -18568,7 +19599,7 @@ mod tests {
             let selector_correlation = input
                 .query_correlation_id
                 .unwrap_or_else(|| input.correlation_id.clone());
-            let limit = input.limit.unwrap_or(2).clamp(1, 3) as usize;
+            let limit = input.limit.unwrap_or(2).clamp(1, 3);
             Ok((0..limit)
                 .map(|index| {
                     sample_restore_rehearsal_run(
@@ -19060,6 +20091,28 @@ mod tests {
                 Arc::new(RecoveryService::default()),
             )
             .with_research_promotion_decision_orchestrator(promotion_decision_orchestrator),
+        )
+    }
+
+    fn test_app_with_alpha_lifecycle_action_orchestrator(
+        alpha_lifecycle_action_orchestrator: Arc<dyn AlphaLifecycleActionOrchestrator>,
+    ) -> Router {
+        test_app_with_state(
+            ControlApiState::with_all_orchestrators(
+                Arc::new(GovernanceAuthorizationGuard::new(
+                    AuthorizationEvaluator::default(),
+                )),
+                Arc::new(HeaderTokenAuthenticator),
+                Arc::new(CapturingAuditAppender::default()),
+                Arc::new(GovernanceApprovalService::default()),
+                Arc::new(CredentialRotationService::default()),
+                Arc::new(AllocationPolicyService::default()),
+                Arc::new(StubMarketPolicyOrchestrator::default()),
+                Arc::new(RiskLimitService::default()),
+                Arc::new(SafetyControlService::default()),
+                Arc::new(RecoveryService::default()),
+            )
+            .with_research_alpha_lifecycle_action_orchestrator(alpha_lifecycle_action_orchestrator),
         )
     }
 
@@ -23630,7 +24683,10 @@ mod tests {
         )
         .expect("payload should be valid json");
         assert_eq!(metric_read_payload["data"]["kind"], "metric");
-        assert_eq!(metric_read_payload["meta"]["action"], "alpha_health_metric_read");
+        assert_eq!(
+            metric_read_payload["meta"]["action"],
+            "alpha_health_metric_read"
+        );
 
         let metric_list_response = app
             .clone()
@@ -23656,8 +24712,14 @@ mod tests {
         )
         .expect("payload should be valid json");
         assert_eq!(metric_list_payload["data"]["kind"], "metrics");
-        assert_eq!(metric_list_payload["data"]["alpha_id"], "alpha::mean-reversion");
-        assert_eq!(metric_list_payload["meta"]["action"], "alpha_health_metric_list");
+        assert_eq!(
+            metric_list_payload["data"]["alpha_id"],
+            "alpha::mean-reversion"
+        );
+        assert_eq!(
+            metric_list_payload["meta"]["action"],
+            "alpha_health_metric_list"
+        );
 
         let breach_read_response = app
             .clone()
@@ -23683,7 +24745,10 @@ mod tests {
         )
         .expect("payload should be valid json");
         assert_eq!(breach_read_payload["data"]["kind"], "breach");
-        assert_eq!(breach_read_payload["meta"]["action"], "alpha_threshold_breach_read");
+        assert_eq!(
+            breach_read_payload["meta"]["action"],
+            "alpha_threshold_breach_read"
+        );
 
         let breach_list_response = app
             .oneshot(
@@ -23708,7 +24773,10 @@ mod tests {
         )
         .expect("payload should be valid json");
         assert_eq!(breach_list_payload["data"]["kind"], "breaches");
-        assert_eq!(breach_list_payload["data"]["alpha_id"], "alpha::mean-reversion");
+        assert_eq!(
+            breach_list_payload["data"]["alpha_id"],
+            "alpha::mean-reversion"
+        );
         assert_eq!(
             breach_list_payload["meta"]["action"],
             "alpha_threshold_breach_list"
@@ -23754,7 +24822,10 @@ mod tests {
                 .expect("body should be readable"),
         )
         .expect("payload should be valid json");
-        assert_eq!(payload["error"]["error_code"], "alpha_health_invalid_payload");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "alpha_health_invalid_payload"
+        );
         assert_eq!(payload["meta"]["action"], "alpha_health_metric_start");
         assert!(payload["data"].is_null());
     }
@@ -23787,22 +24858,24 @@ mod tests {
                 .expect("body should be readable"),
         )
         .expect("payload should be valid json");
-        assert_eq!(payload["error"]["error_code"], "alpha_health_invalid_payload");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "alpha_health_invalid_payload"
+        );
         assert_eq!(payload["meta"]["action"], "alpha_health_metric_list");
         assert!(payload["data"].is_null());
     }
 
     #[tokio::test]
     async fn alpha_health_service_errors_emit_unauthorized_security_signals() {
-        let mutation_app = test_app_with_alpha_health_orchestrator(Arc::new(
-            StubAlphaHealthOrchestrator {
+        let mutation_app =
+            test_app_with_alpha_health_orchestrator(Arc::new(StubAlphaHealthOrchestrator {
                 start_error: Some((
                     AlphaHealthReasonCode::UnauthorizedRole.code(),
                     "forbidden alpha health mutation",
                 )),
                 ..Default::default()
-            },
-        ));
+            }));
         let mutation_response = mutation_app
             .oneshot(
                 Request::builder()
@@ -23841,15 +24914,14 @@ mod tests {
             "unauthorized_alpha_health_mutation_attempt_v1"
         );
 
-        let read_app = test_app_with_alpha_health_orchestrator(Arc::new(
-            StubAlphaHealthOrchestrator {
+        let read_app =
+            test_app_with_alpha_health_orchestrator(Arc::new(StubAlphaHealthOrchestrator {
                 read_metric_error: Some((
                     AlphaHealthReasonCode::UnauthorizedRole.code(),
                     "forbidden alpha health read",
                 )),
                 ..Default::default()
-            },
-        ));
+            }));
         let read_response = read_app
             .oneshot(
                 Request::builder()
@@ -24095,7 +25167,10 @@ mod tests {
                         "authorization",
                         bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
                     )
-                    .header("x-correlation-id", "corr-counterfactual-replay-start-auth-001")
+                    .header(
+                        "x-correlation-id",
+                        "corr-counterfactual-replay-start-auth-001",
+                    )
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{
@@ -24580,6 +25655,410 @@ mod tests {
             read_payload["error"]["security_signal"]["name"],
             "unauthorized_promotion_decision_read_attempt_v1"
         );
+    }
+
+    #[tokio::test]
+    async fn alpha_lifecycle_action_start_route_returns_data_meta_error_envelope() {
+        let app = test_app_with_alpha_lifecycle_action_orchestrator(Arc::new(
+            StubAlphaLifecycleActionOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-start-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "alpha_id":" alpha::mean-reversion ",
+                            "action_type":"stop_research",
+                            "trade_count_30d":142,
+                            "out_of_sample_sharpe_30d":0.18,
+                            "promotion_failure_rate_last_10":0.8,
+                            "deallocation_policies":[{"metric_key":"rolling_sharpe","comparator":"lte","threshold_value":0.4}]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(payload["data"]["kind"], "action");
+        assert_eq!(
+            payload["data"]["action"]["action_id"],
+            "alpha::mean-reversion::1712457600000000000"
+        );
+        assert_eq!(payload["meta"]["action"], "alpha_lifecycle_action_start");
+        assert!(payload["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn alpha_lifecycle_action_read_list_routes_return_envelope_shapes() {
+        let app = test_app_with_alpha_lifecycle_action_orchestrator(Arc::new(
+            StubAlphaLifecycleActionOrchestrator::default(),
+        ));
+
+        let read_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions/alpha::mean-reversion::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-read-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(read_payload["data"]["kind"], "action");
+        assert_eq!(
+            read_payload["meta"]["action"],
+            "alpha_lifecycle_action_read"
+        );
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions?alpha_id=%20Alpha::Mean-Reversion%20&limit=2")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-list-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(list_payload["data"]["kind"], "actions");
+        assert_eq!(
+            list_payload["data"]["actions"][0]["reason_code"],
+            "alpha_lifecycle_action_stop_research_criteria_met"
+        );
+        assert_eq!(list_payload["data"]["alpha_id"], "alpha::mean-reversion");
+        assert_eq!(
+            list_payload["meta"]["action"],
+            "alpha_lifecycle_action_list"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpha_lifecycle_action_read_audit_outcome_is_allow_for_successful_reads() {
+        let audit_appender = Arc::new(CapturingAuditAppender::default());
+        let app = test_app_with_audit_appender(audit_appender.clone());
+
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-audit-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "alpha_id":"alpha::mean-reversion",
+                            "action_type":"deallocate",
+                            "deallocation_policies":[{"metric_key":"rolling_drawdown","comparator":"gt","threshold_value":0.1}]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(start_response.status(), StatusCode::ACCEPTED);
+        let start_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(start_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(start_payload["data"]["action"]["action_status"], "denied");
+        let action_id = start_payload["data"]["action"]["action_id"]
+            .as_str()
+            .expect("start response should include action_id");
+
+        let read_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/control/research/alpha-lifecycle-actions/{action_id}"
+                    ))
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-audit-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::OK);
+
+        let read_audit = audit_appender
+            .snapshot()
+            .into_iter()
+            .find(|record| record.action_type == "alpha_lifecycle_action_read")
+            .expect("read response should append alpha_lifecycle_action_read audit record");
+        assert_eq!(read_audit.outcome, PrivilegedAuditOutcome::Allow);
+    }
+
+    #[tokio::test]
+    async fn alpha_lifecycle_action_read_not_found_maps_to_conflict() {
+        let app = test_app_with_alpha_lifecycle_action_orchestrator(Arc::new(
+            StubAlphaLifecycleActionOrchestrator {
+                read_error: Some((
+                    AlphaLifecycleReasonCode::ActionNotFound.code(),
+                    "alpha lifecycle action was not found",
+                )),
+                ..Default::default()
+            },
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions/alpha::mean-reversion::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-read-missing-001")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            AlphaLifecycleReasonCode::ActionNotFound.code()
+        );
+        assert_eq!(payload["meta"]["action"], "alpha_lifecycle_action_read");
+    }
+
+    #[tokio::test]
+    async fn alpha_lifecycle_action_start_route_maps_json_rejection_to_bad_request_envelope() {
+        let app = test_app_with_alpha_lifecycle_action_orchestrator(Arc::new(
+            StubAlphaLifecycleActionOrchestrator::default(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-start-002")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "alpha_id":123,
+                            "action_type":"deallocate",
+                            "deallocation_policies":[{"metric_key":"rolling_sharpe","comparator":"lte","threshold_value":0.4}]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "alpha_lifecycle_action_invalid_payload"
+        );
+        assert_eq!(payload["meta"]["action"], "alpha_lifecycle_action_start");
+        assert!(payload["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn alpha_lifecycle_action_service_errors_emit_unauthorized_security_signals() {
+        let mutation_app = test_app_with_alpha_lifecycle_action_orchestrator(Arc::new(
+            StubAlphaLifecycleActionOrchestrator {
+                start_error: Some((
+                    AlphaLifecycleReasonCode::UnauthorizedRole.code(),
+                    "forbidden alpha lifecycle mutation",
+                )),
+                ..Default::default()
+            },
+        ));
+        let mutation_response = mutation_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions")
+                    .method("POST")
+                    .header(
+                        "authorization",
+                        bearer_token("ops-1", "operational_control", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-start-003")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "alpha_id":"alpha::mean-reversion",
+                            "action_type":"deallocate",
+                            "deallocation_policies":[{"metric_key":"rolling_sharpe","comparator":"lte","threshold_value":0.4}]
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        let mutation_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(mutation_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            mutation_payload["error"]["security_signal"]["name"],
+            "unauthorized_alpha_lifecycle_action_mutation_attempt_v1"
+        );
+        assert_eq!(
+            mutation_payload["error"]["security_signal"]["severity"],
+            "critical"
+        );
+
+        let read_app = test_app_with_alpha_lifecycle_action_orchestrator(Arc::new(
+            StubAlphaLifecycleActionOrchestrator {
+                read_error: Some((
+                    AlphaLifecycleReasonCode::UnauthorizedRole.code(),
+                    "forbidden alpha lifecycle read",
+                )),
+                ..Default::default()
+            },
+        ));
+        let read_response = read_app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions/alpha::mean-reversion::1712457600000000000")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-read-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(read_response.status(), StatusCode::FORBIDDEN);
+        let read_payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(read_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            read_payload["error"]["security_signal"]["name"],
+            "unauthorized_alpha_lifecycle_action_read_attempt_v1"
+        );
+        assert_eq!(
+            read_payload["error"]["security_signal"]["severity"],
+            "critical"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpha_lifecycle_action_dependency_unavailable_maps_to_service_unavailable() {
+        let app = test_app_with_alpha_lifecycle_action_orchestrator(Arc::new(
+            StubAlphaLifecycleActionOrchestrator {
+                list_error: Some((
+                    AlphaLifecycleReasonCode::DependencyUnavailable.code(),
+                    "alpha lifecycle dependencies unavailable",
+                )),
+                ..Default::default()
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/research/alpha-lifecycle-actions?alpha_id=alpha::mean-reversion")
+                    .method("GET")
+                    .header(
+                        "authorization",
+                        bearer_token("analyst-1", "read_only_analytics", 4_102_444_800),
+                    )
+                    .header("x-correlation-id", "corr-alpha-lifecycle-list-002")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("payload should be valid json");
+        assert_eq!(
+            payload["error"]["error_code"],
+            "alpha_lifecycle_action_dependency_unavailable"
+        );
+        assert_eq!(payload["meta"]["action"], "alpha_lifecycle_action_list");
+        assert_eq!(
+            payload["error"]["security_signal"]["name"],
+            "alpha_lifecycle_action_fail_closed_v1"
+        );
+        assert_eq!(payload["error"]["security_signal"]["severity"], "critical");
     }
 
     #[tokio::test]

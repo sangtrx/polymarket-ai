@@ -99,5 +99,6 @@ Unauthorized security-signal names:
 3. Shadow-mode evaluation (Story 6.4): `docs/operations/alpha-shadow-mode-evaluation.md`
 4. Counterfactual replay stress gating (Story 6.6): `docs/operations/alpha-counterfactual-replay-stress-gating.md`
 5. Live alpha health monitoring and threshold breaches (Story 6.7): `docs/operations/alpha-live-health-monitoring-threshold-breaches.md`
-6. Governance approval workflow implementation: `services/governance-service/src/approvals/mod.rs`
-7. Role model and privileged controls: `docs/governance/rbac-role-model.md`
+6. Automatic deallocation + stop-research (Story 6.9): `docs/operations/alpha-automatic-deallocation-stop-research.md`
+7. Governance approval workflow implementation: `services/governance-service/src/approvals/mod.rs`
+8. Role model and privileged controls: `docs/governance/rbac-role-model.md`

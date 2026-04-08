@@ -1,5 +1,5 @@
 # generated: 2026-04-04T17:40:16Z
-# last_updated: 2026-04-08T08:39:25Z
+# last_updated: 2026-04-09T00:34:33Z
 # project: polymarket-ai
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-04T17:40:16Z
-last_updated: 2026-04-08T08:39:25Z
+last_updated: 2026-04-09T00:34:33Z
 project: polymarket-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -84,7 +84,7 @@ development_status:
   5-3-enforce-low-liquidity-and-overnight-participation-guardrails: done
   5-4-configure-core-satellite-market-stratification-policies: done
   epic-5-retrospective: optional
-  epic-6: in-progress
+  epic-6: done
   6-1-build-alpha-hypothesis-registry-with-required-metadata: done
   6-2-configure-leakage-and-data-quality-gate-definitions: done
   6-3-implement-validation-workflow-and-diagnostics-artifact-store: done
@@ -93,5 +93,5 @@ development_status:
   6-6-integrate-counterfactual-replay-stress-gates: done
   6-7-implement-live-alpha-health-monitoring-and-threshold-detection: done
   6-8-deliver-alpha-governance-readiness-card-ux: done
-  6-9-enforce-automatic-deallocation-and-stop-research-policies: backlog
+  6-9-enforce-automatic-deallocation-and-stop-research-policies: done
   epic-6-retrospective: optional

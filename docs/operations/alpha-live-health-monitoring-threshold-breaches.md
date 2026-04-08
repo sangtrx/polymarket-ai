@@ -113,5 +113,6 @@ Unauthorized security-signal names:
 1. Shadow-mode evaluation (Story 6.4): `docs/operations/alpha-shadow-mode-evaluation.md`
 2. Counterfactual replay stress gating (Story 6.6): `docs/operations/alpha-counterfactual-replay-stress-gating.md`
 3. Promotion lifecycle governance (Story 6.5): `docs/operations/alpha-promotion-lifecycle-governance.md`
-4. Validation workflow and diagnostics (Story 6.3): `docs/operations/alpha-validation-workflow-and-diagnostics.md`
-5. Severity alert delivery: `docs/operations/severity-alert-delivery.md`
+4. Automatic deallocation + stop-research (Story 6.9): `docs/operations/alpha-automatic-deallocation-stop-research.md`
+5. Validation workflow and diagnostics (Story 6.3): `docs/operations/alpha-validation-workflow-and-diagnostics.md`
+6. Severity alert delivery: `docs/operations/severity-alert-delivery.md`

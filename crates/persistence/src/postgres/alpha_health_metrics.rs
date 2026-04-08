@@ -333,10 +333,10 @@ where
     if let (Some(recorded_after), Some(recorded_before)) =
         (normalized_after.as_deref(), normalized_before.as_deref())
     {
-        let recorded_after_ts = parse_alpha_health_utc_timestamp(recorded_after)
-            .map_err(map_contract_error)?;
-        let recorded_before_ts = parse_alpha_health_utc_timestamp(recorded_before)
-            .map_err(map_contract_error)?;
+        let recorded_after_ts =
+            parse_alpha_health_utc_timestamp(recorded_after).map_err(map_contract_error)?;
+        let recorded_before_ts =
+            parse_alpha_health_utc_timestamp(recorded_before).map_err(map_contract_error)?;
         if recorded_before_ts <= recorded_after_ts {
             return Err(AlphaHealthPersistenceError::invalid_payload(
                 "recorded_before_utc must be greater than recorded_after_utc",
@@ -361,7 +361,9 @@ where
             AlphaHealthPersistenceError::query_failure("list_alpha_health_metrics_by_alpha", error)
         })?;
 
-    rows.into_iter().map(decode_alpha_health_metric_row).collect()
+    rows.into_iter()
+        .map(decode_alpha_health_metric_row)
+        .collect()
 }
 
 pub async fn upsert_alpha_threshold_breach<'e, E>(
@@ -451,10 +453,10 @@ where
     if let (Some(breached_after), Some(breached_before)) =
         (normalized_after.as_deref(), normalized_before.as_deref())
     {
-        let breached_after_ts = parse_alpha_health_utc_timestamp(breached_after)
-            .map_err(map_contract_error)?;
-        let breached_before_ts = parse_alpha_health_utc_timestamp(breached_before)
-            .map_err(map_contract_error)?;
+        let breached_after_ts =
+            parse_alpha_health_utc_timestamp(breached_after).map_err(map_contract_error)?;
+        let breached_before_ts =
+            parse_alpha_health_utc_timestamp(breached_before).map_err(map_contract_error)?;
         if breached_before_ts <= breached_after_ts {
             return Err(AlphaHealthPersistenceError::invalid_payload(
                 "breached_before_utc must be greater than breached_after_utc",
@@ -645,7 +647,7 @@ fn parse_validation_comparator(
                     code: AlphaHealthReasonCode::InvalidPayload.code(),
                     message: format!("unsupported comparator `{value}`"),
                 }],
-            ))
+            ));
         }
     };
     Ok(comparator)
@@ -804,9 +806,7 @@ mod tests {
         assert!(
             !ALPHA_HEALTH_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS promotion_decisions")
         );
-        assert!(
-            !ALPHA_HEALTH_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS validation_runs")
-        );
+        assert!(!ALPHA_HEALTH_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS validation_runs"));
     }
 
     #[test]
@@ -815,9 +815,7 @@ mod tests {
         assert!(ALPHA_HEALTH_MIGRATION_SQL.contains("comparator = 'lt'"));
         assert!(ALPHA_HEALTH_MIGRATION_SQL.contains("comparator = 'gt'"));
         assert!(ALPHA_HEALTH_MIGRATION_SQL.contains("idx_alpha_health_metrics_alpha_lookup"));
-        assert!(
-            ALPHA_HEALTH_MIGRATION_SQL.contains("idx_alpha_threshold_breaches_alpha_lookup")
-        );
+        assert!(ALPHA_HEALTH_MIGRATION_SQL.contains("idx_alpha_threshold_breaches_alpha_lookup"));
     }
 
     #[test]
@@ -857,7 +855,12 @@ mod tests {
         let error = validate_breach_record_for_persistence(&breach)
             .expect_err("drawdown breaches must use gt comparator semantics");
         assert_eq!(error.code, AlphaHealthReasonCode::InvalidPayload.code());
-        assert!(error.field_errors.iter().any(|issue| issue.field == "comparator"));
+        assert!(
+            error
+                .field_errors
+                .iter()
+                .any(|issue| issue.field == "comparator")
+        );
     }
 
     #[test]

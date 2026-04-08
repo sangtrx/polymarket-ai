@@ -16,6 +16,7 @@ This runbook explains how to interpret and triage the Alpha Governance Readiness
 4. `GET /control/research/validation-runs/{run_id}`
 5. `GET /control/research/alpha-health-metrics?alpha_id={alpha_id}&limit={n}`
 6. `GET /control/research/alpha-threshold-breaches?alpha_id={alpha_id}&limit={n}`
+7. `GET /control/research/alpha-lifecycle-actions?alpha_id={alpha_id}&limit={n}`
 
 All reads are interpreted from canonical `data/meta/error` envelopes.
 
@@ -26,6 +27,7 @@ All reads are interpreted from canonical `data/meta/error` envelopes.
 Card lifecycle mapping is deterministic and constrained to:
 
 1. `deallocated` — latest allowed promotion action is `retire`
+   - or latest applied alpha lifecycle action is `deallocate`
 2. `production` — latest two allowed actions are consecutive `promote` decisions
 3. `candidate-live` — latest allowed action is `promote` (without production streak) or `pause`
 4. `shadow` — no allowed promote/retire and latest shadow evaluation is `completed`
@@ -91,5 +93,6 @@ Boundary semantics are explicit: floor metrics breach on strict `<`, drawdown br
 1. Story 6.5 promotion lifecycle governance: `docs/operations/alpha-promotion-lifecycle-governance.md`
 2. Story 6.6 counterfactual replay stress gating: `docs/operations/alpha-counterfactual-replay-stress-gating.md`
 3. Story 6.7 live alpha health monitoring: `docs/operations/alpha-live-health-monitoring-threshold-breaches.md`
-4. Story 6.3 validation workflow and diagnostics: `docs/operations/alpha-validation-workflow-and-diagnostics.md`
-5. Story 6.4 shadow-mode evaluation: `docs/operations/alpha-shadow-mode-evaluation.md`
+4. Story 6.9 automatic deallocation + stop-research: `docs/operations/alpha-automatic-deallocation-stop-research.md`
+5. Story 6.3 validation workflow and diagnostics: `docs/operations/alpha-validation-workflow-and-diagnostics.md`
+6. Story 6.4 shadow-mode evaluation: `docs/operations/alpha-shadow-mode-evaluation.md`

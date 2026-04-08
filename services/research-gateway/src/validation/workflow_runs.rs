@@ -291,7 +291,7 @@ impl ValidationWorkflowRunService {
         Self::new(
             Arc::new(InMemoryValidationWorkflowRepository::default()),
             gate_orchestrator,
-            Arc::new(DeterministicValidationStageExecutor::default()),
+            Arc::new(DeterministicValidationStageExecutor),
         )
     }
 
@@ -302,7 +302,7 @@ impl ValidationWorkflowRunService {
         Self::new(
             Arc::new(PostgresValidationWorkflowRepository::new(pool)),
             gate_orchestrator,
-            Arc::new(DeterministicValidationStageExecutor::default()),
+            Arc::new(DeterministicValidationStageExecutor),
         )
     }
 
@@ -1882,9 +1882,8 @@ impl ValidationWorkflowRepositoryPort for InMemoryValidationWorkflowRepository {
             .lock()
             .expect("in-memory validation workflow artifact lock should not be poisoned")
             .values()
-            .filter(|artifact| artifact.run_id == normalized_run_id && artifact.stage == stage)
-            .cloned()
-            .next())
+            .find(|artifact| artifact.run_id == normalized_run_id && artifact.stage == stage)
+            .cloned())
     }
 
     fn list_artifacts_by_run(

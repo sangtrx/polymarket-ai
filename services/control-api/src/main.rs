@@ -20,6 +20,7 @@ use reporting_service::exports::workflows::ReportExportWorkflowService;
 use research_gateway::promotion::alpha_health::AlphaHealthService;
 use research_gateway::promotion::counterfactual_replay::CounterfactualReplayService;
 use research_gateway::promotion::decisions::PromotionDecisionService;
+use research_gateway::promotion::lifecycle_actions::AlphaLifecycleActionService;
 use research_gateway::validation::gate_policies::{
     ValidationGatePolicyOrchestrator, ValidationGatePolicyService,
 };
@@ -53,6 +54,8 @@ async fn main() {
         pool.clone(),
         Arc::clone(&research_validation_gate_orchestrator),
     ));
+    let research_alpha_lifecycle_action_orchestrator =
+        Arc::new(AlphaLifecycleActionService::postgres(pool.clone()));
 
     let state = ControlApiState::with_all_orchestrators_and_reporting(
         Arc::new(GovernanceAuthorizationGuard::new(
@@ -84,6 +87,7 @@ async fn main() {
     .with_research_alpha_health_orchestrator(research_alpha_health_orchestrator)
     .with_research_counterfactual_replay_orchestrator(research_counterfactual_replay_orchestrator)
     .with_research_promotion_decision_orchestrator(research_promotion_decision_orchestrator)
+    .with_research_alpha_lifecycle_action_orchestrator(research_alpha_lifecycle_action_orchestrator)
     .with_attribution_pool(pool);
     let _app: Router = routes::app_router(state);
     println!("control-api bootstrap ready at {}", timestamp_utc());

@@ -1,6 +1,7 @@
 pub mod allocation_policies;
 pub mod alpha_health_metrics;
 pub mod alpha_hypotheses;
+pub mod alpha_lifecycle_actions;
 pub mod api_contract_versions;
 pub mod approvals;
 pub mod attribution_snapshots;

@@ -883,7 +883,7 @@ impl RecoveryOrchestrator for RecoveryService {
         validate_non_empty("actor_id", &input.actor_id)?;
         validate_non_empty("correlation_id", &input.correlation_id)?;
         validate_non_empty("queried_at_utc", &input.queried_at_utc)?;
-        let limit = input.limit.unwrap_or(20).clamp(1, 200) as usize;
+        let limit = input.limit.unwrap_or(20).clamp(1, 200);
         let runs = match (
             input
                 .artifact_id

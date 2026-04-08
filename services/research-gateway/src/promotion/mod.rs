@@ -1,6 +1,7 @@
 pub mod alpha_health;
 pub mod counterfactual_replay;
 pub mod decisions;
+pub mod lifecycle_actions;
 
 use crate::validation::gate_policies::{
     EvaluateValidationGatePoliciesInput, ValidationGateEvaluationEvidence,

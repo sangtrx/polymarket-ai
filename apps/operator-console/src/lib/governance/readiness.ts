@@ -169,16 +169,26 @@ interface AlphaHealthMetricEvidence {
 }
 
 interface AlphaThresholdBreachEvidence {
-  breachId: string;
-  alphaId: string;
-  metricKey: string;
+    breachId: string;
+    alphaId: string;
+    metricKey: string;
   comparator: string;
   observedValue: number;
   thresholdValue: number;
   breachReason: string;
   reasonCode: string;
   correlationId: string;
-  breachedAtUtc: string;
+    breachedAtUtc: string;
+}
+
+interface AlphaLifecycleActionEvidence {
+  actionId: string;
+  alphaId: string;
+  actionType: string;
+  actionStatus: string;
+  reasonCode: string;
+  correlationId: string;
+  actedAtUtc: string;
 }
 
 interface EnvelopeMeta {
@@ -199,6 +209,7 @@ interface ReadinessDerivationInput {
   validationArtifacts: ValidationArtifactEvidence[];
   alphaHealthMetrics: AlphaHealthMetricEvidence[];
   alphaThresholdBreaches: AlphaThresholdBreachEvidence[];
+  alphaLifecycleActions: AlphaLifecycleActionEvidence[];
   metadata: EnvelopeMeta[];
 }
 
@@ -1013,6 +1024,67 @@ function parseAlphaThresholdBreachItem(
   };
 }
 
+function parseAlphaLifecycleActionItem(
+  payload: unknown,
+  endpoint: string,
+): AlphaLifecycleActionEvidence {
+  if (!isRecord(payload)) {
+    throw new GovernanceReadinessClientError({
+      status: 502,
+      errorCode: "governance_readiness_contract_mismatch",
+      message: "alpha lifecycle action entry must be an object",
+      action: "governance_readiness_query",
+      endpoint,
+      timestampUtc: new Date().toISOString(),
+    });
+  }
+
+  return {
+    actionId: requiredString(
+      payload,
+      "action_id",
+      endpoint,
+      "governance_readiness_query",
+    ),
+    alphaId: requiredString(
+      payload,
+      "alpha_id",
+      endpoint,
+      "governance_readiness_query",
+    ),
+    actionType: requiredString(
+      payload,
+      "action_type",
+      endpoint,
+      "governance_readiness_query",
+    ),
+    actionStatus: requiredString(
+      payload,
+      "action_status",
+      endpoint,
+      "governance_readiness_query",
+    ),
+    reasonCode: requiredString(
+      payload,
+      "reason_code",
+      endpoint,
+      "governance_readiness_query",
+    ),
+    correlationId: requiredString(
+      payload,
+      "correlation_id",
+      endpoint,
+      "governance_readiness_query",
+    ),
+    actedAtUtc: requiredTimestamp(
+      payload,
+      "acted_at_utc",
+      endpoint,
+      "governance_readiness_query",
+    ),
+  };
+}
+
 async function requestEnvelope<T>({
   baseUrl,
   endpoint,
@@ -1184,6 +1256,63 @@ function parseAlphaThresholdBreachesData(
   return breaches.map((entry) => parseAlphaThresholdBreachItem(entry, endpoint));
 }
 
+function parseAlphaLifecycleActionsData(
+  data: JsonRecord,
+  endpoint: string,
+  expectedAlphaId: string,
+): AlphaLifecycleActionEvidence[] {
+  const kind = requiredString(data, "kind", endpoint, "governance_readiness_query");
+  if (kind !== "actions") {
+    throw new GovernanceReadinessClientError({
+      status: 502,
+      errorCode: "governance_readiness_contract_mismatch",
+      message: `unexpected alpha-lifecycle-action data kind '${kind}'`,
+      action: "governance_readiness_query",
+      endpoint,
+      timestampUtc: new Date().toISOString(),
+    });
+  }
+  const responseAlphaId = requiredString(
+    data,
+    "alpha_id",
+    endpoint,
+    "governance_readiness_query",
+  );
+  if (toCanonicalState(responseAlphaId) !== toCanonicalState(expectedAlphaId)) {
+    throw new GovernanceReadinessClientError({
+      status: 502,
+      errorCode: "governance_readiness_contract_mismatch",
+      message: `alpha lifecycle action payload alpha_id '${responseAlphaId}' does not match requested alpha_id '${expectedAlphaId}'`,
+      action: "governance_readiness_query",
+      endpoint,
+      timestampUtc: new Date().toISOString(),
+    });
+  }
+  const actions = requiredArray(
+    data,
+    "actions",
+    endpoint,
+    "governance_readiness_query",
+  );
+  const expectedCanonicalAlphaId = toCanonicalState(expectedAlphaId);
+  const parsed = actions.map((entry) =>
+    parseAlphaLifecycleActionItem(entry, endpoint),
+  );
+  for (const [index, action] of parsed.entries()) {
+    if (toCanonicalState(action.alphaId) !== expectedCanonicalAlphaId) {
+      throw new GovernanceReadinessClientError({
+        status: 502,
+        errorCode: "governance_readiness_contract_mismatch",
+        message: `alpha lifecycle action entry ${index} alpha_id '${action.alphaId}' does not match requested alpha_id '${expectedAlphaId}'`,
+        action: "governance_readiness_query",
+        endpoint,
+        timestampUtc: new Date().toISOString(),
+      });
+    }
+  }
+  return parsed;
+}
+
 function toCanonicalState(value: string): string {
   return value.trim().toLowerCase();
 }
@@ -1237,18 +1366,43 @@ function selectLatestAlphaHealthMetric(
   )[0];
 }
 
+function selectLatestLifecycleAction(
+  actions: AlphaLifecycleActionEvidence[],
+): AlphaLifecycleActionEvidence | undefined {
+  return [...actions].sort(
+    (left, right) => Date.parse(right.actedAtUtc) - Date.parse(left.actedAtUtc),
+  )[0];
+}
+
 function deriveLifecycleState(
+  alphaLifecycleActions: AlphaLifecycleActionEvidence[],
   promotionDecisions: PromotionDecisionEvidence[],
   shadowEvaluations: ShadowEvaluationEvidence[],
 ): GovernanceLifecycleState {
+  const latestLifecycleAction = selectLatestLifecycleAction(alphaLifecycleActions);
   const allowedDecisions = [...promotionDecisions]
     .filter((decision) => toCanonicalState(decision.decisionState) === "allowed")
     .sort(
       (left, right) =>
         Date.parse(right.decidedAtUtc) - Date.parse(left.decidedAtUtc),
     );
-
   const latestAllowedDecision = allowedDecisions[0];
+
+  if (latestLifecycleAction) {
+    const actionType = toCanonicalState(latestLifecycleAction.actionType);
+    const actionOccurredAfterLatestAllowedDecision =
+      !latestAllowedDecision ||
+      Date.parse(latestLifecycleAction.actedAtUtc) >=
+        Date.parse(latestAllowedDecision.decidedAtUtc);
+    if (
+      (actionType === "deallocate" || actionType === "stop_research") &&
+      actionOccurredAfterLatestAllowedDecision
+    ) {
+      if (toCanonicalState(latestLifecycleAction.actionStatus) === "applied") {
+        return "deallocated";
+      }
+    }
+  }
   if (!latestAllowedDecision) {
     const latestShadow = selectLatestShadowEvaluation(shadowEvaluations);
     if (
@@ -1318,6 +1472,9 @@ export function deriveAlphaGovernanceReadiness(
   input: ReadinessDerivationInput,
 ): AlphaGovernanceReadinessResult {
   const latestDecision = selectLatestDecision(input.promotionDecisions);
+  const latestLifecycleAction = selectLatestLifecycleAction(
+    input.alphaLifecycleActions,
+  );
   const latestShadow = selectLatestShadowEvaluation(input.shadowEvaluations);
   const latestValidationRun = selectLatestValidationRun(input.validationRuns);
   const latestMetric = selectLatestAlphaHealthMetric(input.alphaHealthMetrics);
@@ -1378,6 +1535,7 @@ export function deriveAlphaGovernanceReadiness(
   ];
 
   const lifecycleState = deriveLifecycleState(
+    input.alphaLifecycleActions,
     input.promotionDecisions,
     input.shadowEvaluations,
   );
@@ -1402,6 +1560,7 @@ export function deriveAlphaGovernanceReadiness(
     missingArtifacts.length > 0 ? "blocked" : "ready";
 
   const asOfUtc = latestIsoTimestamp([
+    latestLifecycleAction?.actedAtUtc,
     latestDecision?.decidedAtUtc,
     latestShadow?.completedAtUtc ?? latestShadow?.startedAtUtc,
     latestValidationRun?.completedAtUtc ?? latestValidationRun?.startedAtUtc,
@@ -1414,6 +1573,7 @@ export function deriveAlphaGovernanceReadiness(
   const source = latestMeta?.endpoint ?? "/control/research";
   const correlationId =
     latestMeta?.correlationId ??
+    latestLifecycleAction?.correlationId ??
     latestDecision?.correlationId ??
     latestMetric?.correlationId ??
     "n/a";
@@ -1493,6 +1653,13 @@ export async function queryAlphaGovernanceReadiness(
       limit,
     },
   );
+  const alphaLifecycleActionsEndpoint = buildEndpoint(
+    "/control/research/alpha-lifecycle-actions",
+    {
+      alpha_id: alphaId,
+      limit,
+    },
+  );
 
   try {
     const [
@@ -1501,6 +1668,7 @@ export async function queryAlphaGovernanceReadiness(
       validationRunsResponse,
       alphaHealthResponse,
       alphaBreachesResponse,
+      alphaLifecycleActionsResponse,
     ] = await Promise.all([
       requestEnvelope({
         baseUrl,
@@ -1532,6 +1700,13 @@ export async function queryAlphaGovernanceReadiness(
         fetchImpl,
         parseData: parseAlphaThresholdBreachesData,
       }),
+      requestEnvelope({
+        baseUrl,
+        endpoint: alphaLifecycleActionsEndpoint,
+        fetchImpl,
+        parseData: (data, endpoint) =>
+          parseAlphaLifecycleActionsData(data, endpoint, alphaId),
+      }),
     ]);
 
     const latestRun = selectLatestValidationRun(validationRunsResponse.data);
@@ -1542,6 +1717,7 @@ export async function queryAlphaGovernanceReadiness(
       validationRunsResponse.meta,
       alphaHealthResponse.meta,
       alphaBreachesResponse.meta,
+      alphaLifecycleActionsResponse.meta,
     ];
     if (latestRun) {
       const validationRunDetailEndpoint = `/control/research/validation-runs/${encodeURIComponent(
@@ -1566,6 +1742,7 @@ export async function queryAlphaGovernanceReadiness(
       validationArtifacts,
       alphaHealthMetrics: alphaHealthResponse.data,
       alphaThresholdBreaches: alphaBreachesResponse.data,
+      alphaLifecycleActions: alphaLifecycleActionsResponse.data,
       metadata,
     });
   } catch (error) {

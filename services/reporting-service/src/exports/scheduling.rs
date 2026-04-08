@@ -1438,10 +1438,9 @@ impl ReportScheduleAlertPort for PostgresAlertPort {
         };
         if let Err(error) =
             self.run_with_runtime(append_alert_delivery_attempt(&self.pool, &attempt))
+            && !error.message.contains("constraint")
         {
-            if !error.message.contains("constraint") {
-                return Err(error);
-            }
+            return Err(error);
         }
         Ok(())
     }
