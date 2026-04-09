@@ -1,7 +1,11 @@
 use crate::exports::artifacts::{
     artifact_source_for_type, compose_artifact_reference, compose_package_reference,
     compute_artifact_checksum, compute_manifest_checksum, deterministic_artifact_order,
-    required_fr36_artifact_types,
+    required_fr36_artifact_types, required_readiness_artifact_types,
+};
+use crate::exports::readiness::{
+    ReadinessReportPayload, ReadinessRiskSummary, ReadinessSeverityBreakdown,
+    ReadinessWaiverLedger, compose_readiness_artifact_payloads,
 };
 use domain::reporting_export::{
     DEFAULT_EXPORT_LIST_LIMIT, ExportArtifactRecord, ExportJobRecord, MAX_EXPORT_LIST_LIMIT,
@@ -405,6 +409,21 @@ impl ReportExportWorkflowService {
             &normalized_correlation,
             &requested_at_utc,
         );
+        if let Some(existing) = self.repository.load_job_by_id(&job_id)? {
+            let artifacts = self
+                .repository
+                .load_artifacts_for_job(&existing.job_id, Some(MAX_EXPORT_LIST_LIMIT))?;
+            emit_export_telemetry(ExportJobTelemetryEvent {
+                event_name: "report_export_job_transition_v1",
+                trigger_source: existing.trigger_source.as_str(),
+                status: existing.status.as_str(),
+                reason_code: ReportingExportReasonCode::DuplicateSuppressed.code(),
+                job_id: &existing.job_id,
+                correlation_id: &existing.correlation_id,
+                timestamp_utc: &requested_at_utc,
+            });
+            return Ok(to_job_evidence(existing, artifacts));
+        }
 
         let queued = match self.repository.upsert_job(ExportJobRecord {
             job_id: job_id.clone(),
@@ -498,7 +517,55 @@ impl ReportExportWorkflowService {
 
         let mut missing_artifacts = Vec::new();
         let mut persisted_artifacts = Vec::new();
-        for artifact_type in deterministic_artifact_order(required_fr36_artifact_types()) {
+        let readiness_payloads = compose_readiness_artifact_payloads(&ReadinessReportPayload {
+            snapshot_id: format!("readiness::{}", running.job_id),
+            commit_sha: running.job_id.clone(),
+            generated_at_utc: as_of_utc.clone(),
+            advisory_state: if unavailable_types.is_empty() {
+                "ready".to_string()
+            } else {
+                "caution".to_string()
+            },
+            recommendation_reason_code: if unavailable_types.is_empty() {
+                "readiness_ready".to_string()
+            } else {
+                "readiness_dependency_unavailable".to_string()
+            },
+            recommendation_rationale: if unavailable_types.is_empty() {
+                "Readiness evidence is complete; recommendation remains advisory for this run."
+                    .to_string()
+            } else {
+                "Readiness evaluation failed because required snapshot or waiver data is unavailable. Re-run audit after restoring prerequisites and verify reason code details.".to_string()
+            },
+            severity_counts: ReadinessSeverityBreakdown {
+                critical: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+            },
+            waived_count: 0,
+            unwaived_count: 0,
+            top_unresolved_risks: vec![ReadinessRiskSummary {
+                canonical_requirement_id: "none".to_string(),
+                severity: "low".to_string(),
+                risk_score: 0,
+                priority_rank: 1,
+                reason_code: "readiness_signal_advisory".to_string(),
+            }],
+            waiver_ledger: ReadinessWaiverLedger {
+                active: Vec::new(),
+                expired: Vec::new(),
+            },
+        })
+        .map_err(map_contract_error)?
+        .into_iter()
+        .map(|artifact| (artifact.artifact_type, artifact.payload))
+        .collect::<BTreeMap<_, _>>();
+        let artifact_types = required_fr36_artifact_types()
+            .into_iter()
+            .chain(required_readiness_artifact_types())
+            .collect::<Vec<_>>();
+        for artifact_type in deterministic_artifact_order(artifact_types) {
             let source = artifact_source_for_type(artifact_type).to_string();
             let is_available = !unavailable_types.contains(&artifact_type);
             let artifact_reason_code = if is_available {
@@ -508,6 +575,18 @@ impl ReportExportWorkflowService {
             };
             if !is_available {
                 missing_artifacts.push(artifact_type.as_str().to_string());
+            }
+            if is_available
+                && matches!(
+                    artifact_type,
+                    ReportingExportArtifactType::ReadinessReportJson
+                        | ReportingExportArtifactType::ReadinessReportMarkdown
+                )
+                && !readiness_payloads.contains_key(&artifact_type)
+            {
+                return Err(ReportExportWorkflowError::dependency_unavailable(
+                    "readiness artifact payload composition failed",
+                ));
             }
             let artifact = self.repository.upsert_artifact(ExportArtifactRecord {
                 artifact_id: compose_export_artifact_id(&running.job_id, artifact_type),
@@ -1244,6 +1323,10 @@ struct IncidentExportFailureAlertEvent<'a> {
 mod tests {
     use super::*;
 
+    fn required_export_artifact_count() -> usize {
+        required_fr36_artifact_types().len() + required_readiness_artifact_types().len()
+    }
+
     fn on_demand_input() -> TriggerOnDemandExportInput {
         TriggerOnDemandExportInput {
             actor_id: "ops-1".to_string(),
@@ -1269,7 +1352,7 @@ mod tests {
         );
         assert_eq!(
             evidence.artifact_count,
-            required_fr36_artifact_types().len()
+            required_export_artifact_count()
         );
         assert!(evidence.missing_artifact_types.is_empty());
 
@@ -1283,7 +1366,7 @@ mod tests {
                 limit: Some(50),
             })
             .expect("artifact listing should succeed");
-        assert_eq!(artifacts.len(), required_fr36_artifact_types().len());
+        assert_eq!(artifacts.len(), required_export_artifact_count());
         assert!(artifacts.iter().all(|artifact| artifact.is_available));
     }
 

@@ -1,8 +1,14 @@
-use domain::reporting_export::{REQUIRED_FR36_ARTIFACT_TYPES, ReportingExportArtifactType};
+use domain::reporting_export::{
+    REQUIRED_FR36_ARTIFACT_TYPES, REQUIRED_READINESS_ARTIFACT_TYPES, ReportingExportArtifactType,
+};
 use sha2::{Digest, Sha256};
 
 pub fn required_fr36_artifact_types() -> Vec<ReportingExportArtifactType> {
     REQUIRED_FR36_ARTIFACT_TYPES.to_vec()
+}
+
+pub fn required_readiness_artifact_types() -> Vec<ReportingExportArtifactType> {
+    REQUIRED_READINESS_ARTIFACT_TYPES.to_vec()
 }
 
 pub fn deterministic_artifact_order(
@@ -20,6 +26,8 @@ pub fn artifact_source_for_type(artifact_type: ReportingExportArtifactType) -> &
         ReportingExportArtifactType::ReconciliationSummary => "execution_reconciliation_summaries",
         ReportingExportArtifactType::AccessAudits => "privileged_access_audits",
         ReportingExportArtifactType::IncidentPostmortems => "incident_postmortems",
+        ReportingExportArtifactType::ReadinessReportJson => "ci_readiness_report",
+        ReportingExportArtifactType::ReadinessReportMarkdown => "ci_readiness_report",
     }
 }
 
@@ -31,10 +39,18 @@ pub fn compose_artifact_reference(
     job_id: &str,
     artifact_type: ReportingExportArtifactType,
 ) -> String {
-    format!(
-        "s3://reporting-exports/{job_id}/{}.json",
-        artifact_type.as_str()
-    )
+    match artifact_type {
+        ReportingExportArtifactType::ReadinessReportJson => {
+            format!("s3://reporting-exports/{job_id}/readiness-report.json")
+        }
+        ReportingExportArtifactType::ReadinessReportMarkdown => {
+            format!("s3://reporting-exports/{job_id}/readiness-report.md")
+        }
+        _ => format!(
+            "s3://reporting-exports/{job_id}/{}.json",
+            artifact_type.as_str()
+        ),
+    }
 }
 
 pub fn compute_manifest_checksum(job_id: &str, correlation_id: &str, as_of_utc: &str) -> String {
@@ -112,5 +128,23 @@ mod tests {
         );
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn readiness_artifact_references_use_canonical_filenames() {
+        assert_eq!(
+            compose_artifact_reference(
+                "export-job-001",
+                ReportingExportArtifactType::ReadinessReportJson
+            ),
+            "s3://reporting-exports/export-job-001/readiness-report.json"
+        );
+        assert_eq!(
+            compose_artifact_reference(
+                "export-job-001",
+                ReportingExportArtifactType::ReadinessReportMarkdown
+            ),
+            "s3://reporting-exports/export-job-001/readiness-report.md"
+        );
     }
 }

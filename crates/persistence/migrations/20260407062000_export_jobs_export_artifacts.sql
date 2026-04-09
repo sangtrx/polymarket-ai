@@ -130,7 +130,9 @@ CREATE TABLE IF NOT EXISTS export_artifacts (
                 'validation_evidence',
                 'reconciliation_summary',
                 'access_audits',
-                'incident_postmortems'
+                'incident_postmortems',
+                'readiness_report_json',
+                'readiness_report_markdown'
             )
         ),
     CONSTRAINT export_artifacts_source_check

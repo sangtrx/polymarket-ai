@@ -906,6 +906,20 @@ mod tests {
     }
 
     #[test]
+    fn canonicalization_accepts_readiness_artifact_types() {
+        let mut artifact = sample_artifact();
+        artifact.artifact_type = ReportingExportArtifactType::ReadinessReportMarkdown;
+        artifact.retrieval_reference =
+            "s3://reporting-exports/export-job-001/readiness-report.md".to_string();
+        let canonical_artifact =
+            canonicalize_artifact(&artifact).expect("readiness artifact should validate");
+        assert_eq!(
+            canonical_artifact.artifact_type,
+            ReportingExportArtifactType::ReadinessReportMarkdown
+        );
+    }
+
+    #[test]
     fn transition_validation_is_fail_closed_for_invalid_jump() {
         let error = validate_export_job_transition(
             Some(ReportingExportJobState::Queued),

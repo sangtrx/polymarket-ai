@@ -145,6 +145,8 @@ pub enum ReportingExportArtifactType {
     ReconciliationSummary,
     AccessAudits,
     IncidentPostmortems,
+    ReadinessReportJson,
+    ReadinessReportMarkdown,
 }
 
 impl ReportingExportArtifactType {
@@ -155,6 +157,8 @@ impl ReportingExportArtifactType {
             Self::ReconciliationSummary => "reconciliation_summary",
             Self::AccessAudits => "access_audits",
             Self::IncidentPostmortems => "incident_postmortems",
+            Self::ReadinessReportJson => "readiness_report_json",
+            Self::ReadinessReportMarkdown => "readiness_report_markdown",
         }
     }
 
@@ -165,12 +169,14 @@ impl ReportingExportArtifactType {
             "reconciliation_summary" => Ok(Self::ReconciliationSummary),
             "access_audits" => Ok(Self::AccessAudits),
             "incident_postmortems" => Ok(Self::IncidentPostmortems),
+            "readiness_report_json" => Ok(Self::ReadinessReportJson),
+            "readiness_report_markdown" => Ok(Self::ReadinessReportMarkdown),
             _ => Err(ReportingExportContractError::invalid_payload_with_issues(
-                "artifact_type must be one of: promotion_decisions, validation_evidence, reconciliation_summary, access_audits, incident_postmortems",
+                "artifact_type must be one of: promotion_decisions, validation_evidence, reconciliation_summary, access_audits, incident_postmortems, readiness_report_json, readiness_report_markdown",
                 vec![ReportingExportValidationIssue {
                     field: "artifact_type",
                     code: ReportingExportReasonCode::InvalidPayload.code(),
-                    message: "artifact_type must be one of: promotion_decisions, validation_evidence, reconciliation_summary, access_audits, incident_postmortems".to_string(),
+                    message: "artifact_type must be one of: promotion_decisions, validation_evidence, reconciliation_summary, access_audits, incident_postmortems, readiness_report_json, readiness_report_markdown".to_string(),
                 }],
             )),
         }
@@ -183,6 +189,11 @@ pub const REQUIRED_FR36_ARTIFACT_TYPES: [ReportingExportArtifactType; 5] = [
     ReportingExportArtifactType::ReconciliationSummary,
     ReportingExportArtifactType::AccessAudits,
     ReportingExportArtifactType::IncidentPostmortems,
+];
+
+pub const REQUIRED_READINESS_ARTIFACT_TYPES: [ReportingExportArtifactType; 2] = [
+    ReportingExportArtifactType::ReadinessReportJson,
+    ReportingExportArtifactType::ReadinessReportMarkdown,
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -918,6 +929,18 @@ mod tests {
                 ReportingExportArtifactType::ReconciliationSummary,
                 ReportingExportArtifactType::AccessAudits,
                 ReportingExportArtifactType::IncidentPostmortems,
+            ]
+        );
+    }
+
+    #[test]
+    fn required_readiness_artifact_types_match_phase5_contract() {
+        assert_eq!(REQUIRED_READINESS_ARTIFACT_TYPES.len(), 2);
+        assert_eq!(
+            REQUIRED_READINESS_ARTIFACT_TYPES,
+            [
+                ReportingExportArtifactType::ReadinessReportJson,
+                ReportingExportArtifactType::ReadinessReportMarkdown,
             ]
         );
     }
