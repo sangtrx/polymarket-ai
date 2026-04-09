@@ -404,6 +404,7 @@ fn map_persistence_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::audit_artifacts::{CanonicalArtifactInput, CanonicalArtifactType, CanonicalSnapshotInput, build_canonical_snapshot};
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -568,5 +569,37 @@ mod tests {
         .expect("second run should pass");
 
         assert_eq!(first.snapshot_digest, second.snapshot_digest);
+    }
+
+    #[test]
+    fn snapshot_identity_changes_when_ingested_at_differs() {
+        let base_input = CanonicalSnapshotInput {
+            commit_sha: "abc123".to_string(),
+            ingested_at_utc: "2026-04-09T00:00:00Z".to_string(),
+            file_digests: BTreeMap::from([(
+                ".planning/PROJECT.md".to_string(),
+                "digest-a".to_string(),
+            )]),
+            aggregate_digest: "digest-all".to_string(),
+            artifacts: vec![CanonicalArtifactInput {
+                artifact_type: CanonicalArtifactType::Prd,
+                artifact_path: ".planning/PROJECT.md".to_string(),
+                heading_slug: "requirements".to_string(),
+                item_index: 1,
+                source_item_id: "REQ-1".to_string(),
+                body: "Traceability baseline".to_string(),
+            }],
+        };
+        let later_input = CanonicalSnapshotInput {
+            ingested_at_utc: "2026-04-09T00:00:01Z".to_string(),
+            ..base_input.clone()
+        };
+        let base_snapshot = build_canonical_snapshot(&base_input).expect("snapshot should build");
+        let later_snapshot = build_canonical_snapshot(&later_input).expect("snapshot should build");
+
+        let base_id = snapshot_id(&base_snapshot).expect("snapshot id should compute");
+        let later_id = snapshot_id(&later_snapshot).expect("snapshot id should compute");
+
+        assert_ne!(base_id, later_id);
     }
 }

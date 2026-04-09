@@ -387,6 +387,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_metadata_immutable_sql_is_insert_only() {
+        assert!(UPSERT_SNAPSHOT_SQL.contains("INSERT INTO canonical_ingestion_snapshots"));
+        assert!(!UPSERT_SNAPSHOT_SQL.contains("DO UPDATE SET"));
+    }
+
+    #[test]
+    fn snapshot_metadata_immutable_conflict_uses_machine_readable_code() {
+        let error = CanonicalArtifactPersistenceError::constraint_violation(
+            "insert_snapshot",
+            sqlx::Error::Protocol("conflict".into()),
+        );
+        assert_eq!(error.code, "canonical_artifact_constraint_violation");
+        assert!(error.message.contains("insert_snapshot"));
+    }
+
+    #[test]
     fn upsert_item_rejects_id_anchor_drift() {
         let item = CanonicalArtifactItem {
             canonical_requirement_id: "wrong.id.1".to_string(),
