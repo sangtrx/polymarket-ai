@@ -336,6 +336,7 @@ fn decode_anchor_line_value(
     })
 }
 
+#[cfg(test)]
 fn insert_traceability_snapshot_transaction_steps() -> [&'static str; 5] {
     ["begin", "snapshot", "links", "anchors", "commit"]
 }
