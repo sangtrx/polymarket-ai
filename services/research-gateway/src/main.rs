@@ -4,13 +4,18 @@ use research_gateway::coverage::service::{
 use research_gateway::ingestion::service::{
     IngestionMode, RunCanonicalIngestionInput, run_canonical_ingestion,
 };
+use research_gateway::readiness::{ReadinessEvaluationResult, RunReadinessInput, run_readiness};
 use research_gateway::risk::service::{RunRiskPrioritizationInput, run_risk_prioritization};
 use research_gateway::traceability::matcher::{EvidenceCandidate, PreviousLink};
 use research_gateway::traceability::service::{
     RunTraceabilityMappingInput, TraceabilityRequirementInput, run_traceability_mapping,
 };
+use reporting_service::exports::workflows::{
+    ReportExportOrchestrator, ReportExportWorkflowService, TriggerOnDemandExportInput,
+};
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,11 +55,19 @@ struct PrioritizeRiskCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct Phase5ChainCliArgs {
+    commit_sha: String,
+    generated_at_utc: String,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     IngestArtifacts(IngestArtifactsCliArgs),
     TraceEvidence(TraceEvidenceCliArgs),
     ClassifyCoverage(ClassifyCoverageCliArgs),
     PrioritizeRisk(PrioritizeRiskCliArgs),
+    RunPhase5Chain(Phase5ChainCliArgs),
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
@@ -64,7 +77,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
         .ok_or_else(|| CliErrorPayload {
             code: "canonical_ingestion_invalid_payload".to_string(),
             message:
-                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, or `prioritize-risk` command".to_string(),
+                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, `prioritize-risk`, or `run-phase5-chain` command".to_string(),
         })?;
     let get_flag = |flag: &str| -> Option<String> {
         args.iter()
@@ -152,10 +165,30 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
                 repo_root,
             }))
         }
+        "run-phase5-chain" => {
+            let commit_sha = get_flag("--commit-sha").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --commit-sha".to_string(),
+            })?;
+            let generated_at_utc =
+                get_flag("--generated-at-utc").ok_or_else(|| CliErrorPayload {
+                    code: "readiness_invalid_payload".to_string(),
+                    message: "missing --generated-at-utc".to_string(),
+                })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::RunPhase5Chain(Phase5ChainCliArgs {
+                commit_sha,
+                generated_at_utc,
+                repo_root,
+            }))
+        }
         _ => Err(CliErrorPayload {
             code: "canonical_ingestion_invalid_payload".to_string(),
             message:
-                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, or `prioritize-risk` command".to_string(),
+                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, `prioritize-risk`, or `run-phase5-chain` command".to_string(),
         }),
     }
 }
@@ -294,7 +327,255 @@ async fn run_cli(args: &[String]) -> Result<String, CliErrorPayload> {
                 message: format!("unable to serialize output: {error}"),
             })
         }
+        CliCommand::RunPhase5Chain(command) => {
+            let output = run_phase5_chain(&command)
+                .await
+                .map_err(|error| CliErrorPayload {
+                    code: error.code,
+                    message: error.message,
+                })?;
+            serde_json::to_string(&output).map_err(|error| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: format!("unable to serialize output: {error}"),
+            })
+        }
     }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ReadinessArtifactMetadata {
+    artifact_id: String,
+    artifact_type: String,
+    checksum: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct Phase5ReportExportEvidence {
+    job_id: String,
+    status: String,
+    reason_code: String,
+    artifact_count: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct Phase5ChainOutput {
+    traceability_snapshot_id: String,
+    coverage_snapshot_id: String,
+    risk_snapshot_id: String,
+    readiness: ReadinessEvaluationResult,
+    artifacts: Vec<ReadinessArtifactMetadata>,
+    report_export: Phase5ReportExportEvidence,
+}
+
+#[derive(Debug, Clone)]
+struct Phase5ChainError {
+    code: String,
+    message: String,
+}
+
+async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOutput, Phase5ChainError> {
+    let traceability_input = build_traceability_mapping_input(
+        &command.commit_sha,
+        &command.generated_at_utc,
+        &command.repo_root,
+    )
+    .await
+    .map_err(|error| Phase5ChainError {
+        code: "readiness_invalid_payload".to_string(),
+        message: error.message,
+    })?;
+
+    let traceability_snapshot_id = traceability_input.snapshot_id.clone();
+    let canonical_requirement_ids = traceability_input
+        .requirements
+        .iter()
+        .map(|requirement| requirement.canonical_requirement_id.clone())
+        .collect::<Vec<_>>();
+
+    let traceability_output = run_traceability_mapping(traceability_input)
+        .await
+        .map_err(|error| Phase5ChainError {
+            code: "readiness_dependency_unavailable".to_string(),
+            message: error.message,
+        })?;
+
+    let coverage_snapshot_id = format!(
+        "coverage_{}_{}",
+        command.commit_sha, command.generated_at_utc
+    );
+    let coverage_output = run_coverage_classification(RunCoverageClassificationInput {
+        snapshot_id: coverage_snapshot_id.clone(),
+        commit_sha: command.commit_sha.clone(),
+        generated_at_utc: command.generated_at_utc.clone(),
+        repo_root: command.repo_root.clone(),
+        canonical_requirement_ids,
+        traceability_rows: traceability_output.rows,
+    })
+    .await
+    .map_err(|error| Phase5ChainError {
+        code: "readiness_dependency_unavailable".to_string(),
+        message: error.message,
+    })?;
+
+    let risk_snapshot_id = format!("risk_{}_{}", command.commit_sha, command.generated_at_utc);
+    let risk_output = run_risk_prioritization(RunRiskPrioritizationInput {
+        snapshot_id: risk_snapshot_id.clone(),
+        commit_sha: command.commit_sha.clone(),
+        generated_at_utc: command.generated_at_utc.clone(),
+        repo_root: command.repo_root.clone(),
+        coverage_matrix: coverage_output,
+    })
+    .await
+    .map_err(|error| Phase5ChainError {
+        code: "readiness_dependency_unavailable".to_string(),
+        message: error.message,
+    })?;
+
+    let readiness_output = run_readiness(RunReadinessInput {
+        snapshot_id: format!("readiness_{}_{}", command.commit_sha, command.generated_at_utc),
+        commit_sha: command.commit_sha.clone(),
+        generated_at_utc: command.generated_at_utc.clone(),
+        repo_root: command.repo_root.clone(),
+        risk_prioritization: Some(risk_output),
+        waivers: Vec::new(),
+    })
+    .await
+    .map_err(|error| Phase5ChainError {
+        code: error.code,
+        message: error.message,
+    })?;
+
+    let artifacts = export_readiness_report(
+        &command.repo_root,
+        &command.commit_sha,
+        &command.generated_at_utc,
+        &readiness_output,
+    )
+    .map_err(|error| Phase5ChainError {
+        code: "readiness_dependency_unavailable".to_string(),
+        message: error,
+    })?;
+
+    let report_export_service = ReportExportWorkflowService::in_memory();
+    let export_evidence = report_export_service
+        .trigger_on_demand_export(TriggerOnDemandExportInput {
+            actor_id: "research-gateway".to_string(),
+            actor_role: "operational_control".to_string(),
+            correlation_id: format!(
+                "phase5_chain_{}_{}",
+                command.commit_sha, command.generated_at_utc
+            ),
+            requested_at_utc: command.generated_at_utc.clone(),
+            as_of_utc: command.generated_at_utc.clone(),
+            reason_code: None,
+            unavailable_artifact_types: Vec::new(),
+        })
+        .map_err(|error| Phase5ChainError {
+            code: "readiness_dependency_unavailable".to_string(),
+            message: error.message,
+        })?;
+
+    Ok(Phase5ChainOutput {
+        traceability_snapshot_id,
+        coverage_snapshot_id,
+        risk_snapshot_id,
+        readiness: readiness_output,
+        artifacts,
+        report_export: Phase5ReportExportEvidence {
+            job_id: export_evidence.job_id,
+            status: export_evidence.status,
+            reason_code: export_evidence.reason_code,
+            artifact_count: export_evidence.artifact_count,
+        },
+    })
+}
+
+fn export_readiness_report(
+    repo_root: &str,
+    commit_sha: &str,
+    generated_at_utc: &str,
+    readiness: &ReadinessEvaluationResult,
+) -> Result<Vec<ReadinessArtifactMetadata>, String> {
+    let artifact_dir = Path::new(repo_root).join(".planning").join("artifacts");
+    fs::create_dir_all(&artifact_dir)
+        .map_err(|error| format!("unable to create readiness artifact dir: {error}"))?;
+
+    let json_payload = serde_json::to_string_pretty(readiness)
+        .map_err(|error| format!("unable to serialize readiness report json: {error}"))?;
+    let markdown_payload = render_readiness_markdown(readiness);
+
+    let json_path = artifact_dir.join("readiness-report.json");
+    let md_path = artifact_dir.join("readiness-report.md");
+    fs::write(&json_path, &json_payload)
+        .map_err(|error| format!("unable to write readiness-report.json: {error}"))?;
+    fs::write(&md_path, &markdown_payload)
+        .map_err(|error| format!("unable to write readiness-report.md: {error}"))?;
+
+    let normalized_timestamp = generated_at_utc.replace(':', "-");
+    Ok(vec![
+        ReadinessArtifactMetadata {
+            artifact_id: format!("readiness_artifact_{}_{}_json", commit_sha, normalized_timestamp),
+            artifact_type: "readiness-report.json".to_string(),
+            checksum: sha256_hex(json_payload.as_bytes()),
+            path: json_path.to_string_lossy().to_string(),
+        },
+        ReadinessArtifactMetadata {
+            artifact_id: format!("readiness_artifact_{}_{}_md", commit_sha, normalized_timestamp),
+            artifact_type: "readiness-report.md".to_string(),
+            checksum: sha256_hex(markdown_payload.as_bytes()),
+            path: md_path.to_string_lossy().to_string(),
+        },
+    ])
+}
+
+fn render_readiness_markdown(readiness: &ReadinessEvaluationResult) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# CI Readiness Report\n\n");
+    markdown.push_str(&format!("- Snapshot: `{}`\n", readiness.snapshot_id));
+    markdown.push_str(&format!(
+        "- Advisory State: `{}`\n",
+        match readiness.readiness_state {
+            domain::readiness::ReadinessState::Ready => "ready",
+            domain::readiness::ReadinessState::Caution => "caution",
+            domain::readiness::ReadinessState::NotReady => "not_ready",
+        }
+    ));
+    markdown.push_str(&format!(
+        "- Recommendation Code: `{}`\n\n",
+        readiness.reason_code
+    ));
+    markdown.push_str("## Coverage Posture\n");
+    markdown.push_str(&format!(
+        "- Unwaived unresolved rows: {}\n",
+        readiness.explainability.unwaived_count
+    ));
+    markdown.push_str(&format!(
+        "- Waived unresolved rows: {}\n\n",
+        readiness.explainability.waived_count
+    ));
+    markdown.push_str("## Top Unresolved Risks\n");
+    if readiness.explainability.top_unresolved_risks.is_empty() {
+        markdown.push_str("- None\n");
+    } else {
+        for risk in &readiness.explainability.top_unresolved_risks {
+            markdown.push_str(&format!(
+                "- `{}` (`{:?}`, score {}, rank {})\n",
+                risk.canonical_requirement_id, risk.severity, risk.risk_score, risk.priority_rank
+            ));
+        }
+    }
+    markdown.push_str("\n## Waiver Ledger\n");
+    markdown.push_str("- Active: included in waived count\n");
+    markdown.push_str("- Expired: excluded from waiver reduction\n");
+    markdown.push_str("- Revoked: excluded from waiver reduction\n");
+    markdown
+}
+
+fn sha256_hex(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    format!("{:x}", hasher.finalize())
 }
 
 async fn build_traceability_mapping_input(
