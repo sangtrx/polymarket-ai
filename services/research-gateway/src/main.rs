@@ -1,8 +1,14 @@
 use research_gateway::ingestion::service::{
     IngestionMode, RunCanonicalIngestionInput, run_canonical_ingestion,
 };
+use research_gateway::traceability::matcher::EvidenceCandidate;
+use research_gateway::traceability::service::{
+    RunTraceabilityMappingInput, TraceabilityRequirementInput, run_traceability_mapping,
+};
 use serde::Serialize;
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct CliErrorPayload {
@@ -18,40 +24,73 @@ struct IngestArtifactsCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceEvidenceCliArgs {
+    commit_sha: String,
+    generated_at_utc: String,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     IngestArtifacts(IngestArtifactsCliArgs),
+    TraceEvidence(TraceEvidenceCliArgs),
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
-    if args.get(1).map(String::as_str) != Some("ingest-artifacts") {
-        return Err(CliErrorPayload {
-            code: "canonical_ingestion_invalid_payload".to_string(),
-            message: "expected `ingest-artifacts` command".to_string(),
-        });
-    }
+    let command = args.get(1).map(String::as_str).ok_or_else(|| CliErrorPayload {
+        code: "canonical_ingestion_invalid_payload".to_string(),
+        message: "expected `ingest-artifacts` or `trace-evidence` command".to_string(),
+    })?;
     let get_flag = |flag: &str| -> Option<String> {
         args.iter()
             .position(|arg| arg == flag)
             .and_then(|index| args.get(index + 1))
             .cloned()
     };
-    let commit_sha = get_flag("--commit-sha").ok_or_else(|| CliErrorPayload {
-        code: "canonical_ingestion_invalid_payload".to_string(),
-        message: "missing --commit-sha".to_string(),
-    })?;
-    let ingested_at_utc = get_flag("--ingested-at-utc").ok_or_else(|| CliErrorPayload {
-        code: "canonical_ingestion_invalid_payload".to_string(),
-        message: "missing --ingested-at-utc".to_string(),
-    })?;
-    let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
-        code: "canonical_ingestion_invalid_payload".to_string(),
-        message: "missing --repo-root".to_string(),
-    })?;
-    Ok(CliCommand::IngestArtifacts(IngestArtifactsCliArgs {
-        commit_sha,
-        ingested_at_utc,
-        repo_root,
-    }))
+    match command {
+        "ingest-artifacts" => {
+            let commit_sha = get_flag("--commit-sha").ok_or_else(|| CliErrorPayload {
+                code: "canonical_ingestion_invalid_payload".to_string(),
+                message: "missing --commit-sha".to_string(),
+            })?;
+            let ingested_at_utc = get_flag("--ingested-at-utc").ok_or_else(|| CliErrorPayload {
+                code: "canonical_ingestion_invalid_payload".to_string(),
+                message: "missing --ingested-at-utc".to_string(),
+            })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "canonical_ingestion_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::IngestArtifacts(IngestArtifactsCliArgs {
+                commit_sha,
+                ingested_at_utc,
+                repo_root,
+            }))
+        }
+        "trace-evidence" => {
+            let commit_sha = get_flag("--commit-sha").ok_or_else(|| CliErrorPayload {
+                code: "traceability_invalid_payload".to_string(),
+                message: "missing --commit-sha".to_string(),
+            })?;
+            let generated_at_utc = get_flag("--generated-at-utc").ok_or_else(|| CliErrorPayload {
+                code: "traceability_invalid_payload".to_string(),
+                message: "missing --generated-at-utc".to_string(),
+            })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "traceability_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::TraceEvidence(TraceEvidenceCliArgs {
+                commit_sha,
+                generated_at_utc,
+                repo_root,
+            }))
+        }
+        _ => Err(CliErrorPayload {
+            code: "canonical_ingestion_invalid_payload".to_string(),
+            message: "expected `ingest-artifacts` or `trace-evidence` command".to_string(),
+        }),
+    }
 }
 
 async fn run_cli(args: &[String]) -> Result<String, CliErrorPayload> {
@@ -73,7 +112,177 @@ async fn run_cli(args: &[String]) -> Result<String, CliErrorPayload> {
                 message: format!("unable to serialize output: {error}"),
             })
         }
+        CliCommand::TraceEvidence(command) => {
+            let traceability_input = build_traceability_mapping_input(
+                &command.commit_sha,
+                &command.generated_at_utc,
+                &command.repo_root,
+            )
+            .await?;
+            let output = run_traceability_mapping(traceability_input)
+                .await
+                .map_err(|error| CliErrorPayload {
+                    code: error.code,
+                    message: error.message,
+                })?;
+            serde_json::to_string(&output).map_err(|error| CliErrorPayload {
+                code: "traceability_invalid_payload".to_string(),
+                message: format!("unable to serialize output: {error}"),
+            })
+        }
     }
+}
+
+async fn build_traceability_mapping_input(
+    commit_sha: &str,
+    generated_at_utc: &str,
+    repo_root: &str,
+) -> Result<RunTraceabilityMappingInput, CliErrorPayload> {
+    let ingestion = run_canonical_ingestion(RunCanonicalIngestionInput {
+        commit_sha: commit_sha.to_string(),
+        ingested_at_utc: generated_at_utc.to_string(),
+        repo_root: repo_root.to_string(),
+        mode: IngestionMode::FullSnapshot,
+    })
+    .await
+    .map_err(|error| CliErrorPayload {
+        code: "traceability_invalid_payload".to_string(),
+        message: error.message,
+    })?;
+
+    let file_paths = collect_source_files(Path::new(repo_root)).map_err(|error| CliErrorPayload {
+        code: "traceability_invalid_payload".to_string(),
+        message: error,
+    })?;
+
+    let requirements = ingestion
+        .canonical_requirement_ids
+        .iter()
+        .map(|requirement_id| {
+            let (deterministic_candidates, semantic_candidates) =
+                collect_requirement_candidates(Path::new(repo_root), requirement_id, &file_paths);
+            TraceabilityRequirementInput {
+                canonical_requirement_id: requirement_id.clone(),
+                deterministic_candidates,
+                semantic_candidates,
+                previous_links: vec![],
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RunTraceabilityMappingInput {
+        snapshot_id: format!("traceability_{}_{}", commit_sha, generated_at_utc),
+        commit_sha: commit_sha.to_string(),
+        generated_at_utc: generated_at_utc.to_string(),
+        repo_root: repo_root.to_string(),
+        requirements,
+    })
+}
+
+fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("unable to read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("unable to read directory entry: {error}"))?;
+            let path = entry.path();
+            if path.file_name().map(|name| name == ".git").unwrap_or(false) {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if is_supported_source_file(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn collect_requirement_candidates(
+    repo_root: &Path,
+    requirement_id: &str,
+    files: &[PathBuf],
+) -> (Vec<EvidenceCandidate>, Vec<EvidenceCandidate>) {
+    let mut deterministic = Vec::new();
+    let mut semantic = Vec::new();
+    let semantic_tokens = requirement_id
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 4)
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    for file in files {
+        let Ok(contents) = fs::read_to_string(file) else {
+            continue;
+        };
+        let relative_path = file
+            .strip_prefix(repo_root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if contents.contains(requirement_id) {
+            deterministic.push(candidate_from_file(
+                &relative_path,
+                "deterministic canonical requirement ID reference",
+                1.0,
+            ));
+            continue;
+        }
+
+        let lowered = contents.to_ascii_lowercase();
+        let token_hits = semantic_tokens
+            .iter()
+            .filter(|token| lowered.contains(token.as_str()) || relative_path.contains(token.as_str()))
+            .count();
+        if token_hits > 0 {
+            semantic.push(candidate_from_file(
+                &relative_path,
+                "semantic token overlap fallback candidate",
+                token_hits as f32 / semantic_tokens.len().max(1) as f32,
+            ));
+        }
+    }
+
+    deterministic.sort_by(|left, right| right.score.total_cmp(&left.score));
+    semantic.sort_by(|left, right| right.score.total_cmp(&left.score));
+    (deterministic, semantic.into_iter().take(3).collect())
+}
+
+fn candidate_from_file(relative_path: &str, rationale: &str, score: f32) -> EvidenceCandidate {
+    let evidence_type = if relative_path.contains("/tests/")
+        || relative_path.contains(".test.")
+        || relative_path.contains(".e2e.")
+    {
+        domain::traceability::EvidenceType::Test
+    } else {
+        domain::traceability::EvidenceType::Code
+    };
+    EvidenceCandidate {
+        anchor: domain::traceability::EvidenceAnchor {
+            evidence_type,
+            file_path: relative_path.to_string(),
+            symbol: Some("line_anchor".to_string()),
+            section: None,
+            line_start: Some(1),
+            line_end: Some(1),
+        },
+        rationale: rationale.to_string(),
+        provenance: "cli_repository_scan".to_string(),
+        score,
+    }
+}
+
+fn is_supported_source_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("rs" | "ts" | "tsx" | "js" | "mjs" | "md")
+    )
 }
 
 #[tokio::main]
