@@ -6,7 +6,7 @@ use std::env;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct CliErrorPayload {
-    code: &'static str,
+    code: String,
     message: String,
 }
 
@@ -25,7 +25,7 @@ enum CliCommand {
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
     if args.get(1).map(String::as_str) != Some("ingest-artifacts") {
         return Err(CliErrorPayload {
-            code: "canonical_ingestion_invalid_payload",
+            code: "canonical_ingestion_invalid_payload".to_string(),
             message: "expected `ingest-artifacts` command".to_string(),
         });
     }
@@ -36,15 +36,15 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
             .cloned()
     };
     let commit_sha = get_flag("--commit-sha").ok_or_else(|| CliErrorPayload {
-        code: "canonical_ingestion_invalid_payload",
+        code: "canonical_ingestion_invalid_payload".to_string(),
         message: "missing --commit-sha".to_string(),
     })?;
     let ingested_at_utc = get_flag("--ingested-at-utc").ok_or_else(|| CliErrorPayload {
-        code: "canonical_ingestion_invalid_payload",
+        code: "canonical_ingestion_invalid_payload".to_string(),
         message: "missing --ingested-at-utc".to_string(),
     })?;
     let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
-        code: "canonical_ingestion_invalid_payload",
+        code: "canonical_ingestion_invalid_payload".to_string(),
         message: "missing --repo-root".to_string(),
     })?;
     Ok(CliCommand::IngestArtifacts(IngestArtifactsCliArgs {
@@ -69,7 +69,7 @@ async fn run_cli(args: &[String]) -> Result<String, CliErrorPayload> {
                 message: error.message,
             })?;
             serde_json::to_string(&output).map_err(|error| CliErrorPayload {
-                code: "canonical_ingestion_invalid_payload",
+                code: "canonical_ingestion_invalid_payload".to_string(),
                 message: format!("unable to serialize output: {error}"),
             })
         }
@@ -143,5 +143,24 @@ mod tests {
                 repo_root: ".".to_string(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_artifacts_command_surfaces_machine_readable_error_payload_for_invalid_inputs() {
+        let args = vec![
+            "research-gateway".to_string(),
+            "ingest-artifacts".to_string(),
+            "--commit-sha".to_string(),
+            "abc123".to_string(),
+            "--ingested-at-utc".to_string(),
+            "not-a-timestamp".to_string(),
+            "--repo-root".to_string(),
+            ".".to_string(),
+        ];
+        let error = run_cli(&args)
+            .await
+            .expect_err("invalid timestamp should fail closed");
+        assert_eq!(error.code, "canonical_ingestion_invalid_payload");
+        assert!(error.message.contains("ingested_at_utc"));
     }
 }
