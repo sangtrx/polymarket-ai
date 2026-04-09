@@ -988,5 +988,74 @@ mod main {
                 .expect_err("invalid risk input should fail closed");
             assert_eq!(error.code, "risk_invalid_payload");
         }
+
+        #[test]
+        fn phase5_chain_command_token_is_parsed() {
+            let args = vec![
+                "research-gateway".to_string(),
+                "run-phase5-chain".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--generated-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                ".".to_string(),
+            ];
+            let parsed = parse_cli_command(&args);
+            assert!(parsed.is_ok(), "phase5 command token should be accepted");
+        }
+
+        #[test]
+        fn phase5_chain_command_requires_generated_at_utc() {
+            let args = vec![
+                "research-gateway".to_string(),
+                "run-phase5-chain".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--repo-root".to_string(),
+                ".".to_string(),
+            ];
+            let error = parse_cli_command(&args).expect_err("missing timestamp should fail");
+            assert_eq!(error.code, "readiness_invalid_payload");
+        }
+
+        #[tokio::test]
+        async fn phase5_chain_emits_deterministic_readiness_artifacts_and_ids() {
+            let fixture = create_traceability_fixture_repo();
+            let args = vec![
+                "research-gateway".to_string(),
+                "run-phase5-chain".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--generated-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+
+            let first = run_cli(&args).await.expect("first phase 5 chain run should succeed");
+            let second = run_cli(&args).await.expect("second phase 5 chain run should succeed");
+            assert_eq!(first, second, "identical inputs must produce deterministic output");
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&first).expect("output should be valid json");
+            assert_eq!(
+                parsed["readiness"]["snapshot_id"]
+                    .as_str()
+                    .expect("snapshot id expected"),
+                "readiness_abc123_2026-04-09T00:00:00Z"
+            );
+            let artifacts = parsed["artifacts"]
+                .as_array()
+                .expect("artifact metadata should be present");
+            assert_eq!(artifacts.len(), 2);
+            let artifact_types = artifacts
+                .iter()
+                .map(|artifact| artifact["artifact_type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>();
+            assert!(artifact_types.contains(&"readiness-report.json"));
+            assert!(artifact_types.contains(&"readiness-report.md"));
+            fs::remove_dir_all(fixture).expect("fixture repo should be removed");
+        }
     }
 }
