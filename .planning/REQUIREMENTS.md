@@ -11,7 +11,7 @@
 - [ ] **ARTF-02**: User can ingest architecture artifacts into a canonical audit dataset
 - [ ] **ARTF-03**: User can ingest story artifacts into a canonical audit dataset
 - [ ] **ARTF-04**: User can ingest roadmap artifacts into a canonical audit dataset
-- [ ] **ARTF-05**: User can normalize all ingested BMAD items to stable requirement IDs with snapshot version metadata
+- [x] **ARTF-05**: User can normalize all ingested BMAD items to stable requirement IDs with snapshot version metadata
 
 ### Traceability Mapping
 
@@ -67,7 +67,7 @@
 | ARTF-02 | Phase 1 | Pending |
 | ARTF-03 | Phase 1 | Pending |
 | ARTF-04 | Phase 1 | Pending |
-| ARTF-05 | Phase 1 | Pending |
+| ARTF-05 | Phase 1 | Complete |
 | TRAC-01 | Phase 2 | Pending |
 | TRAC-02 | Phase 2 | Pending |
 | TRAC-03 | Phase 2 | Pending |
