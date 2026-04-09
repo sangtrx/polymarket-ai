@@ -1,3 +1,4 @@
+pub mod audit_artifacts;
 pub mod alerts;
 pub mod allocation;
 pub mod attribution;
