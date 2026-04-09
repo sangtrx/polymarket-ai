@@ -373,4 +373,40 @@ mod tests {
             .iter()
             .any(|row| row.outcome == LinkOutcome::StaleEvidence));
     }
+
+    #[test]
+    fn persistence_links_are_validator_checked_and_reason_code_is_preserved() {
+        let invalid_row = TraceabilityMappingRow {
+            canonical_requirement_id: "project_md.requirements.6".to_string(),
+            outcome: LinkOutcome::Linked,
+            confidence: LinkConfidence::High,
+            rationale: "deterministic code match".to_string(),
+            reason_code: "deterministic_anchor_match".to_string(),
+            code_anchors: vec![],
+            test_anchors: vec![],
+            ambiguous_candidates: vec![],
+            provenance: "deterministic-id".to_string(),
+        };
+        let invalid_error =
+            build_links_for_persistence(std::slice::from_ref(&invalid_row)).expect_err(
+                "rows without qualifying code evidence should fail validation before persistence",
+            );
+        assert_eq!(invalid_error.code, "traceability_invalid_payload");
+
+        let mut valid_row = invalid_row;
+        valid_row.code_anchors.push(EvidenceAnchor {
+            evidence_type: domain::traceability::EvidenceType::Code,
+            file_path: "services/research-gateway/src/traceability/service.rs".to_string(),
+            symbol: Some("run_traceability_mapping".to_string()),
+            section: None,
+            line_start: Some(1),
+            line_end: Some(40),
+        });
+        let links = build_links_for_persistence(std::slice::from_ref(&valid_row))
+            .expect("validator-approved rows should produce persistence links");
+        assert_eq!(
+            links[0].reason_code.as_deref(),
+            Some("deterministic_anchor_match")
+        );
+    }
 }

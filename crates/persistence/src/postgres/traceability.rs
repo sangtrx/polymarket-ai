@@ -431,6 +431,7 @@ mod tests {
             rationale: "multiple plausible evidence anchors are retained".to_string(),
             confidence: LinkConfidence::Medium,
             outcome: LinkOutcome::Ambiguous,
+            reason_code: Some("ambiguous_multiple_candidates".to_string()),
         };
 
         assert_eq!(link.anchors.len(), 2);
