@@ -32,14 +32,14 @@ pub enum CanonicalValidationSeverity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CanonicalValidationIssue {
     pub field: String,
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
     pub severity: CanonicalValidationSeverity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CanonicalArtifactContractError {
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
     pub field_errors: Vec<CanonicalValidationIssue>,
 }
@@ -50,7 +50,7 @@ impl CanonicalArtifactContractError {
         field_errors: Vec<CanonicalValidationIssue>,
     ) -> Self {
         Self {
-            code: "canonical_artifact_invalid_payload",
+            code: "canonical_artifact_invalid_payload".to_string(),
             message: message.into(),
             field_errors,
         }
@@ -108,7 +108,7 @@ pub fn canonical_requirement_id(
             "path, heading_slug, and item_index are required",
             vec![CanonicalValidationIssue {
                 field: "canonical_requirement_id".to_string(),
-                code: "canonical_artifact_invalid_payload",
+                code: "canonical_artifact_invalid_payload".to_string(),
                 message: "path/heading_slug/item_index must be provided".to_string(),
                 severity: CanonicalValidationSeverity::Error,
             }],
@@ -128,7 +128,7 @@ pub fn build_canonical_snapshot(
             "commit_sha and aggregate_digest are required",
             vec![CanonicalValidationIssue {
                 field: "snapshot".to_string(),
-                code: "canonical_artifact_invalid_payload",
+                code: "canonical_artifact_invalid_payload".to_string(),
                 message: "snapshot metadata is incomplete".to_string(),
                 severity: CanonicalValidationSeverity::Error,
             }],
@@ -145,15 +145,12 @@ pub fn build_canonical_snapshot(
             artifact.item_index,
         )?;
         if artifact.source_item_id.trim().is_empty() {
-            return Err(CanonicalArtifactContractError::invalid_payload(
-                "source_item_id cannot be blank",
-                vec![CanonicalValidationIssue {
-                    field: "source_item_id".to_string(),
-                    code: "canonical_artifact_invalid_payload",
-                    message: "source_item_id cannot be blank".to_string(),
-                    severity: CanonicalValidationSeverity::Error,
-                }],
-            ));
+            warnings.push(CanonicalValidationIssue {
+                field: "source_item_id".to_string(),
+                code: "canonical_artifact_minor_quality_warning".to_string(),
+                message: "source_item_id missing; preserving item with warning".to_string(),
+                severity: CanonicalValidationSeverity::Warning,
+            });
         }
         items.push(CanonicalArtifactItem {
             canonical_requirement_id,
@@ -161,7 +158,11 @@ pub fn build_canonical_snapshot(
             artifact_path: artifact.artifact_path.trim().to_string(),
             heading_slug: normalize_slug(&artifact.heading_slug),
             item_index: artifact.item_index,
-            source_item_id: Some(artifact.source_item_id.trim().to_string()),
+            source_item_id: if artifact.source_item_id.trim().is_empty() {
+                None
+            } else {
+                Some(artifact.source_item_id.trim().to_string())
+            },
             body: artifact.body.trim().to_string(),
         });
     }
@@ -198,7 +199,7 @@ fn validate_utc_timestamp(value: &str) -> Result<(), CanonicalArtifactContractEr
             "ingested_at_utc must be RFC3339 UTC",
             vec![CanonicalValidationIssue {
                 field: "ingested_at_utc".to_string(),
-                code: "canonical_artifact_invalid_payload",
+                code: "canonical_artifact_invalid_payload".to_string(),
                 message: "ingested_at_utc must be RFC3339 UTC".to_string(),
                 severity: CanonicalValidationSeverity::Error,
             }],
@@ -209,7 +210,7 @@ fn validate_utc_timestamp(value: &str) -> Result<(), CanonicalArtifactContractEr
             "ingested_at_utc must use Z offset",
             vec![CanonicalValidationIssue {
                 field: "ingested_at_utc".to_string(),
-                code: "canonical_artifact_invalid_payload",
+                code: "canonical_artifact_invalid_payload".to_string(),
                 message: "ingested_at_utc must use Z offset".to_string(),
                 severity: CanonicalValidationSeverity::Error,
             }],
