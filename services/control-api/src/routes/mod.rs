@@ -426,6 +426,10 @@ pub fn app_router(state: ControlApiState) -> Router {
             post(trigger_on_demand_report_export),
         )
         .route(
+            "/control/report-exports/readiness/on-demand",
+            post(trigger_on_demand_report_export),
+        )
+        .route(
             "/control/report-exports/incidents/{incident_id}",
             post(trigger_incident_report_export),
         )
@@ -434,11 +438,23 @@ pub fn app_router(state: ControlApiState) -> Router {
             get(query_report_export_job),
         )
         .route(
+            "/control/report-exports/readiness/{job_id}",
+            get(query_report_export_job),
+        )
+        .route(
             "/control/report-exports/{job_id}/artifacts",
             get(list_report_export_artifacts),
         )
         .route(
+            "/control/report-exports/readiness/{job_id}/artifacts",
+            get(list_report_export_artifacts),
+        )
+        .route(
             "/control/report-exports/{job_id}/artifacts/{artifact_id}",
+            get(read_report_export_artifact),
+        )
+        .route(
+            "/control/report-exports/readiness/{job_id}/artifacts/{artifact_id}",
             get(read_report_export_artifact),
         )
         .route_layer(axum_middleware::from_fn_with_state(

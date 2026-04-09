@@ -56,6 +56,7 @@
     "qa:test:phase-2": "cargo test -p research-gateway traceability::tests:: && cargo test -p research-gateway main::tests::trace_evidence_ && node --test tests/api/phase-2-traceability.test.mjs tests/e2e/phase-2-traceability-mapping.e2e.test.mjs",
     "qa:test:phase-3": "cargo test -p persistence postgres::coverage::tests:: && cargo test -p research-gateway coverage::tests:: && cargo test -p research-gateway main::tests::classify_coverage_ && node --test tests/api/phase-3-coverage-classification.test.mjs tests/e2e/phase-3-coverage-matrix.e2e.test.mjs",
     "qa:test:phase-4": "cargo test -p persistence postgres::risk_prioritization::tests:: && cargo test -p research-gateway risk::tests:: && cargo test -p research-gateway main::tests::prioritize_risk_ && node --test tests/api/phase-4-risk-prioritization.test.mjs tests/e2e/phase-4-risk-prioritization.e2e.test.mjs",
+    "qa:test:phase-5": "cargo test -p research-gateway readiness::tests:: && cargo test -p persistence postgres::readiness::tests::waiver_ && cargo test -p reporting-service exports::workflows::tests::readiness_ && cargo test -p research-gateway main::tests::readiness_ && node --test tests/api/phase-5-ci-readiness-reporting.test.mjs tests/e2e/phase-5-ci-readiness-reporting.e2e.test.mjs",
     "rust:fmt": "cargo fmt --all -- --check",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace --all-targets",

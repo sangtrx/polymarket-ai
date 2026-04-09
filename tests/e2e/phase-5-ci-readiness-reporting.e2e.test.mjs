@@ -52,7 +52,15 @@ function runPhase5Chain(repoRoot) {
     },
   );
   assert.equal(command.status, 0, command.stderr ?? command.error?.message);
-  return (command.stdout ?? "").trim();
+  const lines = (command.stdout ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const payloadLine = [...lines]
+    .reverse()
+    .find((line) => line.startsWith("{") && line.includes("\"readiness\""));
+  assert.ok(payloadLine, "phase5 chain should emit final readiness JSON payload");
+  return payloadLine;
 }
 
 test("RPTG-01/RPTG-02: run-phase5-chain output is replay-stable with dual readiness artifacts", () => {
