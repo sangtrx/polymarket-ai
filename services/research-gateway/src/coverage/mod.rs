@@ -4,11 +4,46 @@ pub mod service;
 #[cfg(test)]
 mod tests {
     use super::classifier::classify_traceability_row;
-    use super::service::{RunCoverageClassificationInput, run_coverage_classification};
+    use super::service::{
+        CoverageMatrixResult, CoveragePersistencePort, CoverageService, CoverageServiceError,
+        RunCoverageClassificationInput, run_coverage_classification,
+    };
     use crate::traceability::service::TraceabilityMappingRow;
     use domain::coverage::CoverageClass;
     use domain::traceability::{EvidenceAnchor, EvidenceType, LinkConfidence, LinkOutcome};
     use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct RecordingCoveragePersistence {
+        persisted: Arc<Mutex<Vec<CoverageMatrixResult>>>,
+        fail_with: Arc<Mutex<Option<CoverageServiceError>>>,
+    }
+
+    impl CoveragePersistencePort for RecordingCoveragePersistence {
+        fn persist_coverage<'a>(
+            &'a self,
+            result: &'a CoverageMatrixResult,
+        ) -> Pin<Box<dyn Future<Output = Result<(), CoverageServiceError>> + Send + 'a>> {
+            Box::pin(async move {
+                if let Some(error) = self
+                    .fail_with
+                    .lock()
+                    .expect("mutex should not be poisoned")
+                    .clone()
+                {
+                    return Err(error);
+                }
+                self.persisted
+                    .lock()
+                    .expect("mutex should not be poisoned")
+                    .push(result.clone());
+                Ok(())
+            })
+        }
+    }
 
     fn code_anchor(symbol: &str) -> EvidenceAnchor {
         EvidenceAnchor {
@@ -252,5 +287,74 @@ mod tests {
             by_requirement["project_md.requirements.3"].reason_code,
             "missing_evidence"
         );
+    }
+
+    #[tokio::test]
+    async fn persists_coverage_snapshot_transactionally() {
+        let persistence = RecordingCoveragePersistence::default();
+        let service = CoverageService::new(Arc::new(persistence.clone()));
+        let output = service
+            .run_coverage_classification(RunCoverageClassificationInput {
+                snapshot_id: "coverage_snapshot_2".to_string(),
+                commit_sha: "abc123".to_string(),
+                generated_at_utc: "2026-04-09T00:00:00Z".to_string(),
+                repo_root: ".".to_string(),
+                canonical_requirement_ids: vec![
+                    "project_md.requirements.1".to_string(),
+                    "project_md.requirements.2".to_string(),
+                ],
+                traceability_rows: vec![traceability_row(
+                    "project_md.requirements.1",
+                    LinkOutcome::Linked,
+                    LinkConfidence::High,
+                    "deterministic_anchor_match",
+                    "deterministic anchor found",
+                    vec![],
+                )],
+            })
+            .await
+            .expect("classification and persistence should succeed");
+
+        let persisted = persistence
+            .persisted
+            .lock()
+            .expect("mutex should not be poisoned")
+            .clone();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].snapshot_id, "coverage_snapshot_2");
+        assert_eq!(persisted[0].rows, output.rows);
+        assert_eq!(persisted[0].rows[1].reason_code, "missing_evidence");
+    }
+
+    #[tokio::test]
+    async fn persistence_failures_return_machine_readable_errors() {
+        let persistence = RecordingCoveragePersistence::default();
+        *persistence
+            .fail_with
+            .lock()
+            .expect("mutex should not be poisoned") = Some(CoverageServiceError {
+            code: "coverage_query_failed".to_string(),
+            message: "insert failed".to_string(),
+        });
+        let service = CoverageService::new(Arc::new(persistence));
+        let error = service
+            .run_coverage_classification(RunCoverageClassificationInput {
+                snapshot_id: "coverage_snapshot_3".to_string(),
+                commit_sha: "abc123".to_string(),
+                generated_at_utc: "2026-04-09T00:00:00Z".to_string(),
+                repo_root: ".".to_string(),
+                canonical_requirement_ids: vec!["project_md.requirements.1".to_string()],
+                traceability_rows: vec![traceability_row(
+                    "project_md.requirements.1",
+                    LinkOutcome::Linked,
+                    LinkConfidence::High,
+                    "deterministic_anchor_match",
+                    "deterministic anchor found",
+                    vec![],
+                )],
+            })
+            .await
+            .expect_err("persistence failure should surface fail-closed error");
+        assert_eq!(error.code, "coverage_query_failed");
     }
 }

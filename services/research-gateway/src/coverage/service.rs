@@ -1,9 +1,14 @@
 use crate::coverage::classifier::classify_traceability_row;
 use crate::traceability::service::TraceabilityMappingRow;
 use domain::coverage::{CoverageClass, CoverageMatrixRow, build_coverage_row};
+use persistence::postgres::coverage::insert_coverage_snapshot;
 use serde::Serialize;
+use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Clone)]
@@ -30,12 +35,79 @@ pub struct CoverageMatrixResult {
     pub rows: Vec<CoverageMatrixRow>,
 }
 
+pub trait CoveragePersistencePort: Send + Sync {
+    fn persist_coverage<'a>(
+        &'a self,
+        result: &'a CoverageMatrixResult,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoverageServiceError>> + Send + 'a>>;
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct CoverageService;
+pub struct InMemoryCoveragePersistence;
+
+impl CoveragePersistencePort for InMemoryCoveragePersistence {
+    fn persist_coverage<'a>(
+        &'a self,
+        _result: &'a CoverageMatrixResult,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoverageServiceError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresCoveragePersistence {
+    pool: PgPool,
+}
+
+impl PostgresCoveragePersistence {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl CoveragePersistencePort for PostgresCoveragePersistence {
+    fn persist_coverage<'a>(
+        &'a self,
+        result: &'a CoverageMatrixResult,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoverageServiceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut connection =
+                self.pool
+                    .acquire()
+                    .await
+                    .map_err(|error| CoverageServiceError {
+                        code: "coverage_query_failed".to_string(),
+                        message: format!("unable to acquire postgres connection: {error}"),
+                    })?;
+            insert_coverage_snapshot(
+                &mut connection,
+                &result.snapshot_id,
+                &result.commit_sha,
+                &result.generated_at_utc,
+                &result.rows,
+            )
+            .await
+            .map_err(|error| CoverageServiceError {
+                code: error.code.to_string(),
+                message: error.message,
+            })?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct CoverageService {
+    persistence: Arc<dyn CoveragePersistencePort>,
+}
 
 impl CoverageService {
+    pub fn new(persistence: Arc<dyn CoveragePersistencePort>) -> Self {
+        Self { persistence }
+    }
+
     pub fn in_memory() -> Self {
-        Self
+        Self::new(Arc::new(InMemoryCoveragePersistence))
     }
 
     pub async fn run_coverage_classification(
@@ -95,12 +167,16 @@ impl CoverageService {
                 .cmp(&right.canonical_requirement_id)
         });
 
-        Ok(CoverageMatrixResult {
+        let result = CoverageMatrixResult {
             snapshot_id: input.snapshot_id,
             commit_sha: input.commit_sha,
             generated_at_utc: input.generated_at_utc,
             rows,
-        })
+        };
+
+        validate_result_for_persistence(&result)?;
+        self.persistence.persist_coverage(&result).await?;
+        Ok(result)
     }
 }
 
@@ -176,5 +252,27 @@ fn validate_payload(input: &RunCoverageClassificationInput) -> Result<(), Covera
         }
     }
 
+    Ok(())
+}
+
+fn validate_result_for_persistence(
+    result: &CoverageMatrixResult,
+) -> Result<(), CoverageServiceError> {
+    for row in &result.rows {
+        build_coverage_row(
+            row.canonical_requirement_id.clone(),
+            row.coverage_class.clone(),
+            row.reason_code.clone(),
+            row.rationale.clone(),
+            row.code_anchors.clone(),
+            row.test_anchors.clone(),
+            row.ambiguous_candidates.clone(),
+            row.provenance.clone(),
+        )
+        .map_err(|error| CoverageServiceError {
+            code: error.code,
+            message: error.message,
+        })?;
+    }
     Ok(())
 }

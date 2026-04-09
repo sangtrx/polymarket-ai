@@ -5,9 +5,10 @@ pub mod alpha_lifecycle_actions;
 pub mod api_contract_versions;
 pub mod approvals;
 pub mod attribution_snapshots;
-pub mod canonical_artifacts;
 pub mod audit;
+pub mod canonical_artifacts;
 pub mod counterfactual_replay_runs;
+pub mod coverage;
 pub mod credential_rotation;
 pub mod export_jobs;
 pub mod freshness_gate;
@@ -31,11 +32,11 @@ pub mod reward_risk;
 pub mod risk_limits;
 pub mod safety_controls;
 pub mod shadow_evaluations;
+pub mod traceability;
 pub mod user_stream;
 pub mod validation_artifacts;
 pub mod validation_gate_policies;
 pub mod validation_runs;
-pub mod traceability;
 
 pub fn migration_namespace() -> &'static str {
     "governance_rbac"
