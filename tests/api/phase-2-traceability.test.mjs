@@ -59,7 +59,16 @@ test("TRAC-01 and TRAC-03: each row includes requirement id, rationale, confiden
   try {
     const first = runTraceability(workspace);
     assert.equal(first.status, 0, first.stderr);
-    const payload = JSON.parse(first.stdout);
+    const firstPayload = JSON.parse(first.stdout);
+    const targetRequirement = firstPayload.rows[0].canonical_requirement_id;
+    writeFileSync(
+      join(workspace, "docs/traceability.md"),
+      `# mapped doc\n- ${targetRequirement}`,
+      "utf8",
+    );
+    const second = runTraceability(workspace);
+    assert.equal(second.status, 0, second.stderr);
+    const payload = JSON.parse(second.stdout);
     assert.ok(Array.isArray(payload.rows));
     assert.ok(payload.rows.length > 0);
     for (const row of payload.rows) {
@@ -70,6 +79,13 @@ test("TRAC-01 and TRAC-03: each row includes requirement id, rationale, confiden
       assert.ok(["high", "medium", "low"].includes(row.confidence));
       assert.equal(typeof row.reason_code, "string");
       assert.ok(Array.isArray(row.code_anchors));
+      for (const anchor of row.code_anchors) {
+        assert.equal(typeof anchor.file_path, "string");
+        assert.ok(!anchor.file_path.endsWith(".md"));
+      }
+      if (row.outcome !== "missing_evidence") {
+        assert.ok(row.code_anchors.length > 0);
+      }
     }
   } finally {
     rmSync(workspace, { recursive: true, force: true });
