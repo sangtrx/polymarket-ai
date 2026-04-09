@@ -63,30 +63,30 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ARTF-01 | TBD | Pending |
-| ARTF-02 | TBD | Pending |
-| ARTF-03 | TBD | Pending |
-| ARTF-04 | TBD | Pending |
-| ARTF-05 | TBD | Pending |
-| TRAC-01 | TBD | Pending |
-| TRAC-02 | TBD | Pending |
-| TRAC-03 | TBD | Pending |
-| COVR-01 | TBD | Pending |
-| COVR-02 | TBD | Pending |
-| COVR-03 | TBD | Pending |
-| RISK-01 | TBD | Pending |
-| RISK-02 | TBD | Pending |
-| GATE-01 | TBD | Pending |
-| GATE-02 | TBD | Pending |
-| GATE-03 | TBD | Pending |
-| RPTG-01 | TBD | Pending |
-| RPTG-02 | TBD | Pending |
+| ARTF-01 | Phase 1 | Pending |
+| ARTF-02 | Phase 1 | Pending |
+| ARTF-03 | Phase 1 | Pending |
+| ARTF-04 | Phase 1 | Pending |
+| ARTF-05 | Phase 1 | Pending |
+| TRAC-01 | Phase 2 | Pending |
+| TRAC-02 | Phase 2 | Pending |
+| TRAC-03 | Phase 2 | Pending |
+| COVR-01 | Phase 3 | Pending |
+| COVR-02 | Phase 3 | Pending |
+| COVR-03 | Phase 3 | Pending |
+| RISK-01 | Phase 4 | Pending |
+| RISK-02 | Phase 4 | Pending |
+| GATE-01 | Phase 5 | Pending |
+| GATE-02 | Phase 5 | Pending |
+| GATE-03 | Phase 5 | Pending |
+| RPTG-01 | Phase 5 | Pending |
+| RPTG-02 | Phase 5 | Pending |
 
 **Coverage:**
 - v1 requirements: 18 total
-- Mapped to phases: 0
-- Unmapped: 18 ⚠️
+- Mapped to phases: 18
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-04-09*  
-*Last updated: 2026-04-09 after initial definition*
+*Last updated: 2026-04-09 after roadmap phase mapping*
