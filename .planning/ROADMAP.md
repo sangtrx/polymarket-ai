@@ -38,11 +38,12 @@ Plans:
   1. User can map every canonical requirement ID to one or more code evidence references.
   2. User can attach related test evidence to requirement mappings when available.
   3. User can review rationale and confidence for every traceability link.
-**Plans**: 2 plans
+**Plans**: 3 plans
 
 Plans:
 - [ ] 02-01-PLAN.md — Define traceability domain/persistence contracts for deterministic requirement-to-evidence links
 - [ ] 02-02-PLAN.md — Implement traceability mapping service, CLI wiring, and phase-2 API/E2E verification
+- [ ] 02-03-PLAN.md — Gap closure: tighten code-evidence qualification and transactional persistence validation
 
 ### Phase 3: Coverage Classification Matrix
 **Goal**: Users can evaluate coverage status for every scoped requirement with complete, explainable classification.
