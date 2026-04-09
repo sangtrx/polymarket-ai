@@ -1,10 +1,10 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.0
-milestone_name: milestone
+milestone_name: BMAD Coverage Audit
 status: completed
-stopped_at: Phase 05 complete
-last_updated: "2026-04-09T20:42:58.516Z"
+stopped_at: Milestone v1.0 archived
+last_updated: "2026-04-09T21:07:21.059Z"
 last_activity: 2026-04-09
 progress:
   total_phases: 5
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-09)
 
 **Core value:** Establish deployment confidence by producing an evidence-based coverage audit of BMAD intent versus implemented code.
-**Current focus:** Milestone v1.0 complete
+**Current focus:** Plan next milestone (v1.1) and close accepted v1.0 gaps
 
 ## Current Position
 
 Phase: 05
 Plan: Complete
-Status: Phase complete
-Last activity: 2026-04-09 -- Phase 05 execution and verification complete
+Status: Milestone v1.0 archived
+Last activity: 2026-04-09
 
 Progress: [██████████] 100%
 
@@ -78,7 +78,8 @@ None yet.
 
 ### Blockers/Concerns
 
-None yet.
+- GATE-01 portability hardening still needed for CI shell environments that do not auto-inject cargo into PATH.
+- RPTG-02 markdown parity hardening still needed between `run-phase5-chain` and canonical reporting export composer.
 
 ## Session Continuity
 
