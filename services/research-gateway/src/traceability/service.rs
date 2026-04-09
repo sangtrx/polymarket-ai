@@ -1,11 +1,15 @@
 use crate::traceability::matcher::{
-    match_requirement_to_evidence, EvidenceCandidate, MatchRequest, MatchResult, PreviousLink,
+    EvidenceCandidate, MatchRequest, PreviousLink, match_requirement_to_evidence,
 };
-use domain::traceability::{EvidenceAnchor, LinkConfidence, LinkOutcome};
+use domain::traceability::{EvidenceAnchor, LinkConfidence, LinkOutcome, TraceabilityLink};
+use persistence::postgres::traceability::insert_traceability_snapshot;
 use serde::Serialize;
+use sqlx::PgPool;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Clone)]
 pub struct TraceabilityRequirementInput {
@@ -54,8 +58,74 @@ pub struct TraceabilityMappingResult {
 pub trait TraceabilityPersistencePort: Send + Sync {
     fn persist_traceability<'a>(
         &'a self,
-        _result: &'a TraceabilityMappingResult,
+        result: &'a TraceabilityMappingResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), TraceabilityServiceError>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryTraceabilityPersistence;
+
+impl TraceabilityPersistencePort for InMemoryTraceabilityPersistence {
+    fn persist_traceability<'a>(
+        &'a self,
+        _result: &'a TraceabilityMappingResult,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TraceabilityServiceError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresTraceabilityPersistence {
+    pool: PgPool,
+}
+
+impl PostgresTraceabilityPersistence {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl TraceabilityPersistencePort for PostgresTraceabilityPersistence {
+    fn persist_traceability<'a>(
+        &'a self,
+        result: &'a TraceabilityMappingResult,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TraceabilityServiceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut connection = self.pool.acquire().await.map_err(|error| TraceabilityServiceError {
+                code: "traceability_query_failed".to_string(),
+                message: format!("unable to acquire postgres connection: {error}"),
+            })?;
+            let links = result
+                .rows
+                .iter()
+                .map(|row| TraceabilityLink {
+                    canonical_requirement_id: row.canonical_requirement_id.clone(),
+                    anchors: row
+                        .code_anchors
+                        .iter()
+                        .chain(row.test_anchors.iter())
+                        .cloned()
+                        .collect(),
+                    rationale: row.rationale.clone(),
+                    confidence: row.confidence.clone(),
+                    outcome: row.outcome.clone(),
+                })
+                .collect::<Vec<_>>();
+            insert_traceability_snapshot::<()>(
+                &mut connection,
+                &result.snapshot_id,
+                &result.commit_sha,
+                &result.generated_at_utc,
+                &links,
+            )
+            .await
+            .map_err(|error| TraceabilityServiceError {
+                code: error.code.to_string(),
+                message: error.message,
+            })?;
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -68,35 +138,26 @@ impl TraceabilityService {
         Self { persistence }
     }
 
+    pub fn in_memory() -> Self {
+        Self::new(Arc::new(InMemoryTraceabilityPersistence))
+    }
+
     pub async fn run_traceability_mapping(
         &self,
         input: RunTraceabilityMappingInput,
     ) -> Result<TraceabilityMappingResult, TraceabilityServiceError> {
-        if input.requirements.is_empty() {
-            return Err(TraceabilityServiceError {
-                code: "traceability_invalid_payload".to_string(),
-                message: "requirements are required".to_string(),
-            });
-        }
-        let rows = input
+        validate_payload(&input)?;
+        let mut rows = input
             .requirements
             .iter()
             .map(|requirement| {
-                match_requirement_to_evidence(MatchRequest {
+                let matched = match_requirement_to_evidence(MatchRequest {
                     canonical_requirement_id: requirement.canonical_requirement_id.clone(),
                     deterministic_candidates: requirement.deterministic_candidates.clone(),
                     semantic_candidates: requirement.semantic_candidates.clone(),
                     previous_links: requirement.previous_links.clone(),
-                })
-            })
-            .collect::<Vec<MatchResult>>();
-        let result = TraceabilityMappingResult {
-            snapshot_id: input.snapshot_id,
-            commit_sha: input.commit_sha,
-            generated_at_utc: input.generated_at_utc,
-            rows: rows
-                .into_iter()
-                .map(|matched| TraceabilityMappingRow {
+                });
+                TraceabilityMappingRow {
                     canonical_requirement_id: matched.canonical_requirement_id,
                     outcome: matched.outcome,
                     confidence: matched.confidence,
@@ -106,8 +167,21 @@ impl TraceabilityService {
                     test_anchors: matched.test_anchors,
                     ambiguous_candidates: matched.ambiguous_candidates,
                     provenance: matched.provenance,
-                })
-                .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        rows.sort_by(|left, right| {
+            left.canonical_requirement_id
+                .cmp(&right.canonical_requirement_id)
+                .then_with(|| left.reason_code.cmp(&right.reason_code))
+        });
+
+        let result = TraceabilityMappingResult {
+            snapshot_id: input.snapshot_id,
+            commit_sha: input.commit_sha,
+            generated_at_utc: input.generated_at_utc,
+            rows,
         };
         self.persistence.persist_traceability(&result).await?;
         Ok(result)
@@ -115,36 +189,70 @@ impl TraceabilityService {
 }
 
 pub async fn run_traceability_mapping(
-    service: &TraceabilityService,
     input: RunTraceabilityMappingInput,
 ) -> Result<TraceabilityMappingResult, TraceabilityServiceError> {
-    service.run_traceability_mapping(input).await
+    TraceabilityService::in_memory()
+        .run_traceability_mapping(input)
+        .await
+}
+
+fn validate_payload(input: &RunTraceabilityMappingInput) -> Result<(), TraceabilityServiceError> {
+    if input.snapshot_id.trim().is_empty() {
+        return Err(TraceabilityServiceError {
+            code: "traceability_invalid_payload".to_string(),
+            message: "snapshot_id is required".to_string(),
+        });
+    }
+    let commit_sha = input.commit_sha.trim();
+    if commit_sha.len() < 6
+        || commit_sha.len() > 64
+        || !commit_sha.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(TraceabilityServiceError {
+            code: "traceability_invalid_payload".to_string(),
+            message: "commit_sha must be 6-64 hex characters".to_string(),
+        });
+    }
+    let generated_at = OffsetDateTime::parse(input.generated_at_utc.trim(), &Rfc3339).map_err(|_| {
+        TraceabilityServiceError {
+            code: "traceability_invalid_payload".to_string(),
+            message: "generated_at_utc must be RFC3339 UTC".to_string(),
+        }
+    })?;
+    if generated_at.offset() != UtcOffset::UTC {
+        return Err(TraceabilityServiceError {
+            code: "traceability_invalid_payload".to_string(),
+            message: "generated_at_utc must use Z offset".to_string(),
+        });
+    }
+    if !Path::new(input.repo_root.trim()).is_dir() {
+        return Err(TraceabilityServiceError {
+            code: "traceability_invalid_payload".to_string(),
+            message: "repo_root must reference an existing directory".to_string(),
+        });
+    }
+    if input.requirements.is_empty() {
+        return Err(TraceabilityServiceError {
+            code: "traceability_invalid_payload".to_string(),
+            message: "requirements are required".to_string(),
+        });
+    }
+    if input
+        .requirements
+        .iter()
+        .any(|requirement| requirement.canonical_requirement_id.trim().is_empty())
+    {
+        return Err(TraceabilityServiceError {
+            code: "traceability_invalid_payload".to_string(),
+            message: "canonical_requirement_id is required".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Default)]
-    struct InMemoryTraceabilityPersistence {
-        persisted: Arc<Mutex<Vec<TraceabilityMappingResult>>>,
-    }
-
-    impl TraceabilityPersistencePort for InMemoryTraceabilityPersistence {
-        fn persist_traceability<'a>(
-            &'a self,
-            result: &'a TraceabilityMappingResult,
-        ) -> Pin<Box<dyn Future<Output = Result<(), TraceabilityServiceError>> + Send + 'a>> {
-            Box::pin(async move {
-                self.persisted
-                    .lock()
-                    .expect("traceability persistence mutex should not be poisoned")
-                    .push(result.clone());
-                Ok(())
-            })
-        }
-    }
 
     fn code_candidate(path: &str, symbol: &str) -> EvidenceCandidate {
         EvidenceCandidate {
@@ -164,98 +272,98 @@ mod tests {
 
     #[tokio::test]
     async fn deterministic_anchor_matching_is_preferred() {
-        let persistence = Arc::new(InMemoryTraceabilityPersistence::default());
-        let service = TraceabilityService::new(persistence);
-        let output = service
-            .run_traceability_mapping(RunTraceabilityMappingInput {
-                snapshot_id: "traceability_snapshot_1".to_string(),
-                commit_sha: "abc123".to_string(),
-                generated_at_utc: "2026-04-09T12:00:00Z".to_string(),
-                repo_root: ".".to_string(),
-                requirements: vec![TraceabilityRequirementInput {
-                    canonical_requirement_id: "project_md.requirements.1".to_string(),
-                    deterministic_candidates: vec![code_candidate(
-                        "services/research-gateway/src/traceability/service.rs",
-                        "run_traceability_mapping",
-                    )],
-                    semantic_candidates: vec![code_candidate(
-                        "services/research-gateway/src/traceability/matcher.rs",
-                        "semantic_probe",
-                    )],
-                    previous_links: vec![],
-                }],
-            })
-            .await
-            .expect("mapping should succeed");
-        assert_eq!(output.rows[0].reason_code, "semantic_fallback_used");
-    }
-
-    #[tokio::test]
-    async fn semantic_fallback_emits_downgraded_confidence_and_reason_code() {
-        let persistence = Arc::new(InMemoryTraceabilityPersistence::default());
-        let service = TraceabilityService::new(persistence);
-        let output = service
-            .run_traceability_mapping(RunTraceabilityMappingInput {
-                snapshot_id: "traceability_snapshot_1".to_string(),
-                commit_sha: "abc123".to_string(),
-                generated_at_utc: "2026-04-09T12:00:00Z".to_string(),
-                repo_root: ".".to_string(),
-                requirements: vec![TraceabilityRequirementInput {
-                    canonical_requirement_id: "project_md.requirements.2".to_string(),
-                    deterministic_candidates: vec![],
-                    semantic_candidates: vec![code_candidate(
-                        "services/research-gateway/src/traceability/matcher.rs",
-                        "semantic_probe",
-                    )],
-                    previous_links: vec![],
-                }],
-            })
-            .await
-            .expect("mapping should succeed");
+        let output = run_traceability_mapping(RunTraceabilityMappingInput {
+            snapshot_id: "traceability_snapshot_1".to_string(),
+            commit_sha: "abc123".to_string(),
+            generated_at_utc: "2026-04-09T12:00:00Z".to_string(),
+            repo_root: ".".to_string(),
+            requirements: vec![TraceabilityRequirementInput {
+                canonical_requirement_id: "project_md.requirements.1".to_string(),
+                deterministic_candidates: vec![code_candidate(
+                    "services/research-gateway/src/traceability/service.rs",
+                    "run_traceability_mapping",
+                )],
+                semantic_candidates: vec![code_candidate(
+                    "services/research-gateway/src/traceability/matcher.rs",
+                    "semantic_probe",
+                )],
+                previous_links: vec![],
+            }],
+        })
+        .await
+        .expect("mapping should succeed");
+        assert_eq!(output.rows[0].reason_code, "deterministic_anchor_match");
         assert_eq!(output.rows[0].confidence, LinkConfidence::High);
     }
 
     #[tokio::test]
-    async fn ambiguous_candidates_and_missing_outcomes_are_explicit_with_stale_invalidation() {
-        let persistence = Arc::new(InMemoryTraceabilityPersistence::default());
-        let service = TraceabilityService::new(persistence);
-        let output = service
-            .run_traceability_mapping(RunTraceabilityMappingInput {
-                snapshot_id: "traceability_snapshot_1".to_string(),
-                commit_sha: "abc123".to_string(),
-                generated_at_utc: "2026-04-09T12:00:00Z".to_string(),
-                repo_root: ".".to_string(),
-                requirements: vec![
-                    TraceabilityRequirementInput {
-                        canonical_requirement_id: "project_md.requirements.3".to_string(),
-                        deterministic_candidates: vec![
-                            code_candidate("services/research-gateway/src/a.rs", "alpha"),
-                            code_candidate("services/research-gateway/src/b.rs", "beta"),
-                        ],
-                        semantic_candidates: vec![],
-                        previous_links: vec![],
-                    },
-                    TraceabilityRequirementInput {
-                        canonical_requirement_id: "project_md.requirements.4".to_string(),
-                        deterministic_candidates: vec![],
-                        semantic_candidates: vec![],
-                        previous_links: vec![PreviousLink {
-                            snapshot_id: "traceability_snapshot_0".to_string(),
-                            anchor: EvidenceAnchor {
-                                evidence_type: domain::traceability::EvidenceType::Code,
-                                file_path: "services/research-gateway/src/missing.rs".to_string(),
-                                symbol: Some("gone".to_string()),
-                                section: None,
-                                line_start: Some(1),
-                                line_end: Some(5),
-                            },
-                        }],
-                    },
-                ],
-            })
-            .await
-            .expect("mapping should succeed");
+    async fn semantic_fallback_emits_downgraded_confidence_and_reason_code() {
+        let output = run_traceability_mapping(RunTraceabilityMappingInput {
+            snapshot_id: "traceability_snapshot_1".to_string(),
+            commit_sha: "abc123".to_string(),
+            generated_at_utc: "2026-04-09T12:00:00Z".to_string(),
+            repo_root: ".".to_string(),
+            requirements: vec![TraceabilityRequirementInput {
+                canonical_requirement_id: "project_md.requirements.2".to_string(),
+                deterministic_candidates: vec![],
+                semantic_candidates: vec![code_candidate(
+                    "services/research-gateway/src/traceability/matcher.rs",
+                    "semantic_probe",
+                )],
+                previous_links: vec![],
+            }],
+        })
+        .await
+        .expect("mapping should succeed");
+        assert_eq!(output.rows[0].confidence, LinkConfidence::Low);
+        assert_eq!(output.rows[0].reason_code, "semantic_fallback_used");
+    }
 
+    #[tokio::test]
+    async fn ambiguous_candidates_and_missing_outcomes_are_explicit_with_stale_invalidation() {
+        let output = run_traceability_mapping(RunTraceabilityMappingInput {
+            snapshot_id: "traceability_snapshot_1".to_string(),
+            commit_sha: "abc123".to_string(),
+            generated_at_utc: "2026-04-09T12:00:00Z".to_string(),
+            repo_root: ".".to_string(),
+            requirements: vec![
+                TraceabilityRequirementInput {
+                    canonical_requirement_id: "project_md.requirements.3".to_string(),
+                    deterministic_candidates: vec![
+                        code_candidate("services/research-gateway/src/a.rs", "alpha"),
+                        code_candidate("services/research-gateway/src/b.rs", "beta"),
+                    ],
+                    semantic_candidates: vec![],
+                    previous_links: vec![],
+                },
+                TraceabilityRequirementInput {
+                    canonical_requirement_id: "project_md.requirements.4".to_string(),
+                    deterministic_candidates: vec![],
+                    semantic_candidates: vec![],
+                    previous_links: vec![PreviousLink {
+                        snapshot_id: "traceability_snapshot_0".to_string(),
+                        anchor: EvidenceAnchor {
+                            evidence_type: domain::traceability::EvidenceType::Code,
+                            file_path: "services/research-gateway/src/missing.rs".to_string(),
+                            symbol: Some("gone".to_string()),
+                            section: None,
+                            line_start: Some(1),
+                            line_end: Some(5),
+                        },
+                    }],
+                },
+                TraceabilityRequirementInput {
+                    canonical_requirement_id: "project_md.requirements.5".to_string(),
+                    deterministic_candidates: vec![],
+                    semantic_candidates: vec![],
+                    previous_links: vec![],
+                },
+            ],
+        })
+        .await
+        .expect("mapping should succeed");
+
+        assert!(output.rows.iter().any(|row| row.outcome == LinkOutcome::Ambiguous));
         assert!(output
             .rows
             .iter()
