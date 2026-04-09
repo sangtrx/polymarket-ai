@@ -1,3 +1,4 @@
+pub mod coverage;
 pub mod ingestion;
 pub mod promotion;
 pub mod traceability;

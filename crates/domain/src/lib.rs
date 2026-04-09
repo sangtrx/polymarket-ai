@@ -1,7 +1,8 @@
-pub mod audit_artifacts;
 pub mod alerts;
 pub mod allocation;
 pub mod attribution;
+pub mod audit_artifacts;
+pub mod coverage;
 pub mod events;
 pub mod governance;
 pub mod incidents;
