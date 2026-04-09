@@ -210,17 +210,15 @@ sqlx::query(UPSERT_ITEM_SQL)
 |---|-------|---------|---------------|
 | A1 | Line anchor (`path + line`) can satisfy D-04 when symbol extraction is not available in a file type. [ASSUMED] | Architecture Patterns | Could require additional parser work for strict symbol extraction |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Canonical anchor schema detail**
-   - What we know: D-04 requires `file path + symbol/section/line anchor + rationale`. [VERIFIED: 02-CONTEXT.md:20]
-   - What's unclear: exact wire format (single `anchor` string vs structured fields).
-   - Recommendation: lock explicit schema early (e.g., `{path, symbol?, section?, line_start?, line_end?}`) in Wave 0.
+1. **Canonical anchor schema detail — RESOLVED**
+   - Decision: use structured anchor payload with deterministic fields: `{path, symbol?, section?, line_start?, line_end?}` plus required `rationale`.
+   - Rationale: satisfies D-04 while allowing language/file-type variability without losing deterministic anchors.
 
-2. **Deterministic link source for TRAC-01**
-   - What we know: deterministic-first is mandatory. [VERIFIED: 02-CONTEXT.md:23]
-   - What's unclear: where explicit canonical IDs will be found in existing code/tests today.
-   - Recommendation: define deterministic probes (ID literals, structured comments, known registry tables) before semantic pass.
+2. **Deterministic link source for TRAC-01 — RESOLVED**
+   - Decision: deterministic probe order is fixed to: (1) explicit canonical requirement ID literals, (2) structured anchor metadata already stored in traceability records, then (3) semantic fallback with downgraded confidence + reason code.
+   - Rationale: preserves deterministic-first behavior from D-05/D-06 and avoids non-repeatable matching outcomes.
 
 ## Environment Availability
 

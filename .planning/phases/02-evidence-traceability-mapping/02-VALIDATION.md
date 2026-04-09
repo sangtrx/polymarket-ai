@@ -19,7 +19,7 @@ created: 2026-04-09
 |----------|-------|
 | **Framework** | Rust built-in test harness + Node built-in test runner |
 | **Config file** | none (command-driven scripts) |
-| **Quick run command** | `cargo test -p research-gateway traceability:: && node --test tests/api/phase-2-traceability.test.mjs -t` |
+| **Quick run command** | `cargo test -p domain traceability::tests::` |
 | **Full suite command** | `cargo test -p research-gateway traceability:: && node --test tests/api/phase-2-traceability.test.mjs tests/e2e/phase-2-traceability-mapping.e2e.test.mjs` |
 | **Estimated runtime** | ~180 seconds |
 
@@ -27,10 +27,10 @@ created: 2026-04-09
 
 ## Sampling Rate
 
-- **After every task commit:** Run `cargo test -p research-gateway traceability::` plus relevant `node --test` phase-2 file.
+- **After every task commit:** Run `cargo test -p domain traceability::tests::` (smoke gate, target <30s).
 - **After every plan wave:** Run `cargo test -p research-gateway traceability:: && node --test tests/api/phase-2-traceability.test.mjs tests/e2e/phase-2-traceability-mapping.e2e.test.mjs`.
 - **Before `/gsd-verify-work`:** Full suite must be green.
-- **Max feedback latency:** 180 seconds.
+- **Max feedback latency:** 30 seconds.
 
 ---
 
@@ -69,7 +69,7 @@ All phase behaviors are expected to be automated. No manual-only checks planned.
 - [ ] Sampling continuity: no 3 consecutive tasks without automated verify
 - [ ] Wave 0 covers all missing references
 - [ ] No watch-mode flags
-- [ ] Feedback latency < 180s
+- [ ] Feedback latency < 30s
 - [ ] `nyquist_compliant: true` set in frontmatter
 
 **Approval:** pending
