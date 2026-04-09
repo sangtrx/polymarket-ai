@@ -284,9 +284,9 @@ fn parse_outcome(value: &str) -> Result<LinkOutcome, TraceabilityPersistenceErro
         "ambiguous" => Ok(LinkOutcome::Ambiguous),
         "missing_evidence" => Ok(LinkOutcome::MissingEvidence),
         "stale_evidence" => Ok(LinkOutcome::StaleEvidence),
-        _ => Err(TraceabilityPersistenceError::invalid_payload(
-            "invalid outcome stored in database",
-        )),
+        _ => Err(TraceabilityPersistenceError::invalid_payload(format!(
+            "invalid outcome stored in database: {value}",
+        ))),
     }
 }
 
@@ -294,9 +294,9 @@ fn parse_evidence_type(value: &str) -> Result<EvidenceType, TraceabilityPersiste
     match value {
         "code" => Ok(EvidenceType::Code),
         "test" => Ok(EvidenceType::Test),
-        _ => Err(TraceabilityPersistenceError::invalid_payload(
-            "invalid evidence_type stored in database",
-        )),
+        _ => Err(TraceabilityPersistenceError::invalid_payload(format!(
+            "invalid evidence_type stored in database: {value}",
+        ))),
     }
 }
 
