@@ -1,5 +1,5 @@
 use domain::traceability::{EvidenceAnchor, EvidenceType, LinkConfidence, LinkOutcome, TraceabilityLink};
-use sqlx::{PgConnection, Row};
+use sqlx::{Connection, PgConnection, Row};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -127,11 +127,18 @@ pub async fn insert_traceability_snapshot<'e, E>(
         ));
     }
 
+    let mut transaction = executor.begin().await.map_err(|error| {
+        TraceabilityPersistenceError::query_failure(
+            "insert_traceability_snapshot.begin",
+            error,
+        )
+    })?;
+
     sqlx::query(INSERT_TRACEABILITY_SNAPSHOT_SQL)
         .bind(snapshot_id.trim().to_ascii_lowercase())
         .bind(commit_sha.trim().to_ascii_lowercase())
         .bind(generated_at_utc.trim())
-        .execute(&mut *executor)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| classify_query_error("insert_traceability_snapshot.snapshot", error))?;
 
@@ -151,7 +158,7 @@ pub async fn insert_traceability_snapshot<'e, E>(
                     .filter(|value| !value.is_empty())
                     .map(ToString::to_string),
             )
-            .execute(&mut *executor)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| classify_query_error("insert_traceability_snapshot.link", error))?;
 
@@ -166,11 +173,18 @@ pub async fn insert_traceability_snapshot<'e, E>(
                 .bind(anchor.section.clone())
                 .bind(anchor.line_start.map(i64::from))
                 .bind(anchor.line_end.map(i64::from))
-                .execute(&mut *executor)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|error| classify_query_error("insert_traceability_snapshot.anchor", error))?;
         }
     }
+
+    transaction.commit().await.map_err(|error| {
+        TraceabilityPersistenceError::query_failure(
+            "insert_traceability_snapshot.commit",
+            error,
+        )
+    })?;
 
     Ok(())
 }
@@ -265,8 +279,12 @@ fn decode_anchor(row: &sqlx::postgres::PgRow) -> Result<Option<EvidenceAnchor>, 
     let line_end: Option<i64> = row.try_get("line_end").map_err(|error| {
         TraceabilityPersistenceError::query_failure("row_decode.line_end", error)
     })?;
-    let line_start = line_start.map(|value| value as u32);
-    let line_end = line_end.map(|value| value as u32);
+    let line_start = line_start
+        .map(|value| decode_anchor_line_value(value, "line_start"))
+        .transpose()?;
+    let line_end = line_end
+        .map(|value| decode_anchor_line_value(value, "line_end"))
+        .transpose()?;
 
     Ok(Some(EvidenceAnchor {
         evidence_type,
@@ -304,6 +322,22 @@ fn parse_evidence_type(value: &str) -> Result<EvidenceType, TraceabilityPersiste
             "invalid evidence_type stored in database: {value}",
         ))),
     }
+}
+
+fn decode_anchor_line_value(
+    value: i64,
+    field: &'static str,
+) -> Result<u32, TraceabilityPersistenceError> {
+    u32::try_from(value).map_err(|_| {
+        TraceabilityPersistenceError::invalid_payload(format!(
+            "{field} must be between 0 and {}",
+            u32::MAX
+        ))
+    })
+}
+
+fn insert_traceability_snapshot_transaction_steps() -> [&'static str; 5] {
+    ["begin", "snapshot", "links", "anchors", "commit"]
 }
 
 fn confidence_to_str(confidence: &LinkConfidence) -> &'static str {
