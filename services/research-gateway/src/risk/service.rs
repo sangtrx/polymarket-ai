@@ -5,8 +5,10 @@ use domain::risk_prioritization::{RemediationFocus, RiskSeverity};
 use domain::traceability::EvidenceAnchor;
 use serde::Serialize;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Clone)]
 pub struct RunRiskPrioritizationInput {
@@ -21,6 +23,36 @@ pub struct RunRiskPrioritizationInput {
 pub struct RiskServiceError {
     pub code: String,
     pub message: String,
+}
+
+impl RiskServiceError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: "risk_invalid_payload".to_string(),
+            message: message.into(),
+        }
+    }
+
+    pub fn unmapped_reason(message: impl Into<String>) -> Self {
+        Self {
+            code: "risk_weight_unmapped_reason".to_string(),
+            message: message.into(),
+        }
+    }
+
+    pub fn query_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "risk_query_failed".to_string(),
+            message: message.into(),
+        }
+    }
+
+    pub fn constraint_violation(message: impl Into<String>) -> Self {
+        Self {
+            code: "risk_constraint_violation".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -88,6 +120,7 @@ impl RiskPrioritizationService {
         &self,
         input: RunRiskPrioritizationInput,
     ) -> Result<RiskPrioritizationResult, RiskServiceError> {
+        validate_payload(&input)?;
         let mut scored_rows = classify_unresolved_rows(&input.coverage_matrix.rows);
         sort_scored_rows(&mut scored_rows);
 
@@ -153,4 +186,36 @@ fn to_fix_item(scored_row: RiskScoredRow, priority_rank: usize) -> RiskFixItem {
         reason_weight: scored_row.reason_weight,
         evidence_penalty: scored_row.evidence_penalty,
     }
+}
+
+fn validate_payload(input: &RunRiskPrioritizationInput) -> Result<(), RiskServiceError> {
+    if input.snapshot_id.trim().is_empty() {
+        return Err(RiskServiceError::invalid_payload(
+            "snapshot_id is required",
+        ));
+    }
+    let commit_sha = input.commit_sha.trim();
+    if commit_sha.len() < 6
+        || commit_sha.len() > 64
+        || !commit_sha
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(RiskServiceError::invalid_payload(
+            "commit_sha must be 6-64 hex characters",
+        ));
+    }
+    let generated_at = OffsetDateTime::parse(input.generated_at_utc.trim(), &Rfc3339)
+        .map_err(|_| RiskServiceError::invalid_payload("generated_at_utc must be RFC3339 UTC"))?;
+    if generated_at.offset() != UtcOffset::UTC {
+        return Err(RiskServiceError::invalid_payload(
+            "generated_at_utc must use Z offset",
+        ));
+    }
+    if !Path::new(input.repo_root.trim()).is_dir() {
+        return Err(RiskServiceError::invalid_payload(
+            "repo_root must reference an existing directory",
+        ));
+    }
+    Ok(())
 }
