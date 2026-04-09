@@ -83,8 +83,13 @@ Plans:
   2. User can receive an advisory deployment-readiness signal derived from current audit results.
   3. User can manage waivers for unresolved gaps with owner, reason, and expiry metadata.
   4. User can export audit results as markdown and JSON and review a summary report with coverage posture, top risks, and readiness recommendation.
-**Plans**: TBD
+**Plans**: 3 plans
 **UI hint**: yes
+
+Plans:
+- [x] 05-01-PLAN.md — Define readiness/waiver domain and immutable persistence governance contracts
+- [x] 05-02-PLAN.md — Implement deterministic readiness scoring and full-chain CI command execution
+- [x] 05-03-PLAN.md — Deliver deterministic readiness JSON/markdown exports with API/E2E phase QA
 
 ## Progress
 
@@ -94,4 +99,4 @@ Plans:
 | 2. Evidence Traceability Mapping | 3/3 | Complete | 2026-04-09 |
 | 3. Coverage Classification Matrix | 3/3 | Complete    | 2026-04-09 |
 | 4. Deployment Risk Prioritization | 3/3 | Complete | 2026-04-09 |
-| 5. CI Readiness Signal & Reporting | 0/TBD | Not started | - |
+| 5. CI Readiness Signal & Reporting | 0/3 | Not started | - |
