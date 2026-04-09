@@ -8,7 +8,7 @@ This roadmap delivers an end-to-end BMAD coverage audit workflow: ingest and nor
 
 - [x] **Phase 1: Canonical Artifact Ingestion** - BMAD artifacts are ingested into a stable, versioned requirement dataset.
 - [x] **Phase 2: Evidence Traceability Mapping** - Each normalized requirement is linked to code/test evidence with rationale and confidence.
-- [ ] **Phase 3: Coverage Classification Matrix** - All scoped requirements receive explainable Covered/Partial/Missing outcomes in one complete matrix.
+- [x] **Phase 3: Coverage Classification Matrix** - All scoped requirements receive explainable Covered/Partial/Missing outcomes in one complete matrix. (completed 2026-04-09)
 - [ ] **Phase 4: Deployment Risk Prioritization** - Partial/Missing gaps are severity-ranked into a deployment-focused fix order.
 - [ ] **Phase 5: CI Readiness Signal & Reporting** - Deterministic CI audit outputs, waiver controls, and readiness reports are produced for release decisions.
 
@@ -53,7 +53,12 @@ Plans:
   1. User can classify every scoped requirement as Covered, Partial, or Missing.
   2. User can inspect explicit rationale for each Partial or Missing result.
   3. User can access a complete coverage matrix that includes all scoped BMAD requirements and linked evidence.
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [x] 03-01-PLAN.md — Implement coverage contracts, deterministic classifier rules, and full-baseline matrix assembly service
+- [x] 03-02-PLAN.md — Add transactional coverage persistence schema/adapter and service persistence wiring
+- [x] 03-03-PLAN.md — Expose classify-coverage CLI and phase-3 API/E2E verification command
 
 ### Phase 4: Deployment Risk Prioritization
 **Goal**: Users can identify which unresolved coverage gaps most threaten safe deployment.
@@ -82,6 +87,6 @@ Plans:
 |-------|----------------|--------|-----------|
 | 1. Canonical Artifact Ingestion | 4/4 | Complete | 2026-04-09 |
 | 2. Evidence Traceability Mapping | 3/3 | Complete | 2026-04-09 |
-| 3. Coverage Classification Matrix | 0/TBD | Not started | - |
+| 3. Coverage Classification Matrix | 3/3 | Complete    | 2026-04-09 |
 | 4. Deployment Risk Prioritization | 0/TBD | Not started | - |
 | 5. CI Readiness Signal & Reporting | 0/TBD | Not started | - |
