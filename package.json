@@ -52,6 +52,7 @@
     "qa:test:story-6-7": "cargo test -p domain research::tests::alpha_health_ && cargo test -p persistence postgres::alpha_health_metrics::tests:: && cargo test -p research-gateway promotion::alpha_health::tests:: && cargo test -p control-api routes::tests::alpha_health_ && node --test tests/api/story-6-7*.test.mjs tests/e2e/story-6-7*.test.mjs",
     "qa:test:story-6-8": "npm run web:lint && npm run web:typecheck && npm run web:build && node --test tests/story-6-8/*.test.mjs tests/api/story-6-8*.test.mjs tests/e2e/story-6-8*.test.mjs",
     "qa:test:story-6-9": "cargo test -p domain research::tests::alpha_lifecycle_ && cargo test -p persistence postgres::alpha_lifecycle_actions::tests:: && cargo test -p research-gateway promotion::lifecycle_actions::tests:: && cargo test -p control-api routes::tests::alpha_lifecycle_action_ && node --test tests/api/story-6-9*.test.mjs tests/e2e/story-6-9*.test.mjs",
+    "qa:test:phase-1": "cargo test -p research-gateway ingestion:: && node --test tests/api/phase-1-ingestion.test.mjs tests/e2e/phase-1-canonical-ingestion.e2e.test.mjs",
     "rust:fmt": "cargo fmt --all -- --check",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace --all-targets",
