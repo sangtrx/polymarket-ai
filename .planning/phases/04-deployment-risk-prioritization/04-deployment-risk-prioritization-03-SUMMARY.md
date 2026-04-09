@@ -49,6 +49,8 @@ completed: 2026-04-09
    - `fb3d979` feat(04-03): add prioritize-risk CLI chain
 3. **Task 3: Add phase-4 API/E2E suites and qa:test:phase-4 aggregator**
    - `27ad999` test(04-03): add phase-4 API and E2E risk suites
+4. **Post-review hardening fixes**
+   - `d1ea94a` fix(04-03): harden ordering and source traversal
 
 ## Verification
 
@@ -64,4 +66,4 @@ None - plan executed exactly as written.
 ## Self-Check: PASSED
 
 - Found files: `crates/persistence/src/postgres/risk_prioritization.rs`, `services/research-gateway/src/main.rs`, `tests/e2e/phase-4-risk-prioritization.e2e.test.mjs`
-- Found commits: `bda15b7`, `fb3d979`, `27ad999`
+- Found commits: `bda15b7`, `fb3d979`, `27ad999`, `d1ea94a`
