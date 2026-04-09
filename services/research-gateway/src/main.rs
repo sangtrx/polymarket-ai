@@ -1,3 +1,6 @@
+use research_gateway::coverage::service::{
+    RunCoverageClassificationInput, run_coverage_classification,
+};
 use research_gateway::ingestion::service::{
     IngestionMode, RunCanonicalIngestionInput, run_canonical_ingestion,
 };
@@ -5,8 +8,8 @@ use research_gateway::traceability::matcher::{EvidenceCandidate, PreviousLink};
 use research_gateway::traceability::service::{
     RunTraceabilityMappingInput, TraceabilityRequirementInput, run_traceability_mapping,
 };
-use serde::Serialize;
 use serde::Deserialize;
+use serde::Serialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,16 +35,29 @@ struct TraceEvidenceCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassifyCoverageCliArgs {
+    commit_sha: String,
+    generated_at_utc: String,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     IngestArtifacts(IngestArtifactsCliArgs),
     TraceEvidence(TraceEvidenceCliArgs),
+    ClassifyCoverage(ClassifyCoverageCliArgs),
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
-    let command = args.get(1).map(String::as_str).ok_or_else(|| CliErrorPayload {
-        code: "canonical_ingestion_invalid_payload".to_string(),
-        message: "expected `ingest-artifacts` or `trace-evidence` command".to_string(),
-    })?;
+    let command = args
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| CliErrorPayload {
+            code: "canonical_ingestion_invalid_payload".to_string(),
+            message:
+                "expected `ingest-artifacts`, `trace-evidence`, or `classify-coverage` command"
+                    .to_string(),
+        })?;
     let get_flag = |flag: &str| -> Option<String> {
         args.iter()
             .position(|arg| arg == flag)
@@ -73,10 +89,11 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
                 code: "traceability_invalid_payload".to_string(),
                 message: "missing --commit-sha".to_string(),
             })?;
-            let generated_at_utc = get_flag("--generated-at-utc").ok_or_else(|| CliErrorPayload {
-                code: "traceability_invalid_payload".to_string(),
-                message: "missing --generated-at-utc".to_string(),
-            })?;
+            let generated_at_utc =
+                get_flag("--generated-at-utc").ok_or_else(|| CliErrorPayload {
+                    code: "traceability_invalid_payload".to_string(),
+                    message: "missing --generated-at-utc".to_string(),
+                })?;
             let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
                 code: "traceability_invalid_payload".to_string(),
                 message: "missing --repo-root".to_string(),
@@ -87,9 +104,31 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
                 repo_root,
             }))
         }
+        "classify-coverage" => {
+            let commit_sha = get_flag("--commit-sha").ok_or_else(|| CliErrorPayload {
+                code: "coverage_invalid_payload".to_string(),
+                message: "missing --commit-sha".to_string(),
+            })?;
+            let generated_at_utc =
+                get_flag("--generated-at-utc").ok_or_else(|| CliErrorPayload {
+                    code: "coverage_invalid_payload".to_string(),
+                    message: "missing --generated-at-utc".to_string(),
+                })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "coverage_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::ClassifyCoverage(ClassifyCoverageCliArgs {
+                commit_sha,
+                generated_at_utc,
+                repo_root,
+            }))
+        }
         _ => Err(CliErrorPayload {
             code: "canonical_ingestion_invalid_payload".to_string(),
-            message: "expected `ingest-artifacts` or `trace-evidence` command".to_string(),
+            message:
+                "expected `ingest-artifacts`, `trace-evidence`, or `classify-coverage` command"
+                    .to_string(),
         }),
     }
 }
@@ -131,6 +170,49 @@ async fn run_cli(args: &[String]) -> Result<String, CliErrorPayload> {
                 message: format!("unable to serialize output: {error}"),
             })
         }
+        CliCommand::ClassifyCoverage(command) => {
+            let commit_sha = command.commit_sha;
+            let generated_at_utc = command.generated_at_utc;
+            let repo_root = command.repo_root;
+
+            let traceability_input =
+                build_traceability_mapping_input(&commit_sha, &generated_at_utc, &repo_root)
+                    .await
+                    .map_err(|error| CliErrorPayload {
+                        code: "coverage_invalid_payload".to_string(),
+                        message: error.message,
+                    })?;
+            let canonical_requirement_ids = traceability_input
+                .requirements
+                .iter()
+                .map(|requirement| requirement.canonical_requirement_id.clone())
+                .collect::<Vec<_>>();
+
+            let traceability_output =
+                run_traceability_mapping(traceability_input)
+                    .await
+                    .map_err(|error| CliErrorPayload {
+                        code: "coverage_invalid_payload".to_string(),
+                        message: error.message,
+                    })?;
+            let output = run_coverage_classification(RunCoverageClassificationInput {
+                snapshot_id: format!("coverage_{}_{}", commit_sha, generated_at_utc),
+                commit_sha,
+                generated_at_utc,
+                repo_root,
+                canonical_requirement_ids,
+                traceability_rows: traceability_output.rows,
+            })
+            .await
+            .map_err(|error| CliErrorPayload {
+                code: error.code,
+                message: error.message,
+            })?;
+            serde_json::to_string(&output).map_err(|error| CliErrorPayload {
+                code: "coverage_invalid_payload".to_string(),
+                message: format!("unable to serialize output: {error}"),
+            })
+        }
     }
 }
 
@@ -151,20 +233,18 @@ async fn build_traceability_mapping_input(
         message: error.message,
     })?;
 
-    let file_paths = collect_source_files(Path::new(repo_root)).map_err(|error| CliErrorPayload {
-        code: "traceability_invalid_payload".to_string(),
-        message: error,
-    })?;
+    let file_paths =
+        collect_source_files(Path::new(repo_root)).map_err(|error| CliErrorPayload {
+            code: "traceability_invalid_payload".to_string(),
+            message: error,
+        })?;
 
     let history = load_traceability_history(Path::new(repo_root));
     let requirements = ingestion
         .canonical_requirement_ids
         .iter()
         .map(|requirement_id| {
-            let previous_links = history
-                .get(requirement_id)
-                .cloned()
-                .unwrap_or_default();
+            let previous_links = history.get(requirement_id).cloned().unwrap_or_default();
             let (deterministic_candidates, semantic_candidates) =
                 collect_requirement_candidates(Path::new(repo_root), requirement_id, &file_paths);
             TraceabilityRequirementInput {
@@ -192,7 +272,8 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
         let entries = fs::read_dir(&directory)
             .map_err(|error| format!("unable to read {}: {error}", directory.display()))?;
         for entry in entries {
-            let entry = entry.map_err(|error| format!("unable to read directory entry: {error}"))?;
+            let entry =
+                entry.map_err(|error| format!("unable to read directory entry: {error}"))?;
             let path = entry.path();
             if path.file_name().map(|name| name == ".git").unwrap_or(false) {
                 continue;
@@ -250,7 +331,9 @@ fn collect_requirement_candidates(
         let lowered = contents.to_ascii_lowercase();
         let token_hits = semantic_tokens
             .iter()
-            .filter(|token| lowered.contains(token.as_str()) || relative_path.contains(token.as_str()))
+            .filter(|token| {
+                lowered.contains(token.as_str()) || relative_path.contains(token.as_str())
+            })
             .count();
         if token_hits >= 2 {
             semantic.push(candidate_from_file(
@@ -275,12 +358,15 @@ struct HistoryAnchor {
     line_end: Option<u32>,
 }
 
-fn load_traceability_history(repo_root: &Path) -> std::collections::BTreeMap<String, Vec<PreviousLink>> {
+fn load_traceability_history(
+    repo_root: &Path,
+) -> std::collections::BTreeMap<String, Vec<PreviousLink>> {
     let history_path = repo_root.join(".traceability-history.json");
     let Ok(raw) = fs::read_to_string(history_path) else {
         return std::collections::BTreeMap::new();
     };
-    let Ok(parsed) = serde_json::from_str::<std::collections::BTreeMap<String, Vec<HistoryAnchor>>>(&raw)
+    let Ok(parsed) =
+        serde_json::from_str::<std::collections::BTreeMap<String, Vec<HistoryAnchor>>>(&raw)
     else {
         return std::collections::BTreeMap::new();
     };
@@ -384,7 +470,8 @@ mod tests {
             "# Roadmap\n- [ ] TRAC-1 mapping delivery",
         )
         .expect("fixture roadmap should be written");
-        fs::create_dir_all(root.join(".planning/stories")).expect("fixture stories dir should be created");
+        fs::create_dir_all(root.join(".planning/stories"))
+            .expect("fixture stories dir should be created");
         fs::write(
             root.join(".planning/stories/story-1.md"),
             "# Story\n- [ ] TRAC-1 operator traceability link",
@@ -500,8 +587,11 @@ mod tests {
             "--repo-root".to_string(),
             fixture.to_string_lossy().to_string(),
         ];
-        let payload = run_cli(&args).await.expect("traceability mapping should succeed");
-        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("json payload expected");
+        let payload = run_cli(&args)
+            .await
+            .expect("traceability mapping should succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("json payload expected");
         assert!(parsed.get("rows").is_some());
         let first_row = parsed["rows"][0].clone();
         assert!(first_row.get("rationale").is_some());
@@ -543,12 +633,15 @@ mod main {
                 .expect("clock should be monotonic")
                 .as_nanos();
             let root = std::env::temp_dir().join(format!("traceability-cli-filter-{nanos}"));
-            fs::create_dir_all(root.join(".planning")).expect("fixture planning dir should be created");
+            fs::create_dir_all(root.join(".planning"))
+                .expect("fixture planning dir should be created");
             fs::create_dir_all(root.join("docs")).expect("fixture docs dir should be created");
-            fs::create_dir_all(root.join(".planning/stories")).expect("fixture stories dir should be created");
+            fs::create_dir_all(root.join(".planning/stories"))
+                .expect("fixture stories dir should be created");
             fs::create_dir_all(root.join("services/research-gateway/src"))
                 .expect("fixture service dir should be created");
-            fs::create_dir_all(root.join("tests/api")).expect("fixture tests dir should be created");
+            fs::create_dir_all(root.join("tests/api"))
+                .expect("fixture tests dir should be created");
             fs::write(
                 root.join(".planning/PRD.md"),
                 "# PRD\n- [ ] TRAC-1 deterministic mapping output",
@@ -609,8 +702,11 @@ mod main {
                 "--repo-root".to_string(),
                 fixture.to_string_lossy().to_string(),
             ];
-            let payload = run_cli(&args).await.expect("traceability mapping should succeed");
-            let parsed: serde_json::Value = serde_json::from_str(&payload).expect("json payload expected");
+            let payload = run_cli(&args)
+                .await
+                .expect("traceability mapping should succeed");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&payload).expect("json payload expected");
             assert!(parsed.get("rows").is_some());
             fs::remove_dir_all(fixture).expect("fixture repo should be removed");
         }
@@ -631,6 +727,100 @@ mod main {
                 .await
                 .expect_err("invalid traceability input should fail closed");
             assert_eq!(error.code, "traceability_invalid_payload");
+        }
+
+        #[test]
+        fn classify_coverage_command_requires_commit_sha() {
+            let args = vec![
+                "research-gateway".to_string(),
+                "classify-coverage".to_string(),
+                "--generated-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                ".".to_string(),
+            ];
+            let error = parse_cli_command(&args).expect_err("missing commit sha should fail");
+            assert_eq!(error.code, "coverage_invalid_payload");
+        }
+
+        #[tokio::test]
+        async fn classify_coverage_command_returns_complete_matrix_payload() {
+            let fixture = create_traceability_fixture_repo();
+            let args = vec![
+                "research-gateway".to_string(),
+                "classify-coverage".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--generated-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+            let payload = run_cli(&args)
+                .await
+                .expect("coverage classification should succeed");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&payload).expect("json payload expected");
+            assert!(parsed.get("snapshot_id").is_some());
+            assert!(parsed.get("commit_sha").is_some());
+            assert!(parsed.get("generated_at_utc").is_some());
+
+            let rows = parsed["rows"].as_array().expect("rows must be an array");
+            assert!(!rows.is_empty());
+
+            let ids = rows
+                .iter()
+                .map(|row| {
+                    row["canonical_requirement_id"]
+                        .as_str()
+                        .expect("canonical_requirement_id should be string")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            let mut sorted_ids = ids.clone();
+            sorted_ids.sort();
+            assert_eq!(ids, sorted_ids);
+
+            let unique_ids = ids.iter().collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique_ids.len(), rows.len());
+
+            for row in rows {
+                let class = row["class"].as_str().expect("class should be serialized");
+                assert!(matches!(class, "covered" | "partial" | "missing"));
+                if matches!(class, "partial" | "missing") {
+                    let reason_code = row["reason_code"]
+                        .as_str()
+                        .expect("reason_code should be string");
+                    let rationale = row["rationale"]
+                        .as_str()
+                        .expect("rationale should be string");
+                    assert!(!reason_code.is_empty());
+                    assert!(!rationale.is_empty());
+                }
+                assert!(row["code_anchors"].is_array());
+                assert!(row["test_anchors"].is_array());
+                assert!(row["ambiguous_candidates"].is_array());
+            }
+
+            fs::remove_dir_all(fixture).expect("fixture repo should be removed");
+        }
+
+        #[tokio::test]
+        async fn classify_coverage_command_fails_closed_with_machine_readable_code() {
+            let args = vec![
+                "research-gateway".to_string(),
+                "classify-coverage".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--generated-at-utc".to_string(),
+                "invalid".to_string(),
+                "--repo-root".to_string(),
+                ".".to_string(),
+            ];
+            let error = run_cli(&args)
+                .await
+                .expect_err("invalid coverage input should fail closed");
+            assert_eq!(error.code, "coverage_invalid_payload");
         }
     }
 }
