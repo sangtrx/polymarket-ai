@@ -333,7 +333,7 @@ fn candidate_from_file(relative_path: &str, rationale: &str, score: f32) -> Evid
 fn is_supported_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
-        Some("rs" | "ts" | "tsx" | "js" | "mjs" | "md")
+        Some("rs" | "ts" | "tsx" | "js" | "mjs")
     )
 }
 
