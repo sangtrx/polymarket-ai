@@ -9,7 +9,7 @@ This roadmap delivers an end-to-end BMAD coverage audit workflow: ingest and nor
 - [x] **Phase 1: Canonical Artifact Ingestion** - BMAD artifacts are ingested into a stable, versioned requirement dataset.
 - [x] **Phase 2: Evidence Traceability Mapping** - Each normalized requirement is linked to code/test evidence with rationale and confidence.
 - [x] **Phase 3: Coverage Classification Matrix** - All scoped requirements receive explainable Covered/Partial/Missing outcomes in one complete matrix. (completed 2026-04-09)
-- [ ] **Phase 4: Deployment Risk Prioritization** - Partial/Missing gaps are severity-ranked into a deployment-focused fix order.
+- [x] **Phase 4: Deployment Risk Prioritization** - Partial/Missing gaps are severity-ranked into a deployment-focused fix order. (completed 2026-04-09)
 - [ ] **Phase 5: CI Readiness Signal & Reporting** - Deterministic CI audit outputs, waiver controls, and readiness reports are produced for release decisions.
 
 ## Phase Details
@@ -67,7 +67,12 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. User can assign deployment-impact severity to every Partial or Missing requirement.
   2. User can generate a fix list ordered by highest deployment risk first.
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [x] 04-01-PLAN.md — Define deterministic risk severity/scoring contracts and unresolved-row classifier
+- [x] 04-02-PLAN.md — Implement deterministic risk ranking service and fix-list schema with priority ranks
+- [x] 04-03-PLAN.md — Add immutable risk persistence, prioritize-risk CLI wiring, and phase-4 QA suite
 
 ### Phase 5: CI Readiness Signal & Reporting
 **Goal**: Users can run deterministic CI audits, manage justified waivers, and consume readiness outputs for go/no-go decisions.
@@ -88,5 +93,5 @@ Plans:
 | 1. Canonical Artifact Ingestion | 4/4 | Complete | 2026-04-09 |
 | 2. Evidence Traceability Mapping | 3/3 | Complete | 2026-04-09 |
 | 3. Coverage Classification Matrix | 3/3 | Complete    | 2026-04-09 |
-| 4. Deployment Risk Prioritization | 0/TBD | Not started | - |
+| 4. Deployment Risk Prioritization | 3/3 | Complete | 2026-04-09 |
 | 5. CI Readiness Signal & Reporting | 0/TBD | Not started | - |

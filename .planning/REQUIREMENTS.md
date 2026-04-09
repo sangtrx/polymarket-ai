@@ -21,14 +21,14 @@
 
 ### Coverage Classification
 
-- [ ] **COVR-01**: User can classify every BMAD requirement as Covered, Partial, or Missing
-- [ ] **COVR-02**: User can see explicit rationale for every Partial or Missing classification
-- [ ] **COVR-03**: User can view a complete coverage matrix containing all scoped BMAD items and their evidence
+- [x] **COVR-01**: User can classify every BMAD requirement as Covered, Partial, or Missing
+- [x] **COVR-02**: User can see explicit rationale for every Partial or Missing classification
+- [x] **COVR-03**: User can view a complete coverage matrix containing all scoped BMAD items and their evidence
 
 ### Risk Prioritization
 
-- [ ] **RISK-01**: User can assign deployment-impact severity to every Partial or Missing requirement
-- [ ] **RISK-02**: User can generate a prioritized fix list ordered by deployment risk
+- [x] **RISK-01**: User can assign deployment-impact severity to every Partial or Missing requirement
+- [x] **RISK-02**: User can generate a prioritized fix list ordered by deployment risk
 
 ### CI Readiness Signal
 
@@ -71,11 +71,11 @@
 | TRAC-01 | Phase 2 | Complete |
 | TRAC-02 | Phase 2 | Complete |
 | TRAC-03 | Phase 2 | Complete |
-| COVR-01 | Phase 3 | Pending |
-| COVR-02 | Phase 3 | Pending |
-| COVR-03 | Phase 3 | Pending |
-| RISK-01 | Phase 4 | Pending |
-| RISK-02 | Phase 4 | Pending |
+| COVR-01 | Phase 3 | Complete |
+| COVR-02 | Phase 3 | Complete |
+| COVR-03 | Phase 3 | Complete |
+| RISK-01 | Phase 4 | Complete |
+| RISK-02 | Phase 4 | Complete |
 | GATE-01 | Phase 5 | Pending |
 | GATE-02 | Phase 5 | Pending |
 | GATE-03 | Phase 5 | Pending |
@@ -89,4 +89,4 @@
 
 ---
 *Requirements defined: 2026-04-09*  
-*Last updated: 2026-04-09 after phase 2 completion*
+*Last updated: 2026-04-09 after phase 4 completion*
