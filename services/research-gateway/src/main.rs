@@ -4,6 +4,7 @@ use research_gateway::coverage::service::{
 use research_gateway::ingestion::service::{
     IngestionMode, RunCanonicalIngestionInput, run_canonical_ingestion,
 };
+use research_gateway::risk::service::{RunRiskPrioritizationInput, run_risk_prioritization};
 use research_gateway::traceability::matcher::{EvidenceCandidate, PreviousLink};
 use research_gateway::traceability::service::{
     RunTraceabilityMappingInput, TraceabilityRequirementInput, run_traceability_mapping,
@@ -42,10 +43,18 @@ struct ClassifyCoverageCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PrioritizeRiskCliArgs {
+    commit_sha: String,
+    generated_at_utc: String,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     IngestArtifacts(IngestArtifactsCliArgs),
     TraceEvidence(TraceEvidenceCliArgs),
     ClassifyCoverage(ClassifyCoverageCliArgs),
+    PrioritizeRisk(PrioritizeRiskCliArgs),
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
@@ -55,8 +64,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
         .ok_or_else(|| CliErrorPayload {
             code: "canonical_ingestion_invalid_payload".to_string(),
             message:
-                "expected `ingest-artifacts`, `trace-evidence`, or `classify-coverage` command"
-                    .to_string(),
+                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, or `prioritize-risk` command".to_string(),
         })?;
     let get_flag = |flag: &str| -> Option<String> {
         args.iter()
@@ -124,11 +132,30 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
                 repo_root,
             }))
         }
+        "prioritize-risk" => {
+            let commit_sha = get_flag("--commit-sha").ok_or_else(|| CliErrorPayload {
+                code: "risk_invalid_payload".to_string(),
+                message: "missing --commit-sha".to_string(),
+            })?;
+            let generated_at_utc =
+                get_flag("--generated-at-utc").ok_or_else(|| CliErrorPayload {
+                    code: "risk_invalid_payload".to_string(),
+                    message: "missing --generated-at-utc".to_string(),
+                })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "risk_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::PrioritizeRisk(PrioritizeRiskCliArgs {
+                commit_sha,
+                generated_at_utc,
+                repo_root,
+            }))
+        }
         _ => Err(CliErrorPayload {
             code: "canonical_ingestion_invalid_payload".to_string(),
             message:
-                "expected `ingest-artifacts`, `trace-evidence`, or `classify-coverage` command"
-                    .to_string(),
+                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, or `prioritize-risk` command".to_string(),
         }),
     }
 }
@@ -210,6 +237,60 @@ async fn run_cli(args: &[String]) -> Result<String, CliErrorPayload> {
             })?;
             serde_json::to_string(&output).map_err(|error| CliErrorPayload {
                 code: "coverage_invalid_payload".to_string(),
+                message: format!("unable to serialize output: {error}"),
+            })
+        }
+        CliCommand::PrioritizeRisk(command) => {
+            let commit_sha = command.commit_sha;
+            let generated_at_utc = command.generated_at_utc;
+            let repo_root = command.repo_root;
+
+            let traceability_input =
+                build_traceability_mapping_input(&commit_sha, &generated_at_utc, &repo_root)
+                    .await
+                    .map_err(|error| CliErrorPayload {
+                        code: "risk_invalid_payload".to_string(),
+                        message: error.message,
+                    })?;
+            let canonical_requirement_ids = traceability_input
+                .requirements
+                .iter()
+                .map(|requirement| requirement.canonical_requirement_id.clone())
+                .collect::<Vec<_>>();
+            let traceability_output =
+                run_traceability_mapping(traceability_input)
+                    .await
+                    .map_err(|error| CliErrorPayload {
+                        code: "risk_invalid_payload".to_string(),
+                        message: error.message,
+                    })?;
+            let coverage_output = run_coverage_classification(RunCoverageClassificationInput {
+                snapshot_id: format!("coverage_{}_{}", commit_sha, generated_at_utc),
+                commit_sha: commit_sha.clone(),
+                generated_at_utc: generated_at_utc.clone(),
+                repo_root: repo_root.clone(),
+                canonical_requirement_ids,
+                traceability_rows: traceability_output.rows,
+            })
+            .await
+            .map_err(|error| CliErrorPayload {
+                code: "risk_invalid_payload".to_string(),
+                message: error.message,
+            })?;
+            let output = run_risk_prioritization(RunRiskPrioritizationInput {
+                snapshot_id: format!("risk_{}_{}", commit_sha, generated_at_utc),
+                commit_sha,
+                generated_at_utc,
+                repo_root,
+                coverage_matrix: coverage_output,
+            })
+            .await
+            .map_err(|error| CliErrorPayload {
+                code: error.code,
+                message: error.message,
+            })?;
+            serde_json::to_string(&output).map_err(|error| CliErrorPayload {
+                code: "risk_invalid_payload".to_string(),
                 message: format!("unable to serialize output: {error}"),
             })
         }
@@ -821,6 +902,85 @@ mod main {
                 .await
                 .expect_err("invalid coverage input should fail closed");
             assert_eq!(error.code, "coverage_invalid_payload");
+        }
+
+        #[test]
+        fn prioritize_risk_command_requires_commit_sha() {
+            let args = vec![
+                "research-gateway".to_string(),
+                "prioritize-risk".to_string(),
+                "--generated-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                ".".to_string(),
+            ];
+            let error = parse_cli_command(&args).expect_err("missing commit sha should fail");
+            assert_eq!(error.code, "risk_invalid_payload");
+        }
+
+        #[tokio::test]
+        async fn prioritize_risk_command_returns_json_payload_with_priority_rank_and_risk_score() {
+            let fixture = create_traceability_fixture_repo();
+            let args = vec![
+                "research-gateway".to_string(),
+                "prioritize-risk".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--generated-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+            let first_payload = run_cli(&args)
+                .await
+                .expect("risk prioritization should succeed");
+            let second_payload = run_cli(&args)
+                .await
+                .expect("risk prioritization replay should succeed");
+            assert_eq!(first_payload, second_payload);
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&first_payload).expect("json payload expected");
+            assert!(parsed.get("snapshot_id").is_some());
+            assert!(parsed.get("commit_sha").is_some());
+            assert!(parsed.get("generated_at_utc").is_some());
+            let rows = parsed["rows"].as_array().expect("rows must be an array");
+            assert!(!rows.is_empty());
+
+            for row in rows {
+                let priority_rank = row["priority_rank"]
+                    .as_u64()
+                    .expect("priority_rank should be numeric");
+                let risk_score = row["risk_score"]
+                    .as_i64()
+                    .expect("risk_score should be numeric");
+                let severity = row["severity"]
+                    .as_str()
+                    .expect("severity should be serialized");
+                assert!(priority_rank >= 1);
+                assert!(risk_score >= 0);
+                assert!(matches!(severity, "critical" | "high" | "medium" | "low"));
+            }
+
+            fs::remove_dir_all(fixture).expect("fixture repo should be removed");
+        }
+
+        #[tokio::test]
+        async fn prioritize_risk_command_fails_closed_with_machine_readable_code() {
+            let args = vec![
+                "research-gateway".to_string(),
+                "prioritize-risk".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--generated-at-utc".to_string(),
+                "invalid".to_string(),
+                "--repo-root".to_string(),
+                ".".to_string(),
+            ];
+            let error = run_cli(&args)
+                .await
+                .expect_err("invalid risk input should fail closed");
+            assert_eq!(error.code, "risk_invalid_payload");
         }
     }
 }
