@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactSourceKind {
@@ -19,8 +20,28 @@ pub struct ArtifactDiscoveryManifest {
     pub sources: Vec<ArtifactSource>,
 }
 
-pub fn discover_artifact_sources(_repo_root: &Path) -> ArtifactDiscoveryManifest {
-    ArtifactDiscoveryManifest::default()
+const DISCOVERY_ROOTS: &[&str] = &[".planning", "docs", "_bmad", "_bmad-output", ".bmad"];
+
+pub fn discover_artifact_sources(repo_root: &Path) -> ArtifactDiscoveryManifest {
+    let mut files = Vec::new();
+    for root in DISCOVERY_ROOTS {
+        collect_markdown_files(repo_root.join(root), &mut files);
+    }
+
+    let mut sources: Vec<ArtifactSource> = files
+        .into_iter()
+        .filter_map(|absolute| {
+            let relative = absolute.strip_prefix(repo_root).ok()?;
+            let relative = path_to_unix(relative);
+            classify_intent_source(&relative).map(|kind| ArtifactSource {
+                relative_path: relative,
+                kind,
+            })
+        })
+        .collect();
+
+    sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    ArtifactDiscoveryManifest { sources }
 }
 
 pub fn telemetry_paths(manifest: &ArtifactDiscoveryManifest) -> Vec<String> {
@@ -29,6 +50,71 @@ pub fn telemetry_paths(manifest: &ArtifactDiscoveryManifest) -> Vec<String> {
         .iter()
         .map(|source| source.relative_path.clone())
         .collect()
+}
+
+fn collect_markdown_files(path: PathBuf, files: &mut Vec<PathBuf>) {
+    if !path.exists() {
+        return;
+    }
+
+    if path.is_file() {
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
+            files.push(path);
+        }
+        return;
+    }
+
+    let mut entries = match fs::read_dir(&path) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        collect_markdown_files(entry.path(), files);
+    }
+}
+
+fn classify_intent_source(relative_path: &str) -> Option<ArtifactSourceKind> {
+    if is_generated_chatter(relative_path) {
+        return None;
+    }
+
+    let lowered = relative_path.to_ascii_lowercase();
+    if lowered.contains("prd") {
+        return Some(ArtifactSourceKind::Prd);
+    }
+    if lowered.contains("architecture") || lowered.contains("arch") {
+        return Some(ArtifactSourceKind::Architecture);
+    }
+    if lowered.contains("roadmap") {
+        return Some(ArtifactSourceKind::Roadmap);
+    }
+    if lowered.contains("story") || lowered.contains("stories") {
+        return Some(ArtifactSourceKind::Story);
+    }
+    None
+}
+
+fn is_generated_chatter(relative_path: &str) -> bool {
+    let lowered = relative_path.to_ascii_lowercase();
+    lowered.contains("/state.md")
+        || lowered.contains("summary")
+        || lowered.contains("telemetry")
+        || lowered.contains("changelog")
+        || lowered.contains("deferred-items")
+        || lowered.contains("/logs/")
+}
+
+fn path_to_unix(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
