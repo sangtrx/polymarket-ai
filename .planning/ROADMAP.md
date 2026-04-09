@@ -7,7 +7,7 @@ This roadmap delivers an end-to-end BMAD coverage audit workflow: ingest and nor
 ## Phases
 
 - [x] **Phase 1: Canonical Artifact Ingestion** - BMAD artifacts are ingested into a stable, versioned requirement dataset.
-- [ ] **Phase 2: Evidence Traceability Mapping** - Each normalized requirement is linked to code/test evidence with rationale and confidence.
+- [x] **Phase 2: Evidence Traceability Mapping** - Each normalized requirement is linked to code/test evidence with rationale and confidence.
 - [ ] **Phase 3: Coverage Classification Matrix** - All scoped requirements receive explainable Covered/Partial/Missing outcomes in one complete matrix.
 - [ ] **Phase 4: Deployment Risk Prioritization** - Partial/Missing gaps are severity-ranked into a deployment-focused fix order.
 - [ ] **Phase 5: CI Readiness Signal & Reporting** - Deterministic CI audit outputs, waiver controls, and readiness reports are produced for release decisions.
@@ -41,9 +41,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Define traceability domain/persistence contracts for deterministic requirement-to-evidence links
-- [ ] 02-02-PLAN.md — Implement traceability mapping service, CLI wiring, and phase-2 API/E2E verification
-- [ ] 02-03-PLAN.md — Gap closure: tighten code-evidence qualification and transactional persistence validation
+- [x] 02-01-PLAN.md — Define traceability domain/persistence contracts for deterministic requirement-to-evidence links
+- [x] 02-02-PLAN.md — Implement traceability mapping service, CLI wiring, and phase-2 API/E2E verification
+- [x] 02-03-PLAN.md — Gap closure: tighten code-evidence qualification and transactional persistence validation
 
 ### Phase 3: Coverage Classification Matrix
 **Goal**: Users can evaluate coverage status for every scoped requirement with complete, explainable classification.
@@ -81,7 +81,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Canonical Artifact Ingestion | 4/4 | Complete | 2026-04-09 |
-| 2. Evidence Traceability Mapping | 0/TBD | Not started | - |
+| 2. Evidence Traceability Mapping | 3/3 | Complete | 2026-04-09 |
 | 3. Coverage Classification Matrix | 0/TBD | Not started | - |
 | 4. Deployment Risk Prioritization | 0/TBD | Not started | - |
 | 5. CI Readiness Signal & Reporting | 0/TBD | Not started | - |

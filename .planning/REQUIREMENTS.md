@@ -15,9 +15,9 @@
 
 ### Traceability Mapping
 
-- [ ] **TRAC-01**: User can map each canonical BMAD requirement ID to one or more code evidence references
-- [ ] **TRAC-02**: User can map each canonical BMAD requirement ID to related test evidence when available
-- [ ] **TRAC-03**: User can record rationale and confidence for every traceability link
+- [x] **TRAC-01**: User can map each canonical BMAD requirement ID to one or more code evidence references
+- [x] **TRAC-02**: User can map each canonical BMAD requirement ID to related test evidence when available
+- [x] **TRAC-03**: User can record rationale and confidence for every traceability link
 
 ### Coverage Classification
 
@@ -68,9 +68,9 @@
 | ARTF-03 | Phase 1 | Complete |
 | ARTF-04 | Phase 1 | Complete |
 | ARTF-05 | Phase 1 | Complete |
-| TRAC-01 | Phase 2 | Pending |
-| TRAC-02 | Phase 2 | Pending |
-| TRAC-03 | Phase 2 | Pending |
+| TRAC-01 | Phase 2 | Complete |
+| TRAC-02 | Phase 2 | Complete |
+| TRAC-03 | Phase 2 | Complete |
 | COVR-01 | Phase 3 | Pending |
 | COVR-02 | Phase 3 | Pending |
 | COVR-03 | Phase 3 | Pending |
@@ -89,4 +89,4 @@
 
 ---
 *Requirements defined: 2026-04-09*  
-*Last updated: 2026-04-09 after phase 1 completion*
+*Last updated: 2026-04-09 after phase 2 completion*
