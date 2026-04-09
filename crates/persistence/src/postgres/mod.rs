@@ -5,6 +5,7 @@ pub mod alpha_lifecycle_actions;
 pub mod api_contract_versions;
 pub mod approvals;
 pub mod attribution_snapshots;
+pub mod canonical_artifacts;
 pub mod audit;
 pub mod counterfactual_replay_runs;
 pub mod credential_rotation;
