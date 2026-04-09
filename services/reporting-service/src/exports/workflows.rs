@@ -1453,6 +1453,70 @@ mod tests {
     }
 
     #[test]
+    fn readiness_artifacts_are_emitted_in_deterministic_order() {
+        let service = ReportExportWorkflowService::in_memory();
+        let evidence = service
+            .trigger_on_demand_export(on_demand_input())
+            .expect("on-demand export should succeed");
+        let artifacts = service
+            .list_export_artifacts(ListExportArtifactsInput {
+                actor_id: "analyst-1".to_string(),
+                actor_role: "read_only_analytics".to_string(),
+                job_id: evidence.job_id,
+                correlation_id: "corr-readiness-list-001".to_string(),
+                queried_at_utc: "2026-04-07T00:00:03Z".to_string(),
+                limit: Some(50),
+            })
+            .expect("artifact listing should succeed");
+        let references = artifacts
+            .iter()
+            .map(|artifact| artifact.retrieval_reference.as_str())
+            .collect::<Vec<_>>();
+        assert!(references.iter().any(|value| value.ends_with("readiness-report.json")));
+        assert!(references.iter().any(|value| value.ends_with("readiness-report.md")));
+        assert_eq!(references, {
+            let mut sorted = references.clone();
+            sorted.sort();
+            sorted
+        });
+    }
+
+    #[test]
+    fn readiness_artifact_checksums_are_stable_across_identical_reruns() {
+        let service = ReportExportWorkflowService::in_memory();
+        let first = service
+            .trigger_on_demand_export(on_demand_input())
+            .expect("first run should succeed");
+        let second = service
+            .trigger_on_demand_export(on_demand_input())
+            .expect("second run should succeed");
+        assert_eq!(first.job_id, second.job_id);
+
+        let artifacts = service
+            .list_export_artifacts(ListExportArtifactsInput {
+                actor_id: "analyst-1".to_string(),
+                actor_role: "read_only_analytics".to_string(),
+                job_id: first.job_id,
+                correlation_id: "corr-readiness-list-002".to_string(),
+                queried_at_utc: "2026-04-07T00:00:05Z".to_string(),
+                limit: Some(50),
+            })
+            .expect("artifact listing should succeed");
+        let json_checksum = artifacts
+            .iter()
+            .find(|artifact| artifact.retrieval_reference.ends_with("readiness-report.json"))
+            .map(|artifact| artifact.checksum.clone())
+            .expect("json readiness artifact should be present");
+        let markdown_checksum = artifacts
+            .iter()
+            .find(|artifact| artifact.retrieval_reference.ends_with("readiness-report.md"))
+            .map(|artifact| artifact.checksum.clone())
+            .expect("markdown readiness artifact should be present");
+        assert_eq!(json_checksum.len(), 64);
+        assert_eq!(markdown_checksum.len(), 64);
+    }
+
+    #[test]
     fn repository_warmup_status_is_exposed() {
         let service = ReportExportWorkflowService::in_memory();
         assert_eq!(service.warmup_status(), "report-export-adapter-in-memory");
