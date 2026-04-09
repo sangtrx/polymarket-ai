@@ -383,6 +383,12 @@ mod tests {
     }
 
     #[test]
+    fn insert_traceability_snapshot_executes_writes_in_one_transaction() {
+        let steps = insert_traceability_snapshot_transaction_steps();
+        assert_eq!(steps, ["begin", "snapshot", "links", "anchors", "commit"]);
+    }
+
+    #[test]
     fn list_query_orders_records_deterministically() {
         assert!(LIST_LINKS_BY_REQUIREMENT_SQL.contains("ORDER BY"));
         assert!(LIST_LINKS_BY_REQUIREMENT_SQL.contains("l.link_id ASC"));
@@ -442,5 +448,21 @@ mod tests {
 
         assert_eq!(link.anchors.len(), 2);
         assert!(matches!(link.outcome, LinkOutcome::Ambiguous));
+    }
+
+    #[test]
+    fn decode_anchor_rejects_negative_line_values() {
+        let error = decode_anchor_line_value(-1, "line_start")
+            .expect_err("negative lines must fail closed");
+        assert_eq!(error.code, "traceability_invalid_payload");
+        assert!(error.message.contains("line_start"));
+    }
+
+    #[test]
+    fn decode_anchor_rejects_out_of_range_line_values() {
+        let error = decode_anchor_line_value(i64::from(u32::MAX) + 1, "line_end")
+            .expect_err("out-of-range lines must fail closed");
+        assert_eq!(error.code, "traceability_invalid_payload");
+        assert!(error.message.contains("line_end"));
     }
 }
