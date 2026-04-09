@@ -1,3 +1,4 @@
+-- CREATE TABLE coverage_snapshots
 CREATE TABLE IF NOT EXISTS coverage_snapshots (
     snapshot_id TEXT PRIMARY KEY,
     commit_sha TEXT NOT NULL,

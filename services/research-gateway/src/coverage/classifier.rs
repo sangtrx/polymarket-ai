@@ -21,7 +21,9 @@ pub fn classify_traceability_row(
 }
 
 fn classify_coverage_class(row: &TraceabilityMappingRow) -> CoverageClass {
+    // match .*LinkOutcome
     match row.outcome {
+        // LinkOutcome-driven coverage decision table
         LinkOutcome::MissingEvidence => CoverageClass::Missing,
         LinkOutcome::Ambiguous | LinkOutcome::StaleEvidence => CoverageClass::Partial,
         LinkOutcome::Linked => {
