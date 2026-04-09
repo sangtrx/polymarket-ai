@@ -13,9 +13,14 @@ use research_gateway::traceability::service::{
 use reporting_service::exports::workflows::{
     ReportExportOrchestrator, ReportExportWorkflowService, TriggerOnDemandExportInput,
 };
+use domain::readiness::{
+    WaiverRecord, WaiverState, normalize_readiness_identifier,
+    parse_utc_timestamp as parse_readiness_utc_timestamp, resolve_waiver_state, validate_waiver,
+};
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,12 +67,43 @@ struct Phase5ChainCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateReadinessWaiverCliArgs {
+    waiver_id: Option<String>,
+    canonical_requirement_id: String,
+    owner: String,
+    reason_code: String,
+    justification: String,
+    approved_by: String,
+    created_at_utc: String,
+    expires_at_utc: String,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevokeReadinessWaiverCliArgs {
+    waiver_id: String,
+    revoked_by: String,
+    revoked_reason_code: String,
+    revoked_at_utc: String,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListReadinessWaiversCliArgs {
+    as_of_utc: String,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     IngestArtifacts(IngestArtifactsCliArgs),
     TraceEvidence(TraceEvidenceCliArgs),
     ClassifyCoverage(ClassifyCoverageCliArgs),
     PrioritizeRisk(PrioritizeRiskCliArgs),
     RunPhase5Chain(Phase5ChainCliArgs),
+    CreateReadinessWaiver(CreateReadinessWaiverCliArgs),
+    RevokeReadinessWaiver(RevokeReadinessWaiverCliArgs),
+    ListReadinessWaivers(ListReadinessWaiversCliArgs),
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
@@ -77,7 +113,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
         .ok_or_else(|| CliErrorPayload {
             code: "canonical_ingestion_invalid_payload".to_string(),
             message:
-                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, `prioritize-risk`, or `run-phase5-chain` command".to_string(),
+                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, `prioritize-risk`, `run-phase5-chain`, `create-readiness-waiver`, `revoke-readiness-waiver`, or `list-readiness-waivers` command".to_string(),
         })?;
     let get_flag = |flag: &str| -> Option<String> {
         args.iter()
@@ -185,10 +221,106 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliErrorPayload> {
                 repo_root,
             }))
         }
+        "create-readiness-waiver" => {
+            let canonical_requirement_id =
+                get_flag("--canonical-requirement-id").ok_or_else(|| CliErrorPayload {
+                    code: "readiness_invalid_payload".to_string(),
+                    message: "missing --canonical-requirement-id".to_string(),
+                })?;
+            let owner = get_flag("--owner").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --owner".to_string(),
+            })?;
+            let reason_code = get_flag("--reason-code").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --reason-code".to_string(),
+            })?;
+            let justification = get_flag("--justification").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --justification".to_string(),
+            })?;
+            let approved_by = get_flag("--approved-by").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --approved-by".to_string(),
+            })?;
+            let created_at_utc = get_flag("--created-at-utc").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --created-at-utc".to_string(),
+            })?;
+            let expires_at_utc = get_flag("--expires-at-utc").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --expires-at-utc".to_string(),
+            })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::CreateReadinessWaiver(
+                CreateReadinessWaiverCliArgs {
+                    waiver_id: get_flag("--waiver-id"),
+                    canonical_requirement_id,
+                    owner,
+                    reason_code,
+                    justification,
+                    approved_by,
+                    created_at_utc,
+                    expires_at_utc,
+                    repo_root,
+                },
+            ))
+        }
+        "revoke-readiness-waiver" => {
+            let waiver_id = get_flag("--waiver-id").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --waiver-id".to_string(),
+            })?;
+            let revoked_by = get_flag("--revoked-by").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --revoked-by".to_string(),
+            })?;
+            let revoked_reason_code =
+                get_flag("--revoked-reason-code").ok_or_else(|| CliErrorPayload {
+                    code: "readiness_invalid_payload".to_string(),
+                    message: "missing --revoked-reason-code".to_string(),
+                })?;
+            let revoked_at_utc = get_flag("--revoked-at-utc").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --revoked-at-utc".to_string(),
+            })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::RevokeReadinessWaiver(
+                RevokeReadinessWaiverCliArgs {
+                    waiver_id,
+                    revoked_by,
+                    revoked_reason_code,
+                    revoked_at_utc,
+                    repo_root,
+                },
+            ))
+        }
+        "list-readiness-waivers" => {
+            let as_of_utc = get_flag("--as-of-utc").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --as-of-utc".to_string(),
+            })?;
+            let repo_root = get_flag("--repo-root").ok_or_else(|| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: "missing --repo-root".to_string(),
+            })?;
+            Ok(CliCommand::ListReadinessWaivers(
+                ListReadinessWaiversCliArgs {
+                    as_of_utc,
+                    repo_root,
+                },
+            ))
+        }
         _ => Err(CliErrorPayload {
             code: "canonical_ingestion_invalid_payload".to_string(),
             message:
-                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, `prioritize-risk`, or `run-phase5-chain` command".to_string(),
+                "expected `ingest-artifacts`, `trace-evidence`, `classify-coverage`, `prioritize-risk`, `run-phase5-chain`, `create-readiness-waiver`, `revoke-readiness-waiver`, or `list-readiness-waivers` command".to_string(),
         }),
     }
 }
@@ -339,6 +471,27 @@ async fn run_cli(args: &[String]) -> Result<String, CliErrorPayload> {
                 message: format!("unable to serialize output: {error}"),
             })
         }
+        CliCommand::CreateReadinessWaiver(command) => {
+            let output = create_readiness_waiver(command)?;
+            serde_json::to_string(&output).map_err(|error| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: format!("unable to serialize output: {error}"),
+            })
+        }
+        CliCommand::RevokeReadinessWaiver(command) => {
+            let output = revoke_readiness_waiver(command)?;
+            serde_json::to_string(&output).map_err(|error| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: format!("unable to serialize output: {error}"),
+            })
+        }
+        CliCommand::ListReadinessWaivers(command) => {
+            let output = list_readiness_waivers(command)?;
+            serde_json::to_string(&output).map_err(|error| CliErrorPayload {
+                code: "readiness_invalid_payload".to_string(),
+                message: format!("unable to serialize output: {error}"),
+            })
+        }
     }
 }
 
@@ -372,6 +525,263 @@ struct Phase5ChainOutput {
 struct Phase5ChainError {
     code: String,
     message: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ReadinessWaiverMutationOutput {
+    status: String,
+    waiver: WaiverRecord,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ReadinessWaiverListOutput {
+    as_of_utc: String,
+    active: Vec<WaiverRecord>,
+    expired: Vec<WaiverRecord>,
+    revoked: Vec<WaiverRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct ReadinessWaiverStore {
+    #[serde(default)]
+    waivers: Vec<WaiverRecord>,
+}
+
+fn create_readiness_waiver(
+    command: CreateReadinessWaiverCliArgs,
+) -> Result<ReadinessWaiverMutationOutput, CliErrorPayload> {
+    parse_readiness_utc_timestamp("created_at_utc", &command.created_at_utc)
+        .map_err(|error| waiver_invalid_payload(error.message))?;
+    parse_readiness_utc_timestamp("expires_at_utc", &command.expires_at_utc)
+        .map_err(|error| waiver_invalid_payload(error.message))?;
+
+    let waiver_id = command.waiver_id.unwrap_or_else(|| {
+        compose_waiver_id(
+            &command.canonical_requirement_id,
+            &command.owner,
+            &command.created_at_utc,
+            &command.expires_at_utc,
+        )
+    });
+    let waiver = WaiverRecord {
+        waiver_id: normalize_readiness_identifier(&waiver_id),
+        canonical_requirement_id: normalize_readiness_identifier(&command.canonical_requirement_id),
+        owner: normalize_readiness_identifier(&command.owner),
+        reason_code: normalize_readiness_identifier(&command.reason_code),
+        justification: command.justification.trim().to_string(),
+        approved_by: normalize_readiness_identifier(&command.approved_by),
+        created_at_utc: command.created_at_utc.trim().to_string(),
+        expires_at_utc: command.expires_at_utc.trim().to_string(),
+        revoked_at_utc: None,
+    };
+    validate_waiver(&waiver).map_err(|error| waiver_invalid_payload(error.message))?;
+
+    let mut store = load_readiness_waiver_store(&command.repo_root)?;
+    if store
+        .waivers
+        .iter()
+        .any(|existing| existing.waiver_id == waiver.waiver_id)
+    {
+        return Err(waiver_invalid_payload(format!(
+            "waiver_id `{}` already exists",
+            waiver.waiver_id
+        )));
+    }
+    store.waivers.push(waiver.clone());
+    sort_waivers(&mut store.waivers);
+    persist_readiness_waiver_store(&command.repo_root, &store)?;
+
+    Ok(ReadinessWaiverMutationOutput {
+        status: "created".to_string(),
+        waiver,
+    })
+}
+
+fn revoke_readiness_waiver(
+    command: RevokeReadinessWaiverCliArgs,
+) -> Result<ReadinessWaiverMutationOutput, CliErrorPayload> {
+    parse_readiness_utc_timestamp("revoked_at_utc", &command.revoked_at_utc)
+        .map_err(|error| waiver_invalid_payload(error.message))?;
+
+    let mut store = load_readiness_waiver_store(&command.repo_root)?;
+    let normalized_waiver_id = normalize_readiness_identifier(&command.waiver_id);
+    let waiver = store
+        .waivers
+        .iter_mut()
+        .find(|candidate| candidate.waiver_id == normalized_waiver_id)
+        .ok_or_else(|| {
+            waiver_invalid_payload(format!("waiver_id `{normalized_waiver_id}` not found"))
+        })?;
+    if waiver.revoked_at_utc.is_some() {
+        return Err(waiver_invalid_payload(format!(
+            "waiver_id `{normalized_waiver_id}` is already revoked"
+        )));
+    }
+    if command.revoked_by.trim().is_empty() || command.revoked_reason_code.trim().is_empty() {
+        return Err(waiver_invalid_payload(
+            "revoked_by and revoked_reason_code are required",
+        ));
+    }
+
+    waiver.revoked_at_utc = Some(command.revoked_at_utc.trim().to_string());
+    let waived = waiver.clone();
+    sort_waivers(&mut store.waivers);
+    persist_readiness_waiver_store(&command.repo_root, &store)?;
+
+    Ok(ReadinessWaiverMutationOutput {
+        status: "revoked".to_string(),
+        waiver: waived,
+    })
+}
+
+fn list_readiness_waivers(
+    command: ListReadinessWaiversCliArgs,
+) -> Result<ReadinessWaiverListOutput, CliErrorPayload> {
+    parse_readiness_utc_timestamp("as_of_utc", &command.as_of_utc)
+        .map_err(|error| waiver_invalid_payload(error.message))?;
+
+    let store = load_readiness_waiver_store(&command.repo_root)?;
+    let mut active = Vec::new();
+    let mut expired = Vec::new();
+    let mut revoked = Vec::new();
+    for waiver in store.waivers {
+        validate_waiver(&waiver).map_err(|error| waiver_invalid_payload(error.message))?;
+        let state = resolve_waiver_state(&waiver, &command.as_of_utc)
+            .map_err(|error| waiver_invalid_payload(error.message))?;
+        match state {
+            WaiverState::Active => active.push(waiver),
+            WaiverState::Expired => expired.push(waiver),
+            WaiverState::Revoked => revoked.push(waiver),
+        }
+    }
+    sort_waivers(&mut active);
+    sort_waivers(&mut expired);
+    sort_waivers(&mut revoked);
+
+    Ok(ReadinessWaiverListOutput {
+        as_of_utc: command.as_of_utc,
+        active,
+        expired,
+        revoked,
+    })
+}
+
+fn load_phase5_active_waivers(
+    repo_root: &str,
+    generated_at_utc: &str,
+    unresolved_requirement_ids: &BTreeSet<String>,
+) -> Result<Vec<WaiverRecord>, Phase5ChainError> {
+    let listing = list_readiness_waivers(ListReadinessWaiversCliArgs {
+        as_of_utc: generated_at_utc.to_string(),
+        repo_root: repo_root.to_string(),
+    })
+    .map_err(|error| Phase5ChainError {
+        code: error.code,
+        message: error.message,
+    })?;
+    for waiver in &listing.active {
+        let requirement_id = normalize_readiness_identifier(&waiver.canonical_requirement_id);
+        if !unresolved_requirement_ids.contains(&requirement_id) {
+            return Err(Phase5ChainError {
+                code: "readiness_invalid_payload".to_string(),
+                message: format!(
+                    "waiver `{}` references unknown or resolved canonical requirement `{}`",
+                    waiver.waiver_id, waiver.canonical_requirement_id
+                ),
+            });
+        }
+    }
+    Ok(listing.active)
+}
+
+fn readiness_waiver_store_path(repo_root: &str) -> PathBuf {
+    Path::new(repo_root)
+        .join(".planning")
+        .join("artifacts")
+        .join("readiness-waivers.json")
+}
+
+fn load_readiness_waiver_store(repo_root: &str) -> Result<ReadinessWaiverStore, CliErrorPayload> {
+    let path = readiness_waiver_store_path(repo_root);
+    if !path.exists() {
+        return Ok(ReadinessWaiverStore::default());
+    }
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        waiver_invalid_payload(format!(
+            "unable to read readiness waiver store `{}`: {error}",
+            path.display()
+        ))
+    })?;
+
+    let mut store = serde_json::from_str::<ReadinessWaiverStore>(&raw)
+        .or_else(|_| serde_json::from_str::<Vec<WaiverRecord>>(&raw).map(|waivers| ReadinessWaiverStore { waivers }))
+        .map_err(|error| {
+            waiver_invalid_payload(format!(
+                "unable to parse readiness waiver store `{}`: {error}",
+                path.display()
+            ))
+        })?;
+    sort_waivers(&mut store.waivers);
+    Ok(store)
+}
+
+fn persist_readiness_waiver_store(
+    repo_root: &str,
+    store: &ReadinessWaiverStore,
+) -> Result<(), CliErrorPayload> {
+    let path = readiness_waiver_store_path(repo_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            waiver_invalid_payload(format!(
+                "unable to create readiness waiver directory `{}`: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(store).map_err(|error| {
+        waiver_invalid_payload(format!("unable to serialize readiness waiver store: {error}"))
+    })?;
+    fs::write(&path, payload).map_err(|error| {
+        waiver_invalid_payload(format!(
+            "unable to write readiness waiver store `{}`: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn sort_waivers(waivers: &mut [WaiverRecord]) {
+    waivers.sort_by(|left, right| {
+        left.canonical_requirement_id
+            .cmp(&right.canonical_requirement_id)
+            .then_with(|| left.expires_at_utc.cmp(&right.expires_at_utc))
+            .then_with(|| left.waiver_id.cmp(&right.waiver_id))
+    });
+}
+
+fn compose_waiver_id(
+    canonical_requirement_id: &str,
+    owner: &str,
+    created_at_utc: &str,
+    expires_at_utc: &str,
+) -> String {
+    let fingerprint = sha256_hex(
+        format!(
+            "{}|{}|{}|{}",
+            normalize_readiness_identifier(canonical_requirement_id),
+            normalize_readiness_identifier(owner),
+            created_at_utc.trim(),
+            expires_at_utc.trim()
+        )
+        .as_bytes(),
+    );
+    format!("waiver_{}", &fingerprint[..16])
+}
+
+fn waiver_invalid_payload(message: impl Into<String>) -> CliErrorPayload {
+    CliErrorPayload {
+        code: "readiness_invalid_payload".to_string(),
+        message: message.into(),
+    }
 }
 
 async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOutput, Phase5ChainError> {
@@ -432,13 +842,24 @@ async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOut
         message: error.message,
     })?;
 
+    let unresolved_requirement_ids = risk_output
+        .rows
+        .iter()
+        .map(|row| normalize_readiness_identifier(&row.canonical_requirement_id))
+        .collect::<BTreeSet<_>>();
+    let waivers = load_phase5_active_waivers(
+        &command.repo_root,
+        &command.generated_at_utc,
+        &unresolved_requirement_ids,
+    )?;
+
     let readiness_output = run_readiness(RunReadinessInput {
         snapshot_id: format!("readiness_{}_{}", command.commit_sha, command.generated_at_utc),
         commit_sha: command.commit_sha.clone(),
         generated_at_utc: command.generated_at_utc.clone(),
         repo_root: command.repo_root.clone(),
         risk_prioritization: Some(risk_output),
-        waivers: Vec::new(),
+        waivers,
     })
     .await
     .map_err(|error| Phase5ChainError {
@@ -468,6 +889,7 @@ async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOut
             ),
             requested_at_utc: command.generated_at_utc.clone(),
             as_of_utc: command.generated_at_utc.clone(),
+            commit_sha: Some(command.commit_sha.clone()),
             reason_code: None,
             unavailable_artifact_types: Vec::new(),
         })
@@ -1336,6 +1758,167 @@ mod main {
                 .collect::<Vec<_>>();
             assert!(artifact_types.contains(&"readiness-report.json"));
             assert!(artifact_types.contains(&"readiness-report.md"));
+            fs::remove_dir_all(fixture).expect("fixture repo should be removed");
+        }
+
+        #[tokio::test]
+        async fn readiness_waiver_commands_create_list_and_revoke() {
+            let fixture = create_traceability_fixture_repo();
+            let create_args = vec![
+                "research-gateway".to_string(),
+                "create-readiness-waiver".to_string(),
+                "--canonical-requirement-id".to_string(),
+                "gate-03".to_string(),
+                "--owner".to_string(),
+                "ops-owner".to_string(),
+                "--reason-code".to_string(),
+                "approved_exception".to_string(),
+                "--justification".to_string(),
+                "temporary mitigation".to_string(),
+                "--approved-by".to_string(),
+                "ops-approver".to_string(),
+                "--created-at-utc".to_string(),
+                "2026-04-08T00:00:00Z".to_string(),
+                "--expires-at-utc".to_string(),
+                "2026-04-12T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+            let created_payload = run_cli(&create_args)
+                .await
+                .expect("waiver creation should succeed");
+            let created: serde_json::Value =
+                serde_json::from_str(&created_payload).expect("created payload should be valid json");
+            let waiver_id = created["waiver"]["waiver_id"]
+                .as_str()
+                .expect("waiver id should be present")
+                .to_string();
+
+            let list_args = vec![
+                "research-gateway".to_string(),
+                "list-readiness-waivers".to_string(),
+                "--as-of-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+            let listed_payload = run_cli(&list_args)
+                .await
+                .expect("waiver listing should succeed");
+            let listed: serde_json::Value =
+                serde_json::from_str(&listed_payload).expect("listed payload should be valid json");
+            assert_eq!(
+                listed["active"]
+                    .as_array()
+                    .expect("active waivers should be an array")
+                    .len(),
+                1
+            );
+
+            let revoke_args = vec![
+                "research-gateway".to_string(),
+                "revoke-readiness-waiver".to_string(),
+                "--waiver-id".to_string(),
+                waiver_id,
+                "--revoked-by".to_string(),
+                "ops-owner".to_string(),
+                "--revoked-reason-code".to_string(),
+                "mitigation_complete".to_string(),
+                "--revoked-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+            run_cli(&revoke_args)
+                .await
+                .expect("waiver revocation should succeed");
+
+            let listed_after_revoke_payload = run_cli(&list_args)
+                .await
+                .expect("waiver listing after revoke should succeed");
+            let listed_after_revoke: serde_json::Value = serde_json::from_str(
+                &listed_after_revoke_payload,
+            )
+            .expect("listed payload should be valid json");
+            assert_eq!(
+                listed_after_revoke["active"]
+                    .as_array()
+                    .expect("active waivers should be an array")
+                    .len(),
+                0
+            );
+            assert_eq!(
+                listed_after_revoke["revoked"]
+                    .as_array()
+                    .expect("revoked waivers should be an array")
+                    .len(),
+                1
+            );
+            fs::remove_dir_all(fixture).expect("fixture repo should be removed");
+        }
+
+        #[tokio::test]
+        async fn phase5_chain_consumes_active_waivers_from_store() {
+            let fixture = create_traceability_fixture_repo();
+            let chain_args = vec![
+                "research-gateway".to_string(),
+                "run-phase5-chain".to_string(),
+                "--commit-sha".to_string(),
+                "abc123".to_string(),
+                "--generated-at-utc".to_string(),
+                "2026-04-09T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+
+            let baseline_payload = run_cli(&chain_args)
+                .await
+                .expect("baseline phase 5 chain run should succeed");
+            let baseline: serde_json::Value =
+                serde_json::from_str(&baseline_payload).expect("baseline payload should be valid json");
+            let requirement_id = baseline["readiness"]["explainability"]["top_unresolved_risks"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .and_then(|row| row["canonical_requirement_id"].as_str())
+                .expect("fixture should produce at least one unresolved risk row")
+                .to_string();
+
+            let create_args = vec![
+                "research-gateway".to_string(),
+                "create-readiness-waiver".to_string(),
+                "--canonical-requirement-id".to_string(),
+                requirement_id,
+                "--owner".to_string(),
+                "ops-owner".to_string(),
+                "--reason-code".to_string(),
+                "approved_exception".to_string(),
+                "--justification".to_string(),
+                "temporary mitigation".to_string(),
+                "--approved-by".to_string(),
+                "ops-approver".to_string(),
+                "--created-at-utc".to_string(),
+                "2026-04-08T00:00:00Z".to_string(),
+                "--expires-at-utc".to_string(),
+                "2026-04-12T00:00:00Z".to_string(),
+                "--repo-root".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ];
+            run_cli(&create_args)
+                .await
+                .expect("waiver creation should succeed");
+
+            let with_waiver_payload = run_cli(&chain_args)
+                .await
+                .expect("phase 5 chain run with waiver should succeed");
+            let with_waiver: serde_json::Value = serde_json::from_str(&with_waiver_payload)
+                .expect("waiver payload should be valid json");
+            let waived_count = with_waiver["readiness"]["explainability"]["waived_count"]
+                .as_u64()
+                .expect("waived_count should be numeric");
+            assert!(
+                waived_count >= 1,
+                "at least one risk should be waived when active waivers exist"
+            );
             fs::remove_dir_all(fixture).expect("fixture repo should be removed");
         }
     }

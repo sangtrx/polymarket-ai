@@ -125,6 +125,7 @@ pub struct TriggerOnDemandExportInput {
     pub correlation_id: String,
     pub requested_at_utc: String,
     pub as_of_utc: String,
+    pub commit_sha: Option<String>,
     pub reason_code: Option<String>,
     pub unavailable_artifact_types: Vec<String>,
 }
@@ -324,6 +325,7 @@ impl ReportExportWorkflowService {
         correlation_id: String,
         requested_at_utc: String,
         as_of_utc: String,
+        commit_sha: Option<String>,
         reason_code: Option<String>,
         schedule_id: Option<String>,
         schedule_window_key: Option<String>,
@@ -341,6 +343,7 @@ impl ReportExportWorkflowService {
         validate_non_empty("correlation_id", &correlation_id)?;
         parse_utc_timestamp("requested_at_utc", &requested_at_utc).map_err(map_contract_error)?;
         parse_utc_timestamp("as_of_utc", &as_of_utc).map_err(map_contract_error)?;
+        let normalized_commit_sha = normalize_optional_commit_sha(commit_sha)?;
 
         let normalized_correlation = normalize_reporting_export_identifier(&correlation_id);
         let normalized_actor_id = normalize_reporting_export_identifier(&actor_id);
@@ -519,7 +522,9 @@ impl ReportExportWorkflowService {
         let mut persisted_artifacts = Vec::new();
         let readiness_payloads = compose_readiness_artifact_payloads(&ReadinessReportPayload {
             snapshot_id: format!("readiness::{}", running.job_id),
-            commit_sha: running.job_id.clone(),
+            commit_sha: normalized_commit_sha
+                .clone()
+                .unwrap_or_else(|| running.job_id.clone()),
             generated_at_utc: as_of_utc.clone(),
             advisory_state: if unavailable_types.is_empty() {
                 "ready".to_string()
@@ -699,6 +704,7 @@ impl ReportExportOrchestrator for ReportExportWorkflowService {
             input.correlation_id,
             input.requested_at_utc,
             input.as_of_utc,
+            input.commit_sha,
             input.reason_code,
             None,
             None,
@@ -728,6 +734,7 @@ impl ReportExportOrchestrator for ReportExportWorkflowService {
             input.correlation_id,
             input.requested_at_utc,
             input.as_of_utc,
+            None,
             input.reason_code,
             None,
             None,
@@ -752,6 +759,7 @@ impl ReportExportOrchestrator for ReportExportWorkflowService {
             input.correlation_id,
             input.requested_at_utc,
             input.as_of_utc,
+            None,
             input.reason_code,
             Some(input.schedule_id),
             Some(input.schedule_window_key),
@@ -1141,6 +1149,31 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ReportExpo
     ))
 }
 
+fn normalize_optional_commit_sha(
+    commit_sha: Option<String>,
+) -> Result<Option<String>, ReportExportWorkflowError> {
+    let Some(raw_commit_sha) = commit_sha else {
+        return Ok(None);
+    };
+    let normalized = raw_commit_sha.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if (6..=64).contains(&normalized.len())
+        && normalized.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return Ok(Some(normalized));
+    }
+    Err(ReportExportWorkflowError::invalid_payload(
+        "commit_sha must be 6-64 hexadecimal characters when provided",
+        vec![ReportingExportValidationIssue {
+            field: "commit_sha",
+            code: ReportingExportReasonCode::InvalidPayload.code(),
+            message: "commit_sha must be 6-64 hexadecimal characters when provided".to_string(),
+        }],
+    ))
+}
+
 fn normalize_limit(limit: Option<i64>) -> Result<i64, ReportExportWorkflowError> {
     let value = limit.unwrap_or(DEFAULT_EXPORT_LIST_LIMIT);
     if !(1..=MAX_EXPORT_LIST_LIMIT).contains(&value) {
@@ -1328,6 +1361,7 @@ mod tests {
             correlation_id: "corr-export-001".to_string(),
             requested_at_utc: "2026-04-07T00:00:00Z".to_string(),
             as_of_utc: "2026-04-07T00:00:00Z".to_string(),
+            commit_sha: Some("abc123".to_string()),
             reason_code: None,
             unavailable_artifact_types: Vec::new(),
         }
@@ -1519,6 +1553,7 @@ mod tests {
                 correlation_id: "corr-export-unauthorized-001".to_string(),
                 requested_at_utc: "2026-04-07T00:00:00Z".to_string(),
                 as_of_utc: "2026-04-07T00:00:00Z".to_string(),
+                commit_sha: None,
                 reason_code: None,
                 unavailable_artifact_types: Vec::new(),
             })
@@ -1591,6 +1626,21 @@ mod tests {
             .expect("markdown readiness artifact should be present");
         assert_eq!(json_checksum.len(), 64);
         assert_eq!(markdown_checksum.len(), 64);
+    }
+
+    #[test]
+    fn on_demand_export_rejects_invalid_commit_sha_when_provided() {
+        let service = ReportExportWorkflowService::in_memory();
+        let mut input = on_demand_input();
+        input.commit_sha = Some("not-a-valid-sha".to_string());
+        let error = service
+            .trigger_on_demand_export(input)
+            .expect_err("invalid commit sha must fail validation");
+        assert_eq!(error.code, ReportingExportReasonCode::InvalidPayload.code());
+        assert!(error
+            .field_errors
+            .iter()
+            .any(|issue| issue.field == "commit_sha"));
     }
 
     #[test]

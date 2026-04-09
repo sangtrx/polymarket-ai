@@ -1,7 +1,7 @@
 use crate::risk::service::RiskPrioritizationResult;
 use domain::readiness::{
-    ReadinessReasonCode, ReadinessState, WaiverRecord, WaiverState, parse_utc_timestamp,
-    validate_waiver,
+    ReadinessReasonCode, ReadinessState, WaiverRecord, WaiverState, normalize_readiness_identifier,
+    parse_utc_timestamp, validate_waiver,
 };
 use domain::risk_prioritization::RiskSeverity;
 use serde::Serialize;
@@ -91,14 +91,15 @@ pub async fn run_readiness(
         let state = domain::readiness::resolve_waiver_state(waiver, &input.generated_at_utc)
             .map_err(|error| ReadinessServiceError::dependency_unavailable(error.message))?;
         if state == WaiverState::Active {
-            active_waiver_ids.insert(waiver.canonical_requirement_id.clone());
+            active_waiver_ids.insert(normalize_readiness_identifier(&waiver.canonical_requirement_id));
         }
     }
 
     let mut waived_count = 0usize;
     let mut unwaived = Vec::new();
     for row in &risk_prioritization.rows {
-        if active_waiver_ids.contains(&row.canonical_requirement_id) {
+        let normalized_requirement_id = normalize_readiness_identifier(&row.canonical_requirement_id);
+        if active_waiver_ids.contains(&normalized_requirement_id) {
             waived_count += 1;
         } else {
             unwaived.push(row);
@@ -322,6 +323,28 @@ pub mod tests {
         let output = run_readiness(input)
             .await
             .expect("waived critical should not fail readiness");
+        assert_eq!(output.readiness_state, ReadinessState::Ready);
+        assert_eq!(output.explainability.waived_count, 1);
+        assert_eq!(output.explainability.unwaived_count, 0);
+    }
+
+    #[tokio::test]
+    async fn signal_waiver_matching_is_case_insensitive() {
+        let mut input = valid_input(vec![risk_row("gate-03", RiskSeverity::Critical, 100, 1)]);
+        input.waivers.push(WaiverRecord {
+            waiver_id: "waiver-001".to_string(),
+            canonical_requirement_id: "GATE-03".to_string(),
+            owner: "ops-owner".to_string(),
+            reason_code: "approved_exception".to_string(),
+            justification: "temporary mitigation".to_string(),
+            approved_by: "ops-approver".to_string(),
+            created_at_utc: "2026-04-08T00:00:00Z".to_string(),
+            expires_at_utc: "2026-04-12T00:00:00Z".to_string(),
+            revoked_at_utc: None,
+        });
+        let output = run_readiness(input)
+            .await
+            .expect("waiver matching should normalize identifier casing");
         assert_eq!(output.readiness_state, ReadinessState::Ready);
         assert_eq!(output.explainability.waived_count, 1);
         assert_eq!(output.explainability.unwaived_count, 0);

@@ -6083,6 +6083,7 @@ pub async fn trigger_on_demand_report_export(
                 .unwrap_or_else(|| actor.correlation_id.clone()),
             requested_at_utc: authorization.timestamp_utc.clone(),
             as_of_utc,
+            commit_sha: payload.commit_sha,
             reason_code: payload.reason_code,
             unavailable_artifact_types: payload.unavailable_artifact_types,
         },
@@ -16710,6 +16711,7 @@ pub struct ReportExportTriggerPayload {
     pub reason_code: Option<String>,
     pub correlation_id: Option<String>,
     pub as_of_utc: Option<String>,
+    pub commit_sha: Option<String>,
     #[serde(default)]
     pub unavailable_artifact_types: Vec<String>,
 }
