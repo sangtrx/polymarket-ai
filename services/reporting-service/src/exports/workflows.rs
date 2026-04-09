@@ -4,8 +4,8 @@ use crate::exports::artifacts::{
     required_fr36_artifact_types, required_readiness_artifact_types,
 };
 use crate::exports::readiness::{
-    ReadinessReportPayload, ReadinessRiskSummary, ReadinessSeverityBreakdown,
-    ReadinessWaiverLedger, compose_readiness_artifact_payloads,
+    ReadinessReportPayload, ReadinessSeverityBreakdown, ReadinessWaiverLedger,
+    compose_readiness_artifact_payloads,
 };
 use domain::reporting_export::{
     DEFAULT_EXPORT_LIST_LIMIT, ExportArtifactRecord, ExportJobRecord, MAX_EXPORT_LIST_LIMIT,
@@ -545,13 +545,7 @@ impl ReportExportWorkflowService {
             },
             waived_count: 0,
             unwaived_count: 0,
-            top_unresolved_risks: vec![ReadinessRiskSummary {
-                canonical_requirement_id: "none".to_string(),
-                severity: "low".to_string(),
-                risk_score: 0,
-                priority_rank: 1,
-                reason_code: "readiness_signal_advisory".to_string(),
-            }],
+            top_unresolved_risks: Vec::new(),
             waiver_ledger: ReadinessWaiverLedger {
                 active: Vec::new(),
                 expired: Vec::new(),
