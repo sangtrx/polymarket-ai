@@ -35,6 +35,7 @@ pub mod user_stream;
 pub mod validation_artifacts;
 pub mod validation_gate_policies;
 pub mod validation_runs;
+pub mod traceability;
 
 pub fn migration_namespace() -> &'static str {
     "governance_rbac"
