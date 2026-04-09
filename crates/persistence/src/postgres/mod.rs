@@ -24,6 +24,7 @@ pub mod promotion_decisions;
 pub mod rbac;
 pub mod reconciliation;
 pub mod recovery_gate_runs;
+pub mod readiness;
 pub mod regime_shift_alerts;
 pub mod report_schedules;
 pub mod reporting_read_models;
