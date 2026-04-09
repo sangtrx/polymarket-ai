@@ -7,10 +7,10 @@
 
 ### Artifact Ingestion
 
-- [ ] **ARTF-01**: User can ingest PRD artifacts into a canonical audit dataset
-- [ ] **ARTF-02**: User can ingest architecture artifacts into a canonical audit dataset
-- [ ] **ARTF-03**: User can ingest story artifacts into a canonical audit dataset
-- [ ] **ARTF-04**: User can ingest roadmap artifacts into a canonical audit dataset
+- [x] **ARTF-01**: User can ingest PRD artifacts into a canonical audit dataset
+- [x] **ARTF-02**: User can ingest architecture artifacts into a canonical audit dataset
+- [x] **ARTF-03**: User can ingest story artifacts into a canonical audit dataset
+- [x] **ARTF-04**: User can ingest roadmap artifacts into a canonical audit dataset
 - [x] **ARTF-05**: User can normalize all ingested BMAD items to stable requirement IDs with snapshot version metadata
 
 ### Traceability Mapping
@@ -63,10 +63,10 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ARTF-01 | Phase 1 | Pending |
-| ARTF-02 | Phase 1 | Pending |
-| ARTF-03 | Phase 1 | Pending |
-| ARTF-04 | Phase 1 | Pending |
+| ARTF-01 | Phase 1 | Complete |
+| ARTF-02 | Phase 1 | Complete |
+| ARTF-03 | Phase 1 | Complete |
+| ARTF-04 | Phase 1 | Complete |
 | ARTF-05 | Phase 1 | Complete |
 | TRAC-01 | Phase 2 | Pending |
 | TRAC-02 | Phase 2 | Pending |
@@ -89,4 +89,4 @@
 
 ---
 *Requirements defined: 2026-04-09*  
-*Last updated: 2026-04-09 after roadmap phase mapping*
+*Last updated: 2026-04-09 after phase 1 completion*

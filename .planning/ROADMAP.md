@@ -6,7 +6,7 @@ This roadmap delivers an end-to-end BMAD coverage audit workflow: ingest and nor
 
 ## Phases
 
-- [ ] **Phase 1: Canonical Artifact Ingestion** - BMAD artifacts are ingested into a stable, versioned requirement dataset.
+- [x] **Phase 1: Canonical Artifact Ingestion** - BMAD artifacts are ingested into a stable, versioned requirement dataset.
 - [ ] **Phase 2: Evidence Traceability Mapping** - Each normalized requirement is linked to code/test evidence with rationale and confidence.
 - [ ] **Phase 3: Coverage Classification Matrix** - All scoped requirements receive explainable Covered/Partial/Missing outcomes in one complete matrix.
 - [ ] **Phase 4: Deployment Risk Prioritization** - Partial/Missing gaps are severity-ranked into a deployment-focused fix order.
@@ -25,10 +25,10 @@ This roadmap delivers an end-to-end BMAD coverage audit workflow: ingest and nor
 **Plans**: 4 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Define canonical contracts and persistence schema for stable IDs and immutable snapshots
-- [ ] 01-02-PLAN.md — Implement scoped artifact discovery, parsing, and canonical snapshot assembly pipeline
-- [ ] 01-03-PLAN.md — Wire executable ingestion command and end-to-end deterministic verification
-- [ ] 01-04-PLAN.md — Gap closure: enforce immutable snapshot metadata and deterministic snapshot identity regression coverage
+- [x] 01-01-PLAN.md — Define canonical contracts and persistence schema for stable IDs and immutable snapshots
+- [x] 01-02-PLAN.md — Implement scoped artifact discovery, parsing, and canonical snapshot assembly pipeline
+- [x] 01-03-PLAN.md — Wire executable ingestion command and end-to-end deterministic verification
+- [x] 01-04-PLAN.md — Gap closure: enforce immutable snapshot metadata and deterministic snapshot identity regression coverage
 
 ### Phase 2: Evidence Traceability Mapping
 **Goal**: Users can trace each canonical requirement to concrete implementation and validation evidence.
@@ -75,7 +75,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Canonical Artifact Ingestion | 0/3 | Not started | - |
+| 1. Canonical Artifact Ingestion | 4/4 | Complete | 2026-04-09 |
 | 2. Evidence Traceability Mapping | 0/TBD | Not started | - |
 | 3. Coverage Classification Matrix | 0/TBD | Not started | - |
 | 4. Deployment Risk Prioritization | 0/TBD | Not started | - |
