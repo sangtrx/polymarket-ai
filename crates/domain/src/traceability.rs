@@ -72,6 +72,7 @@ pub struct TraceabilityLink {
     pub rationale: String,
     pub confidence: LinkConfidence,
     pub outcome: LinkOutcome,
+    pub reason_code: Option<String>,
 }
 
 pub fn build_traceability_link(
@@ -80,6 +81,7 @@ pub fn build_traceability_link(
     rationale: impl Into<String>,
     confidence: LinkConfidence,
     outcome: LinkOutcome,
+    reason_code: Option<String>,
 ) -> Result<TraceabilityLink, TraceabilityContractError> {
     let canonical_requirement_id = canonical_requirement_id.into().trim().to_string();
     if canonical_requirement_id.is_empty() {
@@ -115,12 +117,19 @@ pub fn build_traceability_link(
         ));
     }
 
+    let reason_code = reason_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
     Ok(TraceabilityLink {
         canonical_requirement_id,
         anchors: normalized_anchors,
         rationale,
         confidence,
         outcome,
+        reason_code,
     })
 }
 
@@ -202,6 +211,7 @@ mod tests {
             "",
             LinkConfidence::High,
             LinkOutcome::Linked,
+            Some("deterministic_anchor_match".to_string()),
         )
         .expect_err("invalid payload must fail");
         assert_eq!(error.code, "traceability_invalid_payload");
@@ -233,10 +243,15 @@ mod tests {
             "deterministic mapping confirmed in code and API test",
             LinkConfidence::High,
             LinkOutcome::Ambiguous,
+            Some("ambiguous_multiple_candidates".to_string()),
         )
         .expect("valid mapping should pass");
         assert_eq!(link.anchors.len(), 2);
         assert_eq!(link.outcome, LinkOutcome::Ambiguous);
+        assert_eq!(
+            link.reason_code.as_deref(),
+            Some("ambiguous_multiple_candidates")
+        );
         assert!(matches!(LinkOutcome::MissingEvidence, LinkOutcome::MissingEvidence));
         assert!(matches!(LinkOutcome::StaleEvidence, LinkOutcome::StaleEvidence));
     }

@@ -144,7 +144,13 @@ pub async fn insert_traceability_snapshot<'e, E>(
             .bind(link.rationale.trim())
             .bind(confidence_to_str(&link.confidence))
             .bind(outcome_to_str(&link.outcome))
-            .bind(None::<String>)
+            .bind(
+                link.reason_code
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+            )
             .execute(&mut *executor)
             .await
             .map_err(|error| classify_query_error("insert_traceability_snapshot.link", error))?;

@@ -1,7 +1,9 @@
 use crate::traceability::matcher::{
     EvidenceCandidate, MatchRequest, PreviousLink, match_requirement_to_evidence,
 };
-use domain::traceability::{EvidenceAnchor, LinkConfidence, LinkOutcome, TraceabilityLink};
+use domain::traceability::{
+    EvidenceAnchor, LinkConfidence, LinkOutcome, TraceabilityLink, build_traceability_link,
+};
 use persistence::postgres::traceability::insert_traceability_snapshot;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -98,19 +100,8 @@ impl TraceabilityPersistencePort for PostgresTraceabilityPersistence {
             let links = result
                 .rows
                 .iter()
-                .map(|row| TraceabilityLink {
-                    canonical_requirement_id: row.canonical_requirement_id.clone(),
-                    anchors: row
-                        .code_anchors
-                        .iter()
-                        .chain(row.test_anchors.iter())
-                        .cloned()
-                        .collect(),
-                    rationale: row.rationale.clone(),
-                    confidence: row.confidence.clone(),
-                    outcome: row.outcome.clone(),
-                })
-                .collect::<Vec<_>>();
+                .map(|row| build_link_for_persistence(row))
+                .collect::<Result<Vec<_>, _>>()?;
             insert_traceability_snapshot::<()>(
                 &mut connection,
                 &result.snapshot_id,
@@ -126,6 +117,30 @@ impl TraceabilityPersistencePort for PostgresTraceabilityPersistence {
             Ok(())
         })
     }
+}
+
+fn build_link_for_persistence(
+    row: &TraceabilityMappingRow,
+) -> Result<TraceabilityLink, TraceabilityServiceError> {
+    let anchors = row
+        .code_anchors
+        .iter()
+        .chain(row.test_anchors.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    build_traceability_link(
+        row.canonical_requirement_id.clone(),
+        anchors,
+        row.rationale.clone(),
+        row.confidence.clone(),
+        row.outcome.clone(),
+        Some(row.reason_code.clone()),
+    )
+    .map_err(|error| TraceabilityServiceError {
+        code: error.code,
+        message: error.message,
+    })
 }
 
 #[derive(Clone)]
@@ -387,10 +402,8 @@ mod tests {
             ambiguous_candidates: vec![],
             provenance: "deterministic-id".to_string(),
         };
-        let invalid_error =
-            build_links_for_persistence(std::slice::from_ref(&invalid_row)).expect_err(
-                "rows without qualifying code evidence should fail validation before persistence",
-            );
+        let invalid_error = build_link_for_persistence(&invalid_row)
+            .expect_err("rows without qualifying code evidence should fail validation before persistence");
         assert_eq!(invalid_error.code, "traceability_invalid_payload");
 
         let mut valid_row = invalid_row;
@@ -402,10 +415,10 @@ mod tests {
             line_start: Some(1),
             line_end: Some(40),
         });
-        let links = build_links_for_persistence(std::slice::from_ref(&valid_row))
+        let link = build_link_for_persistence(&valid_row)
             .expect("validator-approved rows should produce persistence links");
         assert_eq!(
-            links[0].reason_code.as_deref(),
+            link.reason_code.as_deref(),
             Some("deterministic_anchor_match")
         );
     }
