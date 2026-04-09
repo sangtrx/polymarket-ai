@@ -47,6 +47,17 @@ pub struct CanonicalIngestionResult {
     pub item_count: usize,
     pub unresolved_conflict_count: usize,
     pub warning_count: usize,
+    pub canonical_requirement_ids: Vec<String>,
+    pub unresolved_conflicts: Vec<CanonicalIngestionConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CanonicalIngestionConflict {
+    pub conflict_id: String,
+    pub status: String,
+    pub left_canonical_requirement_id: String,
+    pub right_canonical_requirement_id: String,
+    pub rationale: String,
 }
 
 pub trait CanonicalSnapshotPersistencePort: Send + Sync {
@@ -231,6 +242,22 @@ impl CanonicalIngestionService {
             item_count: snapshot.items.len(),
             unresolved_conflict_count: assembly.unresolved_conflicts.len(),
             warning_count: snapshot.warnings.len(),
+            canonical_requirement_ids: snapshot
+                .items
+                .iter()
+                .map(|item| item.canonical_requirement_id.clone())
+                .collect(),
+            unresolved_conflicts: assembly
+                .unresolved_conflicts
+                .iter()
+                .map(|conflict| CanonicalIngestionConflict {
+                    conflict_id: conflict.conflict_id.clone(),
+                    status: conflict.status.clone(),
+                    left_canonical_requirement_id: conflict.left_canonical_requirement_id.clone(),
+                    right_canonical_requirement_id: conflict.right_canonical_requirement_id.clone(),
+                    rationale: conflict.rationale.clone(),
+                })
+                .collect(),
         })
     }
 }

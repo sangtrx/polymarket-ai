@@ -23,8 +23,9 @@ function createFixtureWorkspace() {
 }
 
 function runIngestion(repoRoot) {
+  const cargoBin = process.env.CARGO || `${process.env.HOME}/.cargo/bin/cargo`;
   const command = spawnSync(
-    "cargo",
+    cargoBin,
     [
       "run",
       "-q",
@@ -45,8 +46,8 @@ function runIngestion(repoRoot) {
     },
   );
 
-  assert.equal(command.status, 0, command.stderr);
-  return JSON.parse(command.stdout.trim());
+  assert.equal(command.status, 0, command.stderr ?? command.error?.message);
+  return JSON.parse((command.stdout ?? "").trim());
 }
 
 test("ARTF-05: repeated full snapshot ingestion keeps canonical_requirement_ids and snapshot_digest stable", () => {

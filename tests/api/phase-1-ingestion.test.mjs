@@ -16,8 +16,9 @@ function createFixtureWorkspace(prefix, files) {
 }
 
 function runIngestion(repoRoot, args = []) {
+  const cargoBin = process.env.CARGO || `${process.env.HOME}/.cargo/bin/cargo`;
   const command = spawnSync(
-    "cargo",
+    cargoBin,
     [
       "run",
       "-q",
@@ -40,8 +41,8 @@ function runIngestion(repoRoot, args = []) {
   );
   return {
     status: command.status ?? 1,
-    stdout: command.stdout.trim(),
-    stderr: command.stderr.trim(),
+    stdout: (command.stdout ?? "").trim(),
+    stderr: (command.stderr ?? command.error?.message ?? "").trim(),
   };
 }
 
@@ -90,9 +91,9 @@ test("schema violations fail closed with machine-readable canonical_artifact_inv
 
 test("valid ingestion emits unresolved conflict findings while succeeding", () => {
   const workspace = createFixtureWorkspace("phase-1-api-conflicts-", {
-    ".planning/PRD.md": "# PRD\n- [ ] REQ-2 Execution must require manual approval",
+    ".planning/PRD.md": "# PRD\n- [ ] CTRL-1 Execution must require manual approval",
     "docs/architecture.md":
-      "# Architecture\n- [ ] ARCH-2 Execution must not require manual approval",
+      "# Architecture\n- [ ] CTRL-1 Execution must not require manual approval",
     ".planning/stories/story-1.md":
       "# Story\n- [ ] ST-1 Execution must require manual approval",
     ".planning/ROADMAP.md": "# Roadmap\n- [ ] RM-1 Include conflict evidence",
