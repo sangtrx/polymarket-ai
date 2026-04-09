@@ -1,11 +1,12 @@
 use research_gateway::ingestion::service::{
     IngestionMode, RunCanonicalIngestionInput, run_canonical_ingestion,
 };
-use research_gateway::traceability::matcher::EvidenceCandidate;
+use research_gateway::traceability::matcher::{EvidenceCandidate, PreviousLink};
 use research_gateway::traceability::service::{
     RunTraceabilityMappingInput, TraceabilityRequirementInput, run_traceability_mapping,
 };
 use serde::Serialize;
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,17 +156,22 @@ async fn build_traceability_mapping_input(
         message: error,
     })?;
 
+    let history = load_traceability_history(Path::new(repo_root));
     let requirements = ingestion
         .canonical_requirement_ids
         .iter()
         .map(|requirement_id| {
+            let previous_links = history
+                .get(requirement_id)
+                .cloned()
+                .unwrap_or_default();
             let (deterministic_candidates, semantic_candidates) =
                 collect_requirement_candidates(Path::new(repo_root), requirement_id, &file_paths);
             TraceabilityRequirementInput {
                 canonical_requirement_id: requirement_id.clone(),
                 deterministic_candidates,
                 semantic_candidates,
-                previous_links: vec![],
+                previous_links,
             }
         })
         .collect::<Vec<_>>();
@@ -214,6 +220,12 @@ fn collect_requirement_candidates(
     let semantic_tokens = requirement_id
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|token| token.len() >= 4)
+        .filter(|token| {
+            !matches!(
+                token.to_ascii_lowercase().as_str(),
+                "project" | "planning" | "requirements" | "story" | "roadmap" | "architecture"
+            )
+        })
         .map(|token| token.to_ascii_lowercase())
         .collect::<Vec<_>>();
 
@@ -240,7 +252,7 @@ fn collect_requirement_candidates(
             .iter()
             .filter(|token| lowered.contains(token.as_str()) || relative_path.contains(token.as_str()))
             .count();
-        if token_hits > 0 {
+        if token_hits >= 2 {
             semantic.push(candidate_from_file(
                 &relative_path,
                 "semantic token overlap fallback candidate",
@@ -252,6 +264,46 @@ fn collect_requirement_candidates(
     deterministic.sort_by(|left, right| right.score.total_cmp(&left.score));
     semantic.sort_by(|left, right| right.score.total_cmp(&left.score));
     (deterministic, semantic.into_iter().take(3).collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryAnchor {
+    snapshot_id: String,
+    file_path: String,
+    symbol: Option<String>,
+    line_start: Option<u32>,
+    line_end: Option<u32>,
+}
+
+fn load_traceability_history(repo_root: &Path) -> std::collections::BTreeMap<String, Vec<PreviousLink>> {
+    let history_path = repo_root.join(".traceability-history.json");
+    let Ok(raw) = fs::read_to_string(history_path) else {
+        return std::collections::BTreeMap::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<std::collections::BTreeMap<String, Vec<HistoryAnchor>>>(&raw)
+    else {
+        return std::collections::BTreeMap::new();
+    };
+    parsed
+        .into_iter()
+        .map(|(requirement_id, anchors)| {
+            let links = anchors
+                .into_iter()
+                .map(|anchor| PreviousLink {
+                    snapshot_id: anchor.snapshot_id,
+                    anchor: domain::traceability::EvidenceAnchor {
+                        evidence_type: domain::traceability::EvidenceType::Code,
+                        file_path: anchor.file_path,
+                        symbol: anchor.symbol,
+                        section: None,
+                        line_start: anchor.line_start,
+                        line_end: anchor.line_end,
+                    },
+                })
+                .collect::<Vec<_>>();
+            (requirement_id, links)
+        })
+        .collect()
 }
 
 fn candidate_from_file(relative_path: &str, rationale: &str, score: f32) -> EvidenceCandidate {
