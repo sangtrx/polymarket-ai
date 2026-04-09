@@ -332,6 +332,26 @@ mod tests {
     }
 
     #[test]
+    fn migration_contract_snapshot_immutability_guard_exists() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations/20260409000200_canonical_snapshot_immutability.sql");
+        let sql = std::fs::read_to_string(path).expect("immutability migration must exist");
+        assert!(sql.contains("canonical_ingestion_snapshots"));
+        assert!(sql.contains("TRIGGER") || sql.contains("RAISE EXCEPTION"));
+    }
+
+    #[test]
+    fn migration_contract_snapshot_immutability_protects_metadata_columns() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations/20260409000200_canonical_snapshot_immutability.sql");
+        let sql = std::fs::read_to_string(path).expect("immutability migration must exist");
+        assert!(sql.contains("commit_sha"));
+        assert!(sql.contains("ingested_at_utc"));
+        assert!(sql.contains("file_digests_json"));
+        assert!(sql.contains("aggregate_digest"));
+    }
+
+    #[test]
     fn list_snapshots_query_orders_records_deterministically() {
         assert!(
             LIST_SNAPSHOTS_BY_COMMIT_SQL.contains("ORDER BY ingested_at_utc DESC, snapshot_id ASC")
