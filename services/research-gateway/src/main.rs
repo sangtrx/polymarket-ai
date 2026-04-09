@@ -356,14 +356,20 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
             let entry =
                 entry.map_err(|error| format!("unable to read directory entry: {error}"))?;
             let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("unable to inspect {}: {error}", path.display()))?;
             if path.file_name().map(|name| name == ".git").unwrap_or(false) {
                 continue;
             }
-            if path.is_dir() {
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
-            if is_supported_source_file(&path) {
+            if file_type.is_file() && is_supported_source_file(&path) {
                 files.push(path);
             }
         }

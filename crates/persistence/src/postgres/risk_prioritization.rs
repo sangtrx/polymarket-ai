@@ -79,8 +79,8 @@ const LIST_RISK_ROWS_BY_SNAPSHOT_SQL: &str = r#"
     LEFT JOIN risk_row_anchors a ON a.row_id = r.row_id
     WHERE r.snapshot_id = $1
     ORDER BY
-        r.canonical_requirement_id ASC,
         r.priority_rank ASC,
+        r.canonical_requirement_id ASC,
         r.row_id ASC,
         a.anchor_rank ASC,
         a.anchor_id ASC
