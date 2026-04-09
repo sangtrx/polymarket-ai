@@ -29,6 +29,7 @@ pub mod report_schedules;
 pub mod reporting_read_models;
 pub mod restore_rehearsals;
 pub mod reward_risk;
+pub mod risk_prioritization;
 pub mod risk_limits;
 pub mod safety_controls;
 pub mod shadow_evaluations;

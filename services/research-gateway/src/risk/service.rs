@@ -3,7 +3,9 @@ use crate::risk::classifier::{RiskScoredRow, classify_unresolved_rows};
 use domain::coverage::CoverageClass;
 use domain::risk_prioritization::{RemediationFocus, RiskSeverity};
 use domain::traceability::EvidenceAnchor;
+use persistence::postgres::risk_prioritization::{PersistedRiskRow, insert_risk_snapshot};
 use serde::Serialize;
+use sqlx::PgPool;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -86,7 +88,7 @@ pub struct RiskPrioritizationResult {
 pub trait RiskPersistencePort: Send + Sync {
     fn persist_risk_prioritization<'a>(
         &'a self,
-        _result: &'a RiskPrioritizationResult,
+        result: &'a RiskPrioritizationResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), RiskServiceError>> + Send + 'a>>;
 }
 
@@ -99,6 +101,52 @@ impl RiskPersistencePort for InMemoryRiskPersistence {
         _result: &'a RiskPrioritizationResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), RiskServiceError>> + Send + 'a>> {
         Box::pin(async move { Ok(()) })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresRiskPersistence {
+    pool: PgPool,
+}
+
+impl PostgresRiskPersistence {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl RiskPersistencePort for PostgresRiskPersistence {
+    fn persist_risk_prioritization<'a>(
+        &'a self,
+        result: &'a RiskPrioritizationResult,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RiskServiceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut connection =
+                self.pool
+                    .acquire()
+                    .await
+                    .map_err(|error| RiskServiceError::query_failed(format!(
+                        "unable to acquire postgres connection: {error}"
+                    )))?;
+            let rows = result
+                .rows
+                .iter()
+                .map(build_persisted_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            insert_risk_snapshot(
+                &mut connection,
+                &result.snapshot_id,
+                &result.commit_sha,
+                &result.generated_at_utc,
+                &rows,
+            )
+            .await
+            .map_err(|error| RiskServiceError {
+                code: error.code.to_string(),
+                message: error.message,
+            })?;
+            Ok(())
+        })
     }
 }
 
@@ -218,4 +266,30 @@ fn validate_payload(input: &RunRiskPrioritizationInput) -> Result<(), RiskServic
         ));
     }
     Ok(())
+}
+
+fn build_persisted_row(item: &RiskFixItem) -> Result<PersistedRiskRow, RiskServiceError> {
+    if item.canonical_requirement_id.trim().is_empty() {
+        return Err(RiskServiceError::invalid_payload(
+            "canonical_requirement_id is required",
+        ));
+    }
+    Ok(PersistedRiskRow {
+        canonical_requirement_id: item.canonical_requirement_id.clone(),
+        coverage_class: item.coverage_class.clone(),
+        severity: item.severity,
+        risk_score: item.risk_score,
+        priority_rank: item.priority_rank,
+        reason_code: item.reason_code.clone(),
+        rationale: item.rationale.clone(),
+        provenance: item.provenance.clone(),
+        code_anchor_count: item.code_anchor_count,
+        test_anchor_count: item.test_anchor_count,
+        ambiguous_anchor_count: item.ambiguous_anchor_count,
+        top_evidence_anchors: item.top_evidence_anchors.clone(),
+        remediation_focus: item.remediation_focus,
+        severity_weight: item.severity_weight,
+        reason_weight: item.reason_weight,
+        evidence_penalty: item.evidence_penalty,
+    })
 }
