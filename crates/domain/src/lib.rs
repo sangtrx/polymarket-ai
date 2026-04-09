@@ -15,4 +15,5 @@ pub mod reporting_export;
 pub mod reporting_schedule;
 pub mod research;
 pub mod risk;
+pub mod risk_prioritization;
 pub mod traceability;
