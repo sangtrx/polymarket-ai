@@ -18,11 +18,11 @@ Establish deployment confidence by producing an evidence-based coverage audit of
 - ✓ BMAD/GSD project workflow assets exist in-repo (`.github/get-shit-done/`, `.github/skills/`) — existing
 - ✓ Phase 1 canonical artifact ingestion baseline delivered (ARTF-01..ARTF-05) — validated in Phase 1
 - ✓ Phase 2 evidence traceability mapping delivered (TRAC-01..TRAC-03) — validated in Phase 2
+- ✓ Phase 3 coverage classification matrix delivered (COVR-01..COVR-03) — validated in Phase 3
+- ✓ Phase 4 deployment risk prioritization delivered (RISK-01..RISK-02) — validated in Phase 4
 
 ### Active
 
-- [ ] Classify every mapped item as Covered, Partial, or Missing with rationale
-- [ ] Generate a prioritized fix list for uncovered/partial items, ordered by deployment risk
 - [ ] Deliver an audit summary that clearly supports a deployment readiness decision
 
 ### Out of Scope
@@ -33,7 +33,7 @@ Establish deployment confidence by producing an evidence-based coverage audit of
 
 ## Context
 
-This is an existing multi-service codebase with Rust backends, a TypeScript/Next.js operator console, and BMAD/GSD workflow assets. A fresh codebase map was generated under `.planning/codebase/` to support analysis. The maintainer requested comprehensive coverage validation across all BMAD planning artifacts and a deployment-focused risk view. Phases 1 and 2 are complete; current execution focus is Phase 3 (coverage classification matrix).
+This is an existing multi-service codebase with Rust backends, a TypeScript/Next.js operator console, and BMAD/GSD workflow assets. A fresh codebase map was generated under `.planning/codebase/` to support analysis. The maintainer requested comprehensive coverage validation across all BMAD planning artifacts and a deployment-focused risk view. Phases 1 through 4 are complete; current execution focus is Phase 5 (CI readiness signal and reporting).
 
 ## Constraints
 
@@ -70,4 +70,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-09 after phase 2 completion*
+*Last updated: 2026-04-09 after phase 4 completion*
