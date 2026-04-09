@@ -22,7 +22,12 @@ This roadmap delivers an end-to-end BMAD coverage audit workflow: ingest and nor
   1. User can ingest PRD, architecture, story, and roadmap artifacts into one canonical dataset.
   2. User can see stable requirement IDs assigned across all ingested BMAD items.
   3. User can identify snapshot version metadata for each ingestion run.
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Define canonical contracts and persistence schema for stable IDs and immutable snapshots
+- [ ] 01-02-PLAN.md — Implement scoped artifact discovery, parsing, and canonical snapshot assembly pipeline
+- [ ] 01-03-PLAN.md — Wire executable ingestion command and end-to-end deterministic verification
 
 ### Phase 2: Evidence Traceability Mapping
 **Goal**: Users can trace each canonical requirement to concrete implementation and validation evidence.
@@ -69,7 +74,7 @@ This roadmap delivers an end-to-end BMAD coverage audit workflow: ingest and nor
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Canonical Artifact Ingestion | 0/TBD | Not started | - |
+| 1. Canonical Artifact Ingestion | 0/3 | Not started | - |
 | 2. Evidence Traceability Mapping | 0/TBD | Not started | - |
 | 3. Coverage Classification Matrix | 0/TBD | Not started | - |
 | 4. Deployment Risk Prioritization | 0/TBD | Not started | - |

@@ -3,13 +3,13 @@
 
 **Polymarket-AI BMAD Coverage Audit**
 
-This project defines a brownfield audit milestone for `polymarket-ai` to verify implementation coverage against BMAD artifacts. The immediate goal is to map PRD, architecture, stories, and roadmap expectations to code evidence and identify any coverage gaps before deployment. This work is for a solo maintainer who needs a reliable go/no-go signal.
+This project defines a brownfield audit initiative for `polymarket-ai` to verify and operationalize implementation coverage against BMAD artifacts. The immediate roadmap builds ingestion, mapping, and reporting capabilities that produce code-linked evidence and deployment-readiness signals. This work is for a solo maintainer who needs a reliable go/no-go decision before deployment.
 
 **Core Value:** Establish deployment confidence by producing an evidence-based coverage audit of BMAD intent versus implemented code.
 
 ### Constraints
 
-- **Scope**: Audit-only milestone — no code changes in this phase
+- **Scope**: Audit workflow implementation is allowed by roadmap phases; production deployment actions remain deferred
 - **Traceability**: Must include file-level evidence for every BMAD item assessed
 - **Coverage Baseline**: Comparison must include PRD, architecture, stories, and roadmap artifacts (not a subset)
 - **Decision Utility**: Output must prioritize gaps by deployment impact, not by document order

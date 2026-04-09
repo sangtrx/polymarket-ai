@@ -2,7 +2,7 @@
 
 ## What This Is
 
-This project defines a brownfield audit milestone for `polymarket-ai` to verify implementation coverage against BMAD artifacts. The immediate goal is to map PRD, architecture, stories, and roadmap expectations to code evidence and identify any coverage gaps before deployment. This work is for a solo maintainer who needs a reliable go/no-go signal.
+This project defines a brownfield audit initiative for `polymarket-ai` to verify and operationalize implementation coverage against BMAD artifacts. The immediate roadmap builds ingestion, mapping, and reporting capabilities that produce code-linked evidence and deployment-readiness signals. This work is for a solo maintainer who needs a reliable go/no-go decision before deployment.
 
 ## Core Value
 
@@ -27,7 +27,7 @@ Establish deployment confidence by producing an evidence-based coverage audit of
 ### Out of Scope
 
 - Deploying to the target server in this milestone — explicitly deferred until after audit completion
-- Applying implementation fixes during this milestone — scope is analysis/reporting only
+- Deploy-time infrastructure actions (release rollout, server cutover) before readiness gates are implemented — deferred until later milestone
 - Introducing new product features unrelated to audit findings — avoided to keep validation signal clean
 
 ## Context
@@ -36,7 +36,7 @@ This is an existing multi-service codebase with Rust backends, a TypeScript/Next
 
 ## Constraints
 
-- **Scope**: Audit-only milestone — no code changes in this phase
+- **Scope**: Audit workflow implementation is allowed by roadmap phases; production deployment actions remain deferred
 - **Traceability**: Must include file-level evidence for every BMAD item assessed
 - **Coverage Baseline**: Comparison must include PRD, architecture, stories, and roadmap artifacts (not a subset)
 - **Decision Utility**: Output must prioritize gaps by deployment impact, not by document order
@@ -47,7 +47,8 @@ This is an existing multi-service codebase with Rust backends, a TypeScript/Next
 |----------|-----------|---------|
 | Compare against all BMAD artifacts (PRD, architecture, stories, roadmap) | Avoid blind spots and produce complete readiness picture | — Pending |
 | Deliverable is a detailed traceability matrix | Needed for verifiable, reusable audit evidence | — Pending |
-| Limit milestone to analysis/reporting | Preserve audit neutrality and speed of completion | — Pending |
+| Limit milestone to analysis/reporting | Original initialization assumption before roadmap decomposition | ⚠️ Revisit |
+| Deliver roadmap as implementation phases (ingestion → traceability → classification → risk → CI reporting) | Required to produce repeatable evidence and readiness signal, not a one-off report | — Pending |
 | Defer target-server deployment | Deployment should follow confidence gate from audit results | — Pending |
 
 ## Evolution
@@ -68,4 +69,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-08 after initialization*
+*Last updated: 2026-04-09 after phase-planning alignment*
