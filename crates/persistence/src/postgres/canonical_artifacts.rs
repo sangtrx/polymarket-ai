@@ -2,12 +2,11 @@ use domain::audit_artifacts::{
     CanonicalArtifactContractError, CanonicalArtifactItem, CanonicalSnapshot,
     canonical_requirement_id,
 };
-use serde_json::json;
 use sqlx::PgExecutor;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-const UPSERT_SNAPSHOT_SQL: &str = r#"
+const INSERT_SNAPSHOT_SQL: &str = r#"
     INSERT INTO canonical_ingestion_snapshots (
         snapshot_id,
         commit_sha,
@@ -15,10 +14,6 @@ const UPSERT_SNAPSHOT_SQL: &str = r#"
         file_digests_json,
         aggregate_digest
     ) VALUES ($1, $2, $3::timestamptz, $4::jsonb, $5)
-    ON CONFLICT (snapshot_id)
-    DO UPDATE SET
-        file_digests_json = EXCLUDED.file_digests_json,
-        aggregate_digest = EXCLUDED.aggregate_digest
 "#;
 
 const UPSERT_ITEM_SQL: &str = r#"
@@ -112,7 +107,7 @@ pub struct CanonicalSnapshotRow {
     pub ingested_at_utc: String,
 }
 
-pub async fn upsert_snapshot<'e, E>(
+pub async fn insert_snapshot<'e, E>(
     executor: E,
     snapshot: &CanonicalSnapshot,
 ) -> Result<(), CanonicalArtifactPersistenceError>
@@ -126,7 +121,7 @@ where
         ))
     })?;
 
-    sqlx::query(UPSERT_SNAPSHOT_SQL)
+    sqlx::query(INSERT_SNAPSHOT_SQL)
         .bind(&snapshot_id)
         .bind(&snapshot.commit_sha)
         .bind(&snapshot.ingested_at_utc)
@@ -134,7 +129,7 @@ where
         .bind(&snapshot.aggregate_digest)
         .execute(executor)
         .await
-        .map_err(|error| classify_query_error("upsert_snapshot", error))?;
+        .map_err(|error| classify_query_error("insert_snapshot", error))?;
 
     Ok(())
 }
@@ -273,7 +268,7 @@ where
 fn snapshot_id(snapshot: &CanonicalSnapshot) -> Result<String, CanonicalArtifactContractError> {
     canonical_requirement_id(
         &snapshot.commit_sha,
-        &snapshot.aggregate_digest,
+        &format!("{}-{}", snapshot.aggregate_digest, snapshot.ingested_at_utc),
         snapshot.items.len() as u32 + 1,
     )
 }
@@ -309,6 +304,7 @@ mod tests {
         CanonicalArtifactInput, CanonicalArtifactType, CanonicalSnapshotInput,
         build_canonical_snapshot,
     };
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     const CANONICAL_INGESTION_MIGRATION_SQL: &str =
@@ -388,8 +384,8 @@ mod tests {
 
     #[test]
     fn snapshot_metadata_immutable_sql_is_insert_only() {
-        assert!(UPSERT_SNAPSHOT_SQL.contains("INSERT INTO canonical_ingestion_snapshots"));
-        assert!(!UPSERT_SNAPSHOT_SQL.contains("DO UPDATE SET"));
+        assert!(INSERT_SNAPSHOT_SQL.contains("INSERT INTO canonical_ingestion_snapshots"));
+        assert!(!INSERT_SNAPSHOT_SQL.contains("DO UPDATE SET"));
     }
 
     #[test]

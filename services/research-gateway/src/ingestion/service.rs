@@ -6,7 +6,7 @@ use crate::ingestion::snapshot_builder::{SnapshotAssembly, SnapshotBuildInput, b
 use domain::audit_artifacts::{CanonicalSnapshot, build_canonical_snapshot, canonical_requirement_id};
 use persistence::postgres::canonical_artifacts::{
     insert_conflict as pg_insert_conflict, insert_equivalence as pg_insert_equivalence,
-    upsert_item as pg_upsert_item, upsert_snapshot as pg_upsert_snapshot,
+    insert_snapshot as pg_insert_snapshot, upsert_item as pg_upsert_item,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -121,7 +121,7 @@ impl CanonicalSnapshotPersistencePort for PostgresCanonicalSnapshotPersistence {
                 code: "canonical_artifact_query_failed".to_string(),
                 message: format!("unable to open canonical ingestion transaction: {error}"),
             })?;
-            pg_upsert_snapshot(&mut *transaction, snapshot)
+            pg_insert_snapshot(&mut *transaction, snapshot)
                 .await
                 .map_err(map_persistence_error)?;
 
@@ -383,7 +383,7 @@ fn sha256_digest(bytes: &[u8]) -> String {
 fn snapshot_id(snapshot: &CanonicalSnapshot) -> Result<String, CanonicalIngestionError> {
     canonical_requirement_id(
         &snapshot.commit_sha,
-        &snapshot.aggregate_digest,
+        &format!("{}-{}", snapshot.aggregate_digest, snapshot.ingested_at_utc),
         snapshot.items.len() as u32 + 1,
     )
     .map_err(|error| CanonicalIngestionError {
