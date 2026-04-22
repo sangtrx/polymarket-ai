@@ -93,10 +93,14 @@ impl TraceabilityPersistencePort for PostgresTraceabilityPersistence {
         result: &'a TraceabilityMappingResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), TraceabilityServiceError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut connection = self.pool.acquire().await.map_err(|error| TraceabilityServiceError {
-                code: "traceability_query_failed".to_string(),
-                message: format!("unable to acquire postgres connection: {error}"),
-            })?;
+            let mut connection =
+                self.pool
+                    .acquire()
+                    .await
+                    .map_err(|error| TraceabilityServiceError {
+                        code: "traceability_query_failed".to_string(),
+                        message: format!("unable to acquire postgres connection: {error}"),
+                    })?;
             let links = result
                 .rows
                 .iter()
@@ -221,19 +225,22 @@ fn validate_payload(input: &RunTraceabilityMappingInput) -> Result<(), Traceabil
     let commit_sha = input.commit_sha.trim();
     if commit_sha.len() < 6
         || commit_sha.len() > 64
-        || !commit_sha.chars().all(|character| character.is_ascii_hexdigit())
+        || !commit_sha
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
     {
         return Err(TraceabilityServiceError {
             code: "traceability_invalid_payload".to_string(),
             message: "commit_sha must be 6-64 hex characters".to_string(),
         });
     }
-    let generated_at = OffsetDateTime::parse(input.generated_at_utc.trim(), &Rfc3339).map_err(|_| {
-        TraceabilityServiceError {
-            code: "traceability_invalid_payload".to_string(),
-            message: "generated_at_utc must be RFC3339 UTC".to_string(),
-        }
-    })?;
+    let generated_at =
+        OffsetDateTime::parse(input.generated_at_utc.trim(), &Rfc3339).map_err(|_| {
+            TraceabilityServiceError {
+                code: "traceability_invalid_payload".to_string(),
+                message: "generated_at_utc must be RFC3339 UTC".to_string(),
+            }
+        })?;
     if generated_at.offset() != UtcOffset::UTC {
         return Err(TraceabilityServiceError {
             code: "traceability_invalid_payload".to_string(),
@@ -378,15 +385,24 @@ mod tests {
         .await
         .expect("mapping should succeed");
 
-        assert!(output.rows.iter().any(|row| row.outcome == LinkOutcome::Ambiguous));
-        assert!(output
-            .rows
-            .iter()
-            .any(|row| row.outcome == LinkOutcome::MissingEvidence));
-        assert!(output
-            .rows
-            .iter()
-            .any(|row| row.outcome == LinkOutcome::StaleEvidence));
+        assert!(
+            output
+                .rows
+                .iter()
+                .any(|row| row.outcome == LinkOutcome::Ambiguous)
+        );
+        assert!(
+            output
+                .rows
+                .iter()
+                .any(|row| row.outcome == LinkOutcome::MissingEvidence)
+        );
+        assert!(
+            output
+                .rows
+                .iter()
+                .any(|row| row.outcome == LinkOutcome::StaleEvidence)
+        );
     }
 
     #[test]
@@ -402,8 +418,9 @@ mod tests {
             ambiguous_candidates: vec![],
             provenance: "deterministic-id".to_string(),
         };
-        let invalid_error = build_link_for_persistence(&invalid_row)
-            .expect_err("rows without qualifying code evidence should fail validation before persistence");
+        let invalid_error = build_link_for_persistence(&invalid_row).expect_err(
+            "rows without qualifying code evidence should fail validation before persistence",
+        );
         assert_eq!(invalid_error.code, "traceability_invalid_payload");
 
         let mut valid_row = invalid_row;

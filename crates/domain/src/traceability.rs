@@ -220,7 +220,10 @@ mod tests {
     #[test]
     fn accepts_only_high_medium_low_confidence() {
         assert_eq!(LinkConfidence::try_from("high"), Ok(LinkConfidence::High));
-        assert_eq!(LinkConfidence::try_from("medium"), Ok(LinkConfidence::Medium));
+        assert_eq!(
+            LinkConfidence::try_from("medium"),
+            Ok(LinkConfidence::Medium)
+        );
         assert_eq!(LinkConfidence::try_from("low"), Ok(LinkConfidence::Low));
         let error = LinkConfidence::try_from("uncertain").expect_err("unknown value must fail");
         assert_eq!(error.code, "traceability_invalid_payload");
@@ -252,7 +255,13 @@ mod tests {
             link.reason_code.as_deref(),
             Some("ambiguous_multiple_candidates")
         );
-        assert!(matches!(LinkOutcome::MissingEvidence, LinkOutcome::MissingEvidence));
-        assert!(matches!(LinkOutcome::StaleEvidence, LinkOutcome::StaleEvidence));
+        assert!(matches!(
+            LinkOutcome::MissingEvidence,
+            LinkOutcome::MissingEvidence
+        ));
+        assert!(matches!(
+            LinkOutcome::StaleEvidence,
+            LinkOutcome::StaleEvidence
+        ));
     }
 }

@@ -87,7 +87,8 @@ pub fn match_requirement_to_evidence(input: MatchRequest) -> MatchResult {
             canonical_requirement_id: input.canonical_requirement_id,
             outcome: LinkOutcome::StaleEvidence,
             confidence: LinkConfidence::Low,
-            rationale: "Previously linked evidence anchors are stale at the current snapshot".to_string(),
+            rationale: "Previously linked evidence anchors are stale at the current snapshot"
+                .to_string(),
             reason_code: "stale_link_invalidated".to_string(),
             code_anchors: anchors,
             test_anchors: vec![],
@@ -100,7 +101,8 @@ pub fn match_requirement_to_evidence(input: MatchRequest) -> MatchResult {
         canonical_requirement_id: input.canonical_requirement_id,
         outcome: LinkOutcome::MissingEvidence,
         confidence: LinkConfidence::Low,
-        rationale: "No qualifying code evidence anchors found for the canonical requirement".to_string(),
+        rationale: "No qualifying code evidence anchors found for the canonical requirement"
+            .to_string(),
         reason_code: "missing_evidence".to_string(),
         code_anchors: vec![],
         test_anchors: vec![],

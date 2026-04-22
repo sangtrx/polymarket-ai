@@ -2,8 +2,12 @@ use crate::ingestion::artifact_discovery::{
     ArtifactDiscoveryManifest, ArtifactSourceKind, discover_artifact_sources,
 };
 use crate::ingestion::artifact_parser::parse_markdown_artifact;
-use crate::ingestion::snapshot_builder::{SnapshotAssembly, SnapshotBuildInput, build_snapshot_assembly};
-use domain::audit_artifacts::{CanonicalSnapshot, build_canonical_snapshot, canonical_requirement_id};
+use crate::ingestion::snapshot_builder::{
+    SnapshotAssembly, SnapshotBuildInput, build_snapshot_assembly,
+};
+use domain::audit_artifacts::{
+    CanonicalSnapshot, build_canonical_snapshot, canonical_requirement_id,
+};
 use persistence::postgres::canonical_artifacts::{
     insert_conflict as pg_insert_conflict, insert_equivalence as pg_insert_equivalence,
     insert_snapshot as pg_insert_snapshot, upsert_item as pg_upsert_item,
@@ -117,10 +121,14 @@ impl CanonicalSnapshotPersistencePort for PostgresCanonicalSnapshotPersistence {
         assembly: &'a SnapshotAssembly,
     ) -> Pin<Box<dyn Future<Output = Result<(), CanonicalIngestionError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut transaction = self.pool.begin().await.map_err(|error| CanonicalIngestionError {
-                code: "canonical_artifact_query_failed".to_string(),
-                message: format!("unable to open canonical ingestion transaction: {error}"),
-            })?;
+            let mut transaction =
+                self.pool
+                    .begin()
+                    .await
+                    .map_err(|error| CanonicalIngestionError {
+                        code: "canonical_artifact_query_failed".to_string(),
+                        message: format!("unable to open canonical ingestion transaction: {error}"),
+                    })?;
             pg_insert_snapshot(&mut *transaction, snapshot)
                 .await
                 .map_err(map_persistence_error)?;
@@ -212,28 +220,35 @@ impl CanonicalIngestionService {
             parsed_artifacts,
         });
         if !assembly.successful {
-            let failure = assembly.findings.first().ok_or_else(|| CanonicalIngestionError {
-                code: "canonical_artifact_invalid_payload".to_string(),
-                message: "snapshot assembly failed without a diagnostic".to_string(),
-            })?;
+            let failure = assembly
+                .findings
+                .first()
+                .ok_or_else(|| CanonicalIngestionError {
+                    code: "canonical_artifact_invalid_payload".to_string(),
+                    message: "snapshot assembly failed without a diagnostic".to_string(),
+                })?;
             return Err(CanonicalIngestionError {
                 code: failure.code.clone(),
                 message: failure.message.clone(),
             });
         }
-        let snapshot_input = assembly
-            .snapshot_input
-            .as_ref()
-            .ok_or_else(|| CanonicalIngestionError {
+        let snapshot_input =
+            assembly
+                .snapshot_input
+                .as_ref()
+                .ok_or_else(|| CanonicalIngestionError {
+                    code: "canonical_artifact_invalid_payload".to_string(),
+                    message: "snapshot assembly missing snapshot input".to_string(),
+                })?;
+        let snapshot =
+            build_canonical_snapshot(snapshot_input).map_err(|error| CanonicalIngestionError {
                 code: "canonical_artifact_invalid_payload".to_string(),
-                message: "snapshot assembly missing snapshot input".to_string(),
+                message: error.message,
             })?;
-        let snapshot = build_canonical_snapshot(snapshot_input).map_err(|error| CanonicalIngestionError {
-            code: "canonical_artifact_invalid_payload".to_string(),
-            message: error.message,
-        })?;
 
-        self.persistence.persist_snapshot(&snapshot, &assembly).await?;
+        self.persistence
+            .persist_snapshot(&snapshot, &assembly)
+            .await?;
         Ok(CanonicalIngestionResult {
             commit_sha: snapshot.commit_sha,
             ingested_at_utc: snapshot.ingested_at_utc,
@@ -340,23 +355,34 @@ fn require_required_artifact_classes(
 fn parse_sources(
     repo_root: &Path,
     manifest: &ArtifactDiscoveryManifest,
-) -> Result<(BTreeMap<String, String>, Vec<crate::ingestion::artifact_parser::ParsedArtifact>), CanonicalIngestionError>
-{
+) -> Result<
+    (
+        BTreeMap<String, String>,
+        Vec<crate::ingestion::artifact_parser::ParsedArtifact>,
+    ),
+    CanonicalIngestionError,
+> {
     let mut file_digests = BTreeMap::new();
     let mut parsed_artifacts = Vec::new();
     for source in &manifest.sources {
         let absolute_path = repo_root.join(&source.relative_path);
-        let markdown = std::fs::read_to_string(&absolute_path).map_err(|error| CanonicalIngestionError {
-            code: "canonical_artifact_query_failed".to_string(),
-            message: format!(
-                "unable to read artifact `{}` from repo root: {error}",
-                source.relative_path
-            ),
-        })?;
-        file_digests.insert(source.relative_path.clone(), sha256_digest(markdown.as_bytes()));
-        let parsed = parse_markdown_artifact(source, &markdown).map_err(|error| CanonicalIngestionError {
-            code: error.code.to_string(),
-            message: error.message,
+        let markdown =
+            std::fs::read_to_string(&absolute_path).map_err(|error| CanonicalIngestionError {
+                code: "canonical_artifact_query_failed".to_string(),
+                message: format!(
+                    "unable to read artifact `{}` from repo root: {error}",
+                    source.relative_path
+                ),
+            })?;
+        file_digests.insert(
+            source.relative_path.clone(),
+            sha256_digest(markdown.as_bytes()),
+        );
+        let parsed = parse_markdown_artifact(source, &markdown).map_err(|error| {
+            CanonicalIngestionError {
+                code: error.code.to_string(),
+                message: error.message,
+            }
         })?;
         parsed_artifacts.push(parsed);
     }
@@ -404,7 +430,10 @@ fn map_persistence_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::audit_artifacts::{CanonicalArtifactInput, CanonicalArtifactType, CanonicalSnapshotInput, build_canonical_snapshot};
+    use domain::audit_artifacts::{
+        CanonicalArtifactInput, CanonicalArtifactType, CanonicalSnapshotInput,
+        build_canonical_snapshot,
+    };
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};

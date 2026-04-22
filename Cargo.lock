@@ -3440,6 +3440,7 @@ dependencies = [
  "common",
  "domain",
  "persistence",
+ "reporting-service",
  "serde",
  "serde_json",
  "sha2",

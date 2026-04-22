@@ -3,7 +3,9 @@ pub mod service;
 
 #[cfg(test)]
 mod tests {
-    use super::matcher::{EvidenceCandidate, MatchRequest, PreviousLink, match_requirement_to_evidence};
+    use super::matcher::{
+        EvidenceCandidate, MatchRequest, PreviousLink, match_requirement_to_evidence,
+    };
     use domain::traceability::{EvidenceAnchor, EvidenceType, LinkConfidence, LinkOutcome};
 
     fn code_candidate(path: &str, symbol: &str, score: f32) -> EvidenceCandidate {

@@ -64,7 +64,15 @@ pub fn parse_markdown_artifact(
             let slug = slugify(heading);
             current_heading_slug = Some(slug.clone());
             item_index += 1;
-            push_item(&mut parsed, source, slug, item_index, None, heading, line_number)?;
+            push_item(
+                &mut parsed,
+                source,
+                slug,
+                item_index,
+                None,
+                heading,
+                line_number,
+            )?;
             line_index += 1;
             continue;
         }
@@ -73,7 +81,10 @@ pub fn parse_markdown_artifact(
             let (consumed, rows) = collect_table_rows(&lines, line_index);
             if let Some(first) = rows.first() {
                 let headers = split_table_row(first);
-                if headers.iter().any(|header| header.eq_ignore_ascii_case("acceptance")) {
+                if headers
+                    .iter()
+                    .any(|header| header.eq_ignore_ascii_case("acceptance"))
+                {
                     parse_acceptance_rows(
                         source,
                         &mut parsed,
@@ -88,7 +99,7 @@ pub fn parse_markdown_artifact(
             continue;
         }
 
-        if line.starts_with("- [") || line.starts_with("* [") {
+        if is_task_list_item(line) {
             let Some(heading_slug) = current_heading_slug.clone() else {
                 return Err(invalid_payload(
                     "checklist",
@@ -163,7 +174,13 @@ fn parse_acceptance_rows(
     let id_index = headers
         .iter()
         .position(|header| header.eq_ignore_ascii_case("id"))
-        .ok_or_else(|| invalid_payload("acceptance_table", "acceptance table missing ID column", line_number))?;
+        .ok_or_else(|| {
+            invalid_payload(
+                "acceptance_table",
+                "acceptance table missing ID column",
+                line_number,
+            )
+        })?;
     let acceptance_index = headers
         .iter()
         .position(|header| header.eq_ignore_ascii_case("acceptance"))
@@ -284,6 +301,19 @@ fn extract_source_item_id(text: &str) -> Option<String> {
     None
 }
 
+fn is_task_list_item(line: &str) -> bool {
+    let rest = line
+        .strip_prefix("- [")
+        .or_else(|| line.strip_prefix("* ["))
+        .unwrap_or_default();
+    if rest.is_empty() {
+        return false;
+    }
+    let mut characters = rest.chars();
+    matches!(characters.next(), Some(' ') | Some('x') | Some('X'))
+        && matches!(characters.next(), Some(']'))
+}
+
 fn slugify(value: &str) -> String {
     value
         .trim()
@@ -332,18 +362,24 @@ mod tests {
         let parsed = parse_markdown_artifact(&source(".planning/PRD.md"), markdown)
             .expect("parser should succeed for valid structures");
 
-        assert!(parsed
-            .items
-            .iter()
-            .any(|item| item.body.contains("Coverage Requirements")));
-        assert!(parsed
-            .items
-            .iter()
-            .any(|item| item.source_item_id.as_deref() == Some("REQ-1")));
-        assert!(parsed
-            .items
-            .iter()
-            .any(|item| item.source_item_id.as_deref() == Some("ACC-1")));
+        assert!(
+            parsed
+                .items
+                .iter()
+                .any(|item| item.body.contains("Coverage Requirements"))
+        );
+        assert!(
+            parsed
+                .items
+                .iter()
+                .any(|item| item.source_item_id.as_deref() == Some("REQ-1"))
+        );
+        assert!(
+            parsed
+                .items
+                .iter()
+                .any(|item| item.source_item_id.as_deref() == Some("ACC-1"))
+        );
     }
 
     #[test]
@@ -369,10 +405,26 @@ mod tests {
 "#;
         let parsed = parse_markdown_artifact(&source(".planning/stories/story-1.md"), markdown)
             .expect("minor quality issue should not fail parse");
-        assert!(parsed
-            .findings
-            .iter()
-            .any(|finding| finding.severity == ValidationSeverity::Warning));
+        assert!(
+            parsed
+                .findings
+                .iter()
+                .any(|finding| finding.severity == ValidationSeverity::Warning)
+        );
         assert!(!parsed.items.is_empty());
+    }
+
+    #[test]
+    fn ignores_bracketed_reference_bullets_that_are_not_task_lists() {
+        let markdown = r#"
+## References
+- [Source: _bmad-output/planning-artifacts/epics.md#Story 6.8]
+- [Specific requirements]
+"#;
+        let parsed = parse_markdown_artifact(&source(".planning/stories/story-1.md"), markdown)
+            .expect("reference bullets should not be parsed as checklists");
+        assert_eq!(parsed.findings.len(), 0);
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].body, "References");
     }
 }

@@ -10,9 +10,14 @@ use research_gateway::traceability::matcher::{EvidenceCandidate, PreviousLink};
 use research_gateway::traceability::service::{
     RunTraceabilityMappingInput, TraceabilityRequirementInput, run_traceability_mapping,
 };
+use reporting_service::exports::readiness::{
+    ReadinessReportPayload, ReadinessRiskSummary, ReadinessSeverityBreakdown,
+    ReadinessWaiverLedger, ReadinessWaiverLedgerEntry, compose_readiness_artifact_payloads,
+};
 use reporting_service::exports::workflows::{
     ReportExportOrchestrator, ReportExportWorkflowService, TriggerOnDemandExportInput,
 };
+use domain::reporting_export::ReportingExportArtifactType;
 use domain::readiness::{
     WaiverRecord, WaiverState, normalize_readiness_identifier,
     parse_utc_timestamp as parse_readiness_utc_timestamp, resolve_waiver_state, validate_waiver,
@@ -666,11 +671,11 @@ fn list_readiness_waivers(
     })
 }
 
-fn load_phase5_active_waivers(
+fn load_phase5_waiver_listing(
     repo_root: &str,
     generated_at_utc: &str,
     unresolved_requirement_ids: &BTreeSet<String>,
-) -> Result<Vec<WaiverRecord>, Phase5ChainError> {
+) -> Result<ReadinessWaiverListOutput, Phase5ChainError> {
     let listing = list_readiness_waivers(ListReadinessWaiversCliArgs {
         as_of_utc: generated_at_utc.to_string(),
         repo_root: repo_root.to_string(),
@@ -691,7 +696,7 @@ fn load_phase5_active_waivers(
             });
         }
     }
-    Ok(listing.active)
+    Ok(listing)
 }
 
 fn readiness_waiver_store_path(repo_root: &str) -> PathBuf {
@@ -847,7 +852,7 @@ async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOut
         .iter()
         .map(|row| normalize_readiness_identifier(&row.canonical_requirement_id))
         .collect::<BTreeSet<_>>();
-    let waivers = load_phase5_active_waivers(
+    let waiver_listing = load_phase5_waiver_listing(
         &command.repo_root,
         &command.generated_at_utc,
         &unresolved_requirement_ids,
@@ -859,19 +864,20 @@ async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOut
         generated_at_utc: command.generated_at_utc.clone(),
         repo_root: command.repo_root.clone(),
         risk_prioritization: Some(risk_output),
-        waivers,
+        waivers: waiver_listing.active.clone(),
     })
     .await
     .map_err(|error| Phase5ChainError {
         code: error.code,
         message: error.message,
     })?;
+    let readiness_report = compose_readiness_report(&readiness_output, &waiver_listing);
 
     let artifacts = export_readiness_report(
         &command.repo_root,
         &command.commit_sha,
         &command.generated_at_utc,
-        &readiness_output,
+        &readiness_report,
     )
     .map_err(|error| Phase5ChainError {
         code: "readiness_dependency_unavailable".to_string(),
@@ -892,6 +898,7 @@ async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOut
             commit_sha: Some(command.commit_sha.clone()),
             reason_code: None,
             unavailable_artifact_types: Vec::new(),
+            readiness_report: Some(readiness_report.clone()),
         })
         .map_err(|error| Phase5ChainError {
             code: "readiness_dependency_unavailable".to_string(),
@@ -913,85 +920,123 @@ async fn run_phase5_chain(command: &Phase5ChainCliArgs) -> Result<Phase5ChainOut
     })
 }
 
+fn compose_readiness_report(
+    readiness: &ReadinessEvaluationResult,
+    waiver_listing: &ReadinessWaiverListOutput,
+) -> ReadinessReportPayload {
+    ReadinessReportPayload {
+        snapshot_id: readiness.snapshot_id.clone(),
+        commit_sha: readiness.commit_sha.clone(),
+        generated_at_utc: readiness.generated_at_utc.clone(),
+        advisory_state: readiness_state_label(readiness).to_string(),
+        recommendation_reason_code: readiness.reason_code.clone(),
+        recommendation_rationale: compose_readiness_rationale(readiness),
+        severity_counts: ReadinessSeverityBreakdown {
+            critical: readiness.explainability.severity_counts.critical,
+            high: readiness.explainability.severity_counts.high,
+            medium: readiness.explainability.severity_counts.medium,
+            low: readiness.explainability.severity_counts.low,
+        },
+        waived_count: readiness.explainability.waived_count,
+        unwaived_count: readiness.explainability.unwaived_count,
+        top_unresolved_risks: readiness
+            .explainability
+            .top_unresolved_risks
+            .iter()
+            .map(|risk| ReadinessRiskSummary {
+                canonical_requirement_id: risk.canonical_requirement_id.clone(),
+                severity: format!("{:?}", risk.severity).to_ascii_lowercase(),
+                risk_score: risk.risk_score,
+                priority_rank: risk.priority_rank,
+                reason_code: risk.reason_code.clone(),
+            })
+            .collect::<Vec<_>>(),
+        waiver_ledger: ReadinessWaiverLedger {
+            active: compose_waiver_ledger_entries(&waiver_listing.active),
+            expired: compose_waiver_ledger_entries(&waiver_listing.expired),
+        },
+    }
+}
+
+fn readiness_state_label(readiness: &ReadinessEvaluationResult) -> &'static str {
+    match readiness.readiness_state {
+        domain::readiness::ReadinessState::Ready => "ready",
+        domain::readiness::ReadinessState::Caution => "caution",
+        domain::readiness::ReadinessState::NotReady => "not_ready",
+    }
+}
+
+fn compose_readiness_rationale(readiness: &ReadinessEvaluationResult) -> String {
+    let summary = format!(
+        "unwaived={}, waived={}",
+        readiness.explainability.unwaived_count, readiness.explainability.waived_count
+    );
+    match readiness.readiness_state {
+        domain::readiness::ReadinessState::Ready => format!(
+            "No unwaived critical/high/medium risks remain; advisory state is ready ({summary})."
+        ),
+        domain::readiness::ReadinessState::Caution => format!(
+            "One or more unwaived high/medium risks remain; advisory state is caution ({summary})."
+        ),
+        domain::readiness::ReadinessState::NotReady => format!(
+            "At least one unwaived critical risk remains; advisory state is not_ready ({summary})."
+        ),
+    }
+}
+
+fn compose_waiver_ledger_entries(waivers: &[WaiverRecord]) -> Vec<ReadinessWaiverLedgerEntry> {
+    waivers
+        .iter()
+        .map(|waiver| ReadinessWaiverLedgerEntry {
+            canonical_requirement_id: waiver.canonical_requirement_id.clone(),
+            owner: waiver.owner.clone(),
+            reason_code: waiver.reason_code.clone(),
+            approved_by: waiver.approved_by.clone(),
+            expires_at_utc: waiver.expires_at_utc.clone(),
+        })
+        .collect::<Vec<_>>()
+}
+
 fn export_readiness_report(
     repo_root: &str,
     commit_sha: &str,
     generated_at_utc: &str,
-    readiness: &ReadinessEvaluationResult,
+    readiness: &ReadinessReportPayload,
 ) -> Result<Vec<ReadinessArtifactMetadata>, String> {
     let artifact_dir = Path::new(repo_root).join(".planning").join("artifacts");
     fs::create_dir_all(&artifact_dir)
         .map_err(|error| format!("unable to create readiness artifact dir: {error}"))?;
-
-    let json_payload = serde_json::to_string_pretty(readiness)
-        .map_err(|error| format!("unable to serialize readiness report json: {error}"))?;
-    let markdown_payload = render_readiness_markdown(readiness);
-
-    let json_path = artifact_dir.join("readiness-report.json");
-    let md_path = artifact_dir.join("readiness-report.md");
-    fs::write(&json_path, &json_payload)
-        .map_err(|error| format!("unable to write readiness-report.json: {error}"))?;
-    fs::write(&md_path, &markdown_payload)
-        .map_err(|error| format!("unable to write readiness-report.md: {error}"))?;
-
+    let payloads = compose_readiness_artifact_payloads(readiness)
+        .map_err(|error| format!("unable to compose readiness artifacts: {error:?}"))?;
     let normalized_timestamp = generated_at_utc.replace(':', "-");
-    Ok(vec![
-        ReadinessArtifactMetadata {
-            artifact_id: format!("readiness_artifact_{}_{}_json", commit_sha, normalized_timestamp),
-            artifact_type: "readiness-report.json".to_string(),
-            checksum: sha256_hex(json_payload.as_bytes()),
-            path: json_path.to_string_lossy().to_string(),
-        },
-        ReadinessArtifactMetadata {
-            artifact_id: format!("readiness_artifact_{}_{}_md", commit_sha, normalized_timestamp),
-            artifact_type: "readiness-report.md".to_string(),
-            checksum: sha256_hex(markdown_payload.as_bytes()),
-            path: md_path.to_string_lossy().to_string(),
-        },
-    ])
-}
-
-fn render_readiness_markdown(readiness: &ReadinessEvaluationResult) -> String {
-    let mut markdown = String::new();
-    markdown.push_str("# CI Readiness Report\n\n");
-    markdown.push_str(&format!("- Snapshot: `{}`\n", readiness.snapshot_id));
-    markdown.push_str(&format!(
-        "- Advisory State: `{}`\n",
-        match readiness.readiness_state {
-            domain::readiness::ReadinessState::Ready => "ready",
-            domain::readiness::ReadinessState::Caution => "caution",
-            domain::readiness::ReadinessState::NotReady => "not_ready",
-        }
-    ));
-    markdown.push_str(&format!(
-        "- Recommendation Code: `{}`\n\n",
-        readiness.reason_code
-    ));
-    markdown.push_str("## Coverage Posture\n");
-    markdown.push_str(&format!(
-        "- Unwaived unresolved rows: {}\n",
-        readiness.explainability.unwaived_count
-    ));
-    markdown.push_str(&format!(
-        "- Waived unresolved rows: {}\n\n",
-        readiness.explainability.waived_count
-    ));
-    markdown.push_str("## Top Unresolved Risks\n");
-    if readiness.explainability.top_unresolved_risks.is_empty() {
-        markdown.push_str("- None\n");
-    } else {
-        for risk in &readiness.explainability.top_unresolved_risks {
-            markdown.push_str(&format!(
-                "- `{}` (`{:?}`, score {}, rank {})\n",
-                risk.canonical_requirement_id, risk.severity, risk.risk_score, risk.priority_rank
-            ));
-        }
+    let mut metadata = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let (artifact_type, suffix, path) = match payload.artifact_type {
+            ReportingExportArtifactType::ReadinessReportJson => (
+                "readiness-report.json",
+                "json",
+                artifact_dir.join("readiness-report.json"),
+            ),
+            ReportingExportArtifactType::ReadinessReportMarkdown => (
+                "readiness-report.md",
+                "md",
+                artifact_dir.join("readiness-report.md"),
+            ),
+            _ => continue,
+        };
+        fs::write(&path, &payload.payload)
+            .map_err(|error| format!("unable to write {artifact_type}: {error}"))?;
+        metadata.push(ReadinessArtifactMetadata {
+            artifact_id: format!(
+                "readiness_artifact_{}_{}_{}",
+                commit_sha, normalized_timestamp, suffix
+            ),
+            artifact_type: artifact_type.to_string(),
+            checksum: sha256_hex(payload.payload.as_bytes()),
+            path: path.to_string_lossy().to_string(),
+        });
     }
-    markdown.push_str("\n## Waiver Ledger\n");
-    markdown.push_str("- Active: included in waived count\n");
-    markdown.push_str("- Expired: excluded from waiver reduction\n");
-    markdown.push_str("- Revoked: excluded from waiver reduction\n");
-    markdown
+    Ok(metadata)
 }
 
 fn sha256_hex(payload: &[u8]) -> String {

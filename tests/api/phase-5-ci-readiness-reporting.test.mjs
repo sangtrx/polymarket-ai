@@ -27,10 +27,31 @@ test("RPTG-02: readiness markdown composer includes required operator summary se
   assert.match(readiness, /## Recommendation Rationale/);
 });
 
-test("RPTG-01/RPTG-02: phase-5 aggregate QA script is present and exact", () => {
+test("RPTG-01/RPTG-02: phase-5 aggregate QA script keeps portable cargo resolution and required checks", () => {
   const pkg = JSON.parse(read("package.json"));
-  assert.equal(
-    pkg.scripts["qa:test:phase-5"],
-    "cargo test -p research-gateway readiness::tests:: && cargo test -p persistence postgres::readiness::tests::waiver_ && cargo test -p reporting-service exports::workflows::tests::readiness_ && cargo test -p research-gateway main::tests::readiness_ && node --test tests/api/phase-5-ci-readiness-reporting.test.mjs tests/e2e/phase-5-ci-readiness-reporting.e2e.test.mjs",
+  const cargoRunner = pkg.scripts["qa:test:phase:cargo"];
+  const phase5 = pkg.scripts["qa:test:phase-5"];
+
+  assert.match(cargoRunner, /CARGO_BIN=/);
+  assert.match(cargoRunner, /\.cargo\/bin\/cargo/);
+  assert.match(
+    phase5,
+    /qa:test:phase:cargo -- test -p research-gateway readiness::tests::/,
+  );
+  assert.match(
+    phase5,
+    /qa:test:phase:cargo -- test -p persistence postgres::readiness::tests::waiver_/,
+  );
+  assert.match(
+    phase5,
+    /qa:test:phase:cargo -- test -p reporting-service exports::workflows::tests::readiness_/,
+  );
+  assert.match(
+    phase5,
+    /qa:test:phase:cargo -- test -p research-gateway main::tests::readiness_/,
+  );
+  assert.match(
+    phase5,
+    /node --test tests\/api\/phase-5-ci-readiness-reporting\.test\.mjs tests\/e2e\/phase-5-ci-readiness-reporting\.e2e\.test\.mjs/,
   );
 });

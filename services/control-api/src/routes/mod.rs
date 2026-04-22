@@ -6086,6 +6086,7 @@ pub async fn trigger_on_demand_report_export(
             commit_sha: payload.commit_sha,
             reason_code: payload.reason_code,
             unavailable_artifact_types: payload.unavailable_artifact_types,
+            readiness_report: None,
         },
     ) {
         Ok(evidence) => evidence,

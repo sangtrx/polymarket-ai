@@ -313,9 +313,7 @@ mod tests {
     #[test]
     fn migration_contract_snapshot_unique_key() {
         assert!(CANONICAL_INGESTION_MIGRATION_SQL.contains("canonical_ingestion_snapshots"));
-        assert!(
-            CANONICAL_INGESTION_MIGRATION_SQL.contains("UNIQUE (commit_sha, ingested_at_utc)")
-        );
+        assert!(CANONICAL_INGESTION_MIGRATION_SQL.contains("UNIQUE (commit_sha, ingested_at_utc)"));
     }
 
     #[test]

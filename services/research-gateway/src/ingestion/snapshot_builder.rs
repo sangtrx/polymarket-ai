@@ -1,7 +1,7 @@
 use crate::ingestion::artifact_parser::ParsedArtifact;
 use domain::audit_artifacts::{
-    CanonicalArtifactInput, CanonicalArtifactType, CanonicalSnapshotInput, build_canonical_snapshot,
-    canonical_requirement_id,
+    CanonicalArtifactInput, CanonicalArtifactType, CanonicalSnapshotInput,
+    build_canonical_snapshot, canonical_requirement_id,
 };
 use std::collections::BTreeMap;
 
@@ -72,7 +72,10 @@ pub fn build_snapshot_assembly(input: SnapshotBuildInput) -> SnapshotAssembly {
             let Some(artifact_type) = classify_artifact_type(&item.artifact_path) else {
                 findings.push(SnapshotFinding {
                     code: "canonical_artifact_invalid_payload".to_string(),
-                    message: format!("unable to classify artifact type for {}", item.artifact_path),
+                    message: format!(
+                        "unable to classify artifact type for {}",
+                        item.artifact_path
+                    ),
                 });
                 continue;
             };
@@ -175,7 +178,8 @@ fn build_equivalence_records(entries: &[CanonicalEntry]) -> Vec<EquivalenceRecor
     let mut records = Vec::new();
     for left in 0..entries.len() {
         for right in (left + 1)..entries.len() {
-            if normalized_semantic_key(&entries[left].body) == normalized_semantic_key(&entries[right].body)
+            if normalized_semantic_key(&entries[left].body)
+                == normalized_semantic_key(&entries[right].body)
                 && !entries[left].source_item_id.is_empty()
                 && !entries[right].source_item_id.is_empty()
             {
@@ -256,7 +260,13 @@ mod tests {
         }
     }
 
-    fn item(path: &str, heading_slug: &str, index: u32, source_item_id: &str, body: &str) -> ParsedArtifactItem {
+    fn item(
+        path: &str,
+        heading_slug: &str,
+        index: u32,
+        source_item_id: &str,
+        body: &str,
+    ) -> ParsedArtifactItem {
         ParsedArtifactItem {
             artifact_path: path.to_string(),
             heading_slug: heading_slug.to_string(),
@@ -326,10 +336,12 @@ mod tests {
         };
 
         let assembly = build_snapshot_assembly(input);
-        assert!(assembly
-            .unresolved_conflicts
-            .iter()
-            .any(|conflict| conflict.status == "unresolved"));
+        assert!(
+            assembly
+                .unresolved_conflicts
+                .iter()
+                .any(|conflict| conflict.status == "unresolved")
+        );
     }
 
     #[test]
@@ -359,9 +371,11 @@ mod tests {
 
         let assembly = build_snapshot_assembly(input);
         assert!(assembly.successful);
-        assert!(assembly
-            .findings
-            .iter()
-            .any(|finding| finding.code == "canonical_item_conflict_unresolved"));
+        assert!(
+            assembly
+                .findings
+                .iter()
+                .any(|finding| finding.code == "canonical_item_conflict_unresolved")
+        );
     }
 }

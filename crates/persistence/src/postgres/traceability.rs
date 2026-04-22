@@ -1,4 +1,6 @@
-use domain::traceability::{EvidenceAnchor, EvidenceType, LinkConfidence, LinkOutcome, TraceabilityLink};
+use domain::traceability::{
+    EvidenceAnchor, EvidenceType, LinkConfidence, LinkOutcome, TraceabilityLink,
+};
 use sqlx::{Connection, PgConnection, Row};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -119,19 +121,18 @@ pub async fn insert_traceability_snapshot<'e, E>(
     commit_sha: &str,
     generated_at_utc: &str,
     links: &[TraceabilityLink],
-) -> Result<(), TraceabilityPersistenceError>
-{
-    if snapshot_id.trim().is_empty() || commit_sha.trim().is_empty() || generated_at_utc.trim().is_empty() {
+) -> Result<(), TraceabilityPersistenceError> {
+    if snapshot_id.trim().is_empty()
+        || commit_sha.trim().is_empty()
+        || generated_at_utc.trim().is_empty()
+    {
         return Err(TraceabilityPersistenceError::invalid_payload(
             "snapshot_id, commit_sha, and generated_at_utc are required",
         ));
     }
 
     let mut transaction = executor.begin().await.map_err(|error| {
-        TraceabilityPersistenceError::query_failure(
-            "insert_traceability_snapshot.begin",
-            error,
-        )
+        TraceabilityPersistenceError::query_failure("insert_traceability_snapshot.begin", error)
     })?;
 
     sqlx::query(INSERT_TRACEABILITY_SNAPSHOT_SQL)
@@ -143,7 +144,11 @@ pub async fn insert_traceability_snapshot<'e, E>(
         .map_err(|error| classify_query_error("insert_traceability_snapshot.snapshot", error))?;
 
     for (link_idx, link) in links.iter().enumerate() {
-        let link_id = format!("{}_{}", snapshot_id.trim().to_ascii_lowercase(), link_idx + 1);
+        let link_id = format!(
+            "{}_{}",
+            snapshot_id.trim().to_ascii_lowercase(),
+            link_idx + 1
+        );
         sqlx::query(INSERT_TRACEABILITY_LINK_SQL)
             .bind(&link_id)
             .bind(snapshot_id.trim().to_ascii_lowercase())
@@ -175,15 +180,14 @@ pub async fn insert_traceability_snapshot<'e, E>(
                 .bind(anchor.line_end.map(i64::from))
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| classify_query_error("insert_traceability_snapshot.anchor", error))?;
+                .map_err(|error| {
+                    classify_query_error("insert_traceability_snapshot.anchor", error)
+                })?;
         }
     }
 
     transaction.commit().await.map_err(|error| {
-        TraceabilityPersistenceError::query_failure(
-            "insert_traceability_snapshot.commit",
-            error,
-        )
+        TraceabilityPersistenceError::query_failure("insert_traceability_snapshot.commit", error)
     })?;
 
     Ok(())
@@ -193,8 +197,7 @@ pub async fn list_links_by_requirement(
     executor: &mut PgConnection,
     snapshot_id: &str,
     canonical_requirement_id: &str,
-) -> Result<Vec<TraceabilityLinkRecord>, TraceabilityPersistenceError>
-{
+) -> Result<Vec<TraceabilityLinkRecord>, TraceabilityPersistenceError> {
     if snapshot_id.trim().is_empty() || canonical_requirement_id.trim().is_empty() {
         return Err(TraceabilityPersistenceError::invalid_payload(
             "snapshot_id and canonical_requirement_id are required",
@@ -210,9 +213,9 @@ pub async fn list_links_by_requirement(
 
     let mut records: Vec<TraceabilityLinkRecord> = Vec::new();
     for row in rows {
-        let link_id: String = row
-            .try_get("link_id")
-            .map_err(|error| TraceabilityPersistenceError::query_failure("row_decode.link_id", error))?;
+        let link_id: String = row.try_get("link_id").map_err(|error| {
+            TraceabilityPersistenceError::query_failure("row_decode.link_id", error)
+        })?;
 
         let maybe_existing_idx = records.iter().position(|record| record.link_id == link_id);
         let anchor = decode_anchor(&row)?;
@@ -239,7 +242,10 @@ pub async fn list_links_by_requirement(
         records.push(TraceabilityLinkRecord {
             link_id,
             canonical_requirement_id: row.try_get("canonical_requirement_id").map_err(|error| {
-                TraceabilityPersistenceError::query_failure("row_decode.canonical_requirement_id", error)
+                TraceabilityPersistenceError::query_failure(
+                    "row_decode.canonical_requirement_id",
+                    error,
+                )
             })?,
             rationale: row.try_get("rationale").map_err(|error| {
                 TraceabilityPersistenceError::query_failure("row_decode.rationale", error)
@@ -261,10 +267,12 @@ pub async fn list_links_by_requirement(
     Ok(records)
 }
 
-fn decode_anchor(row: &sqlx::postgres::PgRow) -> Result<Option<EvidenceAnchor>, TraceabilityPersistenceError> {
-    let anchor_id: Option<String> = row
-        .try_get("anchor_id")
-        .map_err(|error| TraceabilityPersistenceError::query_failure("row_decode.anchor_id", error))?;
+fn decode_anchor(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<EvidenceAnchor>, TraceabilityPersistenceError> {
+    let anchor_id: Option<String> = row.try_get("anchor_id").map_err(|error| {
+        TraceabilityPersistenceError::query_failure("row_decode.anchor_id", error)
+    })?;
     if anchor_id.is_none() {
         return Ok(None);
     }
@@ -365,7 +373,10 @@ fn evidence_type_to_str(value: &EvidenceType) -> &'static str {
     }
 }
 
-fn classify_query_error(operation: &'static str, error: sqlx::Error) -> TraceabilityPersistenceError {
+fn classify_query_error(
+    operation: &'static str,
+    error: sqlx::Error,
+) -> TraceabilityPersistenceError {
     if is_constraint_error(&error) {
         return TraceabilityPersistenceError::constraint_violation(operation, error);
     }
@@ -385,7 +396,9 @@ fn is_constraint_error(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::traceability::{EvidenceAnchor, EvidenceType, LinkConfidence, LinkOutcome, TraceabilityLink};
+    use domain::traceability::{
+        EvidenceAnchor, EvidenceType, LinkConfidence, LinkOutcome, TraceabilityLink,
+    };
 
     const TRACEABILITY_MIGRATION_SQL: &str =
         include_str!("../../migrations/20260409000300_traceability_mapping.sql");
@@ -442,8 +455,14 @@ mod tests {
 
     #[test]
     fn parse_outcome_accepts_missing_and_stale_records() {
-        assert_eq!(parse_outcome("missing_evidence"), Ok(LinkOutcome::MissingEvidence));
-        assert_eq!(parse_outcome("stale_evidence"), Ok(LinkOutcome::StaleEvidence));
+        assert_eq!(
+            parse_outcome("missing_evidence"),
+            Ok(LinkOutcome::MissingEvidence)
+        );
+        assert_eq!(
+            parse_outcome("stale_evidence"),
+            Ok(LinkOutcome::StaleEvidence)
+        );
     }
 
     #[test]

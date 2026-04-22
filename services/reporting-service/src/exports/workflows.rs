@@ -128,6 +128,7 @@ pub struct TriggerOnDemandExportInput {
     pub commit_sha: Option<String>,
     pub reason_code: Option<String>,
     pub unavailable_artifact_types: Vec<String>,
+    pub readiness_report: Option<ReadinessReportPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +334,7 @@ impl ReportExportWorkflowService {
         incident_id: Option<String>,
         incident_severity: Option<String>,
         unavailable_artifact_types: Vec<String>,
+        readiness_report: Option<ReadinessReportPayload>,
         impacted_system: Option<String>,
         runbook_url: Option<String>,
     ) -> Result<ReportExportJobEvidence, ReportExportWorkflowError> {
@@ -520,42 +522,17 @@ impl ReportExportWorkflowService {
 
         let mut missing_artifacts = Vec::new();
         let mut persisted_artifacts = Vec::new();
-        let readiness_payloads = compose_readiness_artifact_payloads(&ReadinessReportPayload {
-            snapshot_id: format!("readiness::{}", running.job_id),
-            commit_sha: normalized_commit_sha
-                .clone()
-                .unwrap_or_else(|| running.job_id.clone()),
-            generated_at_utc: as_of_utc.clone(),
-            advisory_state: if unavailable_types.is_empty() {
-                "ready".to_string()
-            } else {
-                "caution".to_string()
-            },
-            recommendation_reason_code: if unavailable_types.is_empty() {
-                "readiness_ready".to_string()
-            } else {
-                "readiness_dependency_unavailable".to_string()
-            },
-            recommendation_rationale: if unavailable_types.is_empty() {
-                "Readiness evidence is complete; recommendation remains advisory for this run."
-                    .to_string()
-            } else {
-                "Readiness evaluation failed because required snapshot or waiver data is unavailable. Re-run audit after restoring prerequisites and verify reason code details.".to_string()
-            },
-            severity_counts: ReadinessSeverityBreakdown {
-                critical: 0,
-                high: 0,
-                medium: 0,
-                low: 0,
-            },
-            waived_count: 0,
-            unwaived_count: 0,
-            top_unresolved_risks: Vec::new(),
-            waiver_ledger: ReadinessWaiverLedger {
-                active: Vec::new(),
-                expired: Vec::new(),
-            },
-        })
+        let readiness_report = readiness_report.unwrap_or_else(|| {
+            default_readiness_report_payload(
+                &running.job_id,
+                normalized_commit_sha
+                    .as_deref()
+                    .unwrap_or(running.job_id.as_str()),
+                &as_of_utc,
+                &unavailable_types,
+            )
+        });
+        let readiness_payloads = compose_readiness_artifact_payloads(&readiness_report)
         .map_err(map_contract_error)?
         .into_iter()
         .map(|artifact| (artifact.artifact_type, artifact.payload))
@@ -712,6 +689,7 @@ impl ReportExportOrchestrator for ReportExportWorkflowService {
             None,
             None,
             input.unavailable_artifact_types,
+            input.readiness_report,
             None,
             None,
         )
@@ -742,6 +720,7 @@ impl ReportExportOrchestrator for ReportExportWorkflowService {
             Some(input.incident_id),
             Some(input.incident_severity),
             input.unavailable_artifact_types,
+            None,
             input.impacted_system,
             input.runbook_url,
         )
@@ -767,6 +746,7 @@ impl ReportExportOrchestrator for ReportExportWorkflowService {
             None,
             None,
             input.unavailable_artifact_types,
+            None,
             None,
             None,
         )
@@ -1200,6 +1180,48 @@ fn parse_optional_reason_code(
         .map(|code| code.unwrap_or(fallback))
 }
 
+fn default_readiness_report_payload(
+    job_id: &str,
+    commit_sha: &str,
+    as_of_utc: &str,
+    unavailable_types: &BTreeSet<ReportingExportArtifactType>,
+) -> ReadinessReportPayload {
+    ReadinessReportPayload {
+        snapshot_id: format!("readiness::{job_id}"),
+        commit_sha: commit_sha.to_string(),
+        generated_at_utc: as_of_utc.to_string(),
+        advisory_state: if unavailable_types.is_empty() {
+            "ready".to_string()
+        } else {
+            "caution".to_string()
+        },
+        recommendation_reason_code: if unavailable_types.is_empty() {
+            "readiness_ready".to_string()
+        } else {
+            "readiness_dependency_unavailable".to_string()
+        },
+        recommendation_rationale: if unavailable_types.is_empty() {
+            "Readiness evidence is complete; recommendation remains advisory for this run."
+                .to_string()
+        } else {
+            "Readiness evaluation failed because required snapshot or waiver data is unavailable. Re-run audit after restoring prerequisites and verify reason code details.".to_string()
+        },
+        severity_counts: ReadinessSeverityBreakdown {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+        },
+        waived_count: 0,
+        unwaived_count: 0,
+        top_unresolved_risks: Vec::new(),
+        waiver_ledger: ReadinessWaiverLedger {
+            active: Vec::new(),
+            expired: Vec::new(),
+        },
+    }
+}
+
 fn normalize_unavailable_artifact_types(
     candidates: &[String],
 ) -> Result<BTreeSet<ReportingExportArtifactType>, ReportExportWorkflowError> {
@@ -1364,6 +1386,33 @@ mod tests {
             commit_sha: Some("abc123".to_string()),
             reason_code: None,
             unavailable_artifact_types: Vec::new(),
+            readiness_report: None,
+        }
+    }
+
+    fn sample_readiness_report() -> ReadinessReportPayload {
+        ReadinessReportPayload {
+            snapshot_id: "readiness::sample".to_string(),
+            commit_sha: "abc123".to_string(),
+            generated_at_utc: "2026-04-07T00:00:00Z".to_string(),
+            advisory_state: "ready".to_string(),
+            recommendation_reason_code: "readiness_ready".to_string(),
+            recommendation_rationale:
+                "Readiness evidence is complete; recommendation remains advisory for this run."
+                    .to_string(),
+            severity_counts: ReadinessSeverityBreakdown {
+                critical: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+            },
+            waived_count: 0,
+            unwaived_count: 0,
+            top_unresolved_risks: Vec::new(),
+            waiver_ledger: ReadinessWaiverLedger {
+                active: Vec::new(),
+                expired: Vec::new(),
+            },
         }
     }
 
@@ -1440,6 +1489,24 @@ mod tests {
             evidence.missing_artifact_types,
             vec!["access_audits".to_string()]
         );
+    }
+
+    #[test]
+    fn readiness_provided_payload_rejects_invalid_report_contract() {
+        let service = ReportExportWorkflowService::in_memory();
+        let mut input = on_demand_input();
+        let mut report = sample_readiness_report();
+        report.recommendation_rationale = String::new();
+        input.readiness_report = Some(report);
+
+        let error = service
+            .trigger_on_demand_export(input)
+            .expect_err("invalid readiness payload should fail closed");
+        assert_eq!(error.code, ReportingExportReasonCode::InvalidPayload.code());
+        assert!(error
+            .field_errors
+            .iter()
+            .any(|issue| issue.field == "recommendation_rationale"));
     }
 
     #[test]
@@ -1556,6 +1623,7 @@ mod tests {
                 commit_sha: None,
                 reason_code: None,
                 unavailable_artifact_types: Vec::new(),
+                readiness_report: None,
             })
             .expect_err("read-only roles must not trigger exports");
         assert_eq!(

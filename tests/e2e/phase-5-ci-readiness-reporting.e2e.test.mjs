@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -85,6 +91,12 @@ test("RPTG-01/RPTG-02: run-phase5-chain output is replay-stable with dual readin
       assert.equal(typeof artifact.checksum, "string");
       assert.equal(artifact.checksum.length, 64);
     }
+    const markdownArtifact = payload.artifacts.find(
+      (artifact) => artifact.artifact_type === "readiness-report.md",
+    );
+    assert.ok(markdownArtifact?.path);
+    const markdown = readFileSync(markdownArtifact.path, "utf8");
+    assert.match(markdown, /## Recommendation Rationale/);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
