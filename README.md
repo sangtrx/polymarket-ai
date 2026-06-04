@@ -1,5 +1,9 @@
 # polymarket-ai
 
+<p align="center">
+	<img src="./banner.png" alt="polymarket-ai banner" style="max-width:100%; height:auto;" />
+</p>
+
 A monorepo providing the polymarket-ai baseline: a Rust backend ecosystem with web frontends (Next.js) and supporting services. This repository contains server crates, web apps, tooling, infrastructure manifests and CI helpers for local development and CI.
 
 Badges: [CI] [Docs] [License] (replace with your project badges)
