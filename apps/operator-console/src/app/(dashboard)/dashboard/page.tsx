@@ -6,6 +6,7 @@ import { OperatorShellLayout } from "@/components/shell/OperatorShellLayout";
 import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
 import { IncidentAlertsPanel } from "@/components/timeline/IncidentAlertsPanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
+import { OperatorWorkflowReadinessCard } from "@/components/workflows/OperatorWorkflowReadinessCard";
 import { getOperatorConsoleEnv } from "@/lib/env";
 import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
@@ -23,7 +24,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     resolvedSearchParams,
     "dashboard.read-model.shell",
   );
-  const { apiBaseUrl } = getOperatorConsoleEnv();
+  const { apiBaseUrl, operatorBffBaseUrl } = getOperatorConsoleEnv();
   const riskPosture = resolveRiskPostureViewModel(resolvedSearchParams, stateModel);
 
   const tabViews = [
@@ -33,14 +34,15 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
       content: (
         <section className="shell-panel-grid">
           <PortfolioSummaryCard freshness={stateModel.freshness} />
-           <ExecutionSummaryCard freshness={stateModel.freshness} />
-           <GovernanceQueueCard
-             baseUrl={apiBaseUrl}
-             freshness={stateModel.freshness}
-           />
-           <IncidentTimelineCard
-             baseUrl={apiBaseUrl}
-             freshness={stateModel.freshness}
+          <ExecutionSummaryCard freshness={stateModel.freshness} />
+          <GovernanceQueueCard
+            baseUrl={apiBaseUrl}
+            freshness={stateModel.freshness}
+          />
+          <OperatorWorkflowReadinessCard baseUrl={operatorBffBaseUrl} />
+          <IncidentTimelineCard
+            baseUrl={apiBaseUrl}
+            freshness={stateModel.freshness}
           />
           <IncidentAlertsPanel
             baseUrl={apiBaseUrl}
