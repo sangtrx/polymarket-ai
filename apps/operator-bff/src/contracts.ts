@@ -7,6 +7,7 @@ export interface OperatorPrincipal {
 
 export type WorkflowKind = "readiness_snapshot";
 export type WorkflowStatus = "queued" | "running" | "succeeded" | "failed";
+export type WorkflowStoreDurability = "memory" | "postgres";
 
 export interface ReadinessSnapshotResult {
   target: string;
@@ -40,6 +41,8 @@ export interface CreateWorkflowResult {
 }
 
 export interface WorkflowStore {
+  readonly durability: WorkflowStoreDurability;
+  ready(): Promise<boolean>;
   createOrGet(input: CreateWorkflowInput): Promise<CreateWorkflowResult>;
   get(id: string): Promise<WorkflowRecord | null>;
   transition(
