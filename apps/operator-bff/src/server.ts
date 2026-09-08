@@ -5,7 +5,6 @@ import type { OperatorPrincipal, ReadinessSnapshotResult, WorkflowRecord } from 
 import { AuthorizationError, WorkflowService } from "./service.js";
 import { InMemoryWorkflowStore } from "./store.js";
 
-const DEFAULT_PORT = 8090;
 const DEFAULT_CONTROL_API_BASE_URL = "http://127.0.0.1:8080";
 
 interface ErrorEnvelope {
@@ -197,15 +196,5 @@ export function buildServer(options?: {
         errorEnvelope("operator_bff_internal_error", "Operator BFF request failed."),
       );
     }
-  });
-}
-
-if (process.env.NODE_ENV !== "test") {
-  const port = Number.parseInt(process.env.OPERATOR_BFF_PORT ?? `${DEFAULT_PORT}`, 10);
-  const server = buildServer();
-  server.listen(port, "127.0.0.1", () => {
-    process.stdout.write(
-      `${JSON.stringify({ event: "operator_bff_started", port, timestamp_utc: new Date().toISOString() })}\n`,
-    );
   });
 }

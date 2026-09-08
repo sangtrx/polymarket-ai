@@ -10,7 +10,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "rm -rf dist-test && tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
-    "start": "node dist/server.js"
+    "start": "node dist/main.js"
   },
   "devDependencies": {
     "@types/node": "^20",
