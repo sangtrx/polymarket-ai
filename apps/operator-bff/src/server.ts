@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 
 import { AuthenticationError, verifyOperatorBearerToken } from "./auth.js";
 import type { OperatorPrincipal, ReadinessSnapshotResult, WorkflowRecord } from "./contracts.js";
+import { PostgresWorkflowStore } from "./postgres-store.js";
 import { AuthorizationError, WorkflowService } from "./service.js";
 import { InMemoryWorkflowStore } from "./store.js";
 
@@ -84,13 +85,17 @@ export function createReadinessRunner(
 export function buildServer(options?: {
   authSecret?: string;
   controlApiBaseUrl?: string;
+  databaseUrl?: string;
   workflowService?: WorkflowService;
 }) {
   const authSecret = options?.authSecret ?? process.env.OPERATOR_BFF_AUTH_SECRET ?? "";
+  const databaseUrl = options?.databaseUrl ?? process.env.OPERATOR_BFF_DATABASE_URL ?? "";
   const workflowService =
     options?.workflowService ??
     new WorkflowService(
-      new InMemoryWorkflowStore(),
+      databaseUrl
+        ? PostgresWorkflowStore.fromConnectionString(databaseUrl)
+        : new InMemoryWorkflowStore(),
       createReadinessRunner(
         options?.controlApiBaseUrl ??
           process.env.CONTROL_API_BASE_URL ??
@@ -107,10 +112,16 @@ export function buildServer(options?: {
     }
 
     if (request.method === "GET" && url.pathname === "/readyz") {
-      const ready = authSecret.length >= 32;
+      const authConfigured = authSecret.length >= 32;
+      const durableStorageConfigured = workflowService.storageDurability === "postgres";
+      const durableStorageReady =
+        durableStorageConfigured && (await workflowService.storageReady());
+      const ready = authConfigured && durableStorageReady;
       jsonResponse(response, ready ? 200 : 503, {
         status: ready ? "ready" : "not_ready",
-        auth_configured: ready,
+        auth_configured: authConfigured,
+        storage_durability: workflowService.storageDurability,
+        durable_storage_ready: durableStorageReady,
       });
       return;
     }
