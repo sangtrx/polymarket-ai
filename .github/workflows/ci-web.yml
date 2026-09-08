@@ -63,13 +63,11 @@ jobs:
           npm run web:build 2>&1 | tee bootstrap-evidence/web-build.log
 
       - name: Run operator BFF quality gates
-        env:
-          OPERATOR_BFF_TEST_DATABASE_URL: postgresql://operator_bff:operator_bff_test@127.0.0.1:5432/operator_bff_test
         run: |
           set -euo pipefail
           pnpm --filter operator-bff typecheck 2>&1 | tee bootstrap-evidence/operator-bff-typecheck.log
           pnpm --filter operator-bff test 2>&1 | tee bootstrap-evidence/operator-bff-test.log
-          pnpm --filter operator-bff test:postgres 2>&1 | tee bootstrap-evidence/operator-bff-postgres-integration.log
+          OPERATOR_BFF_TEST_DATABASE_URL='postgresql://operator_bff:operator_bff_test@127.0.0.1:5432/operator_bff_test' pnpm --filter operator-bff test:postgres 2>&1 | tee bootstrap-evidence/operator-bff-postgres-integration.log
           pnpm --filter operator-bff build 2>&1 | tee bootstrap-evidence/operator-bff-build.log
 
       - name: Upload bootstrap evidence

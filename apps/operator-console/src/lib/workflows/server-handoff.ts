@@ -81,7 +81,9 @@ function mintOperatorToken(config: OperatorBffServerConfig): string {
   return `${header}.${payload}.${signature}`;
 }
 
-function authenticatedHeaders(config: OperatorBffServerConfig): HeadersInit {
+function authenticatedHeaders(
+  config: OperatorBffServerConfig,
+): Record<string, string> {
   return {
     accept: "application/json",
     authorization: `Bearer ${mintOperatorToken(config)}`,
