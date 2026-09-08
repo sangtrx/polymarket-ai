@@ -5,6 +5,7 @@ import type {
   ReadinessRunner,
   WorkflowRecord,
   WorkflowStore,
+  WorkflowStoreDurability,
 } from "./contracts.js";
 
 export class AuthorizationError extends Error {
@@ -42,6 +43,14 @@ export class WorkflowService {
     private readonly store: WorkflowStore,
     private readonly readinessRunner: ReadinessRunner,
   ) {}
+
+  get storageDurability(): WorkflowStoreDurability {
+    return this.store.durability;
+  }
+
+  async storageReady(): Promise<boolean> {
+    return this.store.ready();
+  }
 
   async startReadinessSnapshot(
     principal: OperatorPrincipal,
