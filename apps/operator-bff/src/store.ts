@@ -13,8 +13,13 @@ function cloneRecord(record: WorkflowRecord): WorkflowRecord {
 }
 
 export class InMemoryWorkflowStore implements WorkflowStore {
+  readonly durability = "memory" as const;
   private readonly records = new Map<string, WorkflowRecord>();
   private readonly idempotencyIndex = new Map<string, string>();
+
+  async ready(): Promise<boolean> {
+    return true;
+  }
 
   async createOrGet(input: CreateWorkflowInput): Promise<CreateWorkflowResult> {
     const indexKey = `${input.operatorId}:${input.kind}:${input.idempotencyKey}`;
