@@ -41,12 +41,19 @@ jobs:
           npm run preflight 2>&1 | tee bootstrap-evidence/preflight.log
           node tools/bootstrap/check-bootstrap.mjs --evidence-file bootstrap-evidence/bootstrap-check.json 2>&1 | tee bootstrap-evidence/bootstrap-check.log
 
-      - name: Run web quality gates
+      - name: Run operator console quality gates
         run: |
           set -euo pipefail
           npm run web:lint 2>&1 | tee bootstrap-evidence/web-lint.log
           npm run web:typecheck 2>&1 | tee bootstrap-evidence/web-typecheck.log
           npm run web:build 2>&1 | tee bootstrap-evidence/web-build.log
+
+      - name: Run operator BFF quality gates
+        run: |
+          set -euo pipefail
+          pnpm --filter operator-bff typecheck 2>&1 | tee bootstrap-evidence/operator-bff-typecheck.log
+          pnpm --filter operator-bff test 2>&1 | tee bootstrap-evidence/operator-bff-test.log
+          pnpm --filter operator-bff build 2>&1 | tee bootstrap-evidence/operator-bff-build.log
 
       - name: Upload bootstrap evidence
         if: always()
