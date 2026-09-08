@@ -180,11 +180,11 @@ export function validateReproducibility(repoRoot) {
     );
   }
 
-  if (appPackageJson.dependencies?.next !== "16.2.2") {
+  if (appPackageJson.dependencies?.next !== "16.2.6") {
     throwFailure(
       "BOOTSTRAP_REPRODUCIBILITY_GAP",
       "web-version-pin",
-      "Pin apps/operator-console Next.js dependency to 16.2.2.",
+      "Pin apps/operator-console Next.js dependency to 16.2.6.",
       { actual: appPackageJson.dependencies?.next ?? null },
     );
   }
