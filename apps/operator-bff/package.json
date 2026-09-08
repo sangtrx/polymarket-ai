@@ -12,8 +12,12 @@
     "test": "rm -rf dist-test && tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
     "start": "node dist/main.js"
   },
+  "dependencies": {
+    "pg": "^8.16.3"
+  },
   "devDependencies": {
     "@types/node": "^20",
+    "@types/pg": "^8.15.5",
     "typescript": "^5"
   }
 }
