@@ -1,0 +1,35 @@
+name: san279-lockfile-artifact
+
+on:
+  push:
+    branches:
+      - "tqsang97/san-279-track-a-polymarket-typescript-operator-workflow-bff-proof"
+
+permissions:
+  contents: read
+
+jobs:
+  generate-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.10.0
+
+      - name: Regenerate lockfile only
+        run: pnpm install --lockfile-only --no-frozen-lockfile
+
+      - name: Upload regenerated lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: san279-pnpm-lock
+          path: pnpm-lock.yaml
