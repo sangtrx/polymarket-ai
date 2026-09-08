@@ -16,8 +16,9 @@ export function getOperatorConsoleEnv() {
       process.env.OPERATOR_CONSOLE_PUBLIC_API_BASE_URL ??
       resolveDefaultControlApiUrl(),
     operatorBffBaseUrl:
-      process.env.NEXT_PUBLIC_OPERATOR_BFF_BASE_URL ??
+      process.env.OPERATOR_BFF_INTERNAL_BASE_URL ??
       process.env.OPERATOR_BFF_PUBLIC_BASE_URL ??
+      process.env.NEXT_PUBLIC_OPERATOR_BFF_BASE_URL ??
       resolveDefaultOperatorBffUrl(),
   };
 }

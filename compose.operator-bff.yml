@@ -1,0 +1,47 @@
+services:
+  operator-bff-postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: operator_bff
+      POSTGRES_USER: operator_bff
+      POSTGRES_PASSWORD: operator_bff_local_only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U operator_bff -d operator_bff"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - operator-bff-postgres-data:/var/lib/postgresql/data
+      - ./apps/operator-bff/migrations/001_operator_workflow_requests.sql:/docker-entrypoint-initdb.d/001_operator_workflow_requests.sql:ro
+
+  operator-bff:
+    build:
+      context: .
+      dockerfile: apps/operator-bff/Dockerfile
+    environment:
+      OPERATOR_BFF_BIND_ADDRESS: 0.0.0.0
+      OPERATOR_BFF_PORT: 8090
+      OPERATOR_BFF_AUTH_SECRET: ${OPERATOR_BFF_AUTH_SECRET:?set a 32+ character local test secret}
+      OPERATOR_BFF_DATABASE_URL: postgresql://operator_bff:operator_bff_local_only@operator-bff-postgres:5432/operator_bff
+      CONTROL_API_BASE_URL: ${CONTROL_API_BASE_URL:-http://host.docker.internal:8080}
+    depends_on:
+      operator-bff-postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8090/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:8090:8090"
+
+volumes:
+  operator-bff-postgres-data:

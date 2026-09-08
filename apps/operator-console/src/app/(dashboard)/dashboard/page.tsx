@@ -7,6 +7,7 @@ import { ShellStatePanel } from "@/components/shell/ShellStatePanel";
 import { IncidentAlertsPanel } from "@/components/timeline/IncidentAlertsPanel";
 import { IncidentTimelineCard } from "@/components/timeline/IncidentTimelineCard";
 import { OperatorWorkflowReadinessCard } from "@/components/workflows/OperatorWorkflowReadinessCard";
+import { OperatorWorkflowRunCard } from "@/components/workflows/OperatorWorkflowRunCard";
 import { getOperatorConsoleEnv } from "@/lib/env";
 import { resolveRiskPostureViewModel } from "@/lib/risk/posture";
 import {
@@ -40,6 +41,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
             freshness={stateModel.freshness}
           />
           <OperatorWorkflowReadinessCard baseUrl={operatorBffBaseUrl} />
+          <OperatorWorkflowRunCard />
           <IncidentTimelineCard
             baseUrl={apiBaseUrl}
             freshness={stateModel.freshness}
