@@ -11,6 +11,11 @@ function jsonError(status: number, errorCode: string, message: string): Response
 }
 
 function isSameOriginMutation(request: Request): boolean {
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite) {
+    return fetchSite === "same-origin";
+  }
+
   const origin = request.headers.get("origin");
   if (!origin) {
     return false;
