@@ -27,6 +27,14 @@ function signToken(payload: Record<string, unknown>): string {
   return `${header}.${body}.${signature}`;
 }
 
+function operatorToken(subject: string): string {
+  return signToken({
+    sub: subject,
+    role: "operator",
+    exp: Math.floor(Date.now() / 1000) + 60,
+  });
+}
+
 async function withServer(
   callback: (baseUrl: string) => Promise<void>,
 ): Promise<void> {
@@ -73,11 +81,7 @@ test("workflow HTTP route enforces auth and idempotency", async () => {
     });
     assert.equal(unauthorized.status, 401);
 
-    const token = signToken({
-      sub: "operator-http",
-      role: "operator",
-      exp: Math.floor(Date.now() / 1000) + 60,
-    });
+    const token = operatorToken("operator-http");
     const headers = {
       authorization: `Bearer ${token}`,
       "idempotency-key": "http-test-0001",
@@ -112,5 +116,40 @@ test("workflow HTTP route enforces auth and idempotency", async () => {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
     assert.equal(terminalStatus, "succeeded");
+  });
+});
+
+test("authenticated workflow SSE endpoint returns a terminal end-to-end event", async () => {
+  await withServer(async (baseUrl) => {
+    const token = operatorToken("operator-sse");
+    const start = await fetch(`${baseUrl}/v1/workflows/readiness-snapshots`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "idempotency-key": "sse-http-test-0001",
+      },
+    });
+    assert.equal(start.status, 202);
+    const started = (await start.json()) as { workflow_id: string };
+
+    const events = await fetch(`${baseUrl}/v1/workflows/${started.workflow_id}/events`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(events.status, 200);
+    assert.match(events.headers.get("content-type") ?? "", /^text\/event-stream/);
+
+    const stream = await events.text();
+    assert.match(stream, /event: workflow/);
+    const dataLine = stream.split("\n").find((line) => line.startsWith("data: "));
+    assert.ok(dataLine);
+    const terminal = JSON.parse(dataLine.slice("data: ".length)) as {
+      workflow_id: string;
+      status: string;
+      result: ReadinessSnapshotResult | null;
+    };
+    assert.equal(terminal.workflow_id, started.workflow_id);
+    assert.equal(terminal.status, "succeeded");
+    assert.equal(terminal.result?.ok, true);
+    assert.equal(terminal.result?.latencyMs, RESULT.latencyMs);
   });
 });

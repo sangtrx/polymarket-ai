@@ -36,6 +36,10 @@ function assertCanRead(principal: OperatorPrincipal, record: WorkflowRecord): vo
   }
 }
 
+function isTerminal(record: WorkflowRecord): boolean {
+  return record.status === "succeeded" || record.status === "failed";
+}
+
 export class WorkflowService {
   private readonly events = new EventEmitter();
 
@@ -101,6 +105,10 @@ export class WorkflowService {
     }
 
     listener(record);
+    if (isTerminal(record)) {
+      return () => {};
+    }
+
     const eventName = `workflow:${workflowId}`;
     this.events.on(eventName, listener);
     return () => this.events.off(eventName, listener);
