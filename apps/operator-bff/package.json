@@ -1,0 +1,24 @@
+{
+  "name": "operator-bff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "rm -rf dist-test && tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
+    "test:postgres": "test -n \"$OPERATOR_BFF_TEST_DATABASE_URL\" && rm -rf dist-test && tsc -p tsconfig.test.json && node --test --test-name-pattern=PostgresWorkflowStore dist-test/tests/postgres-integration.test.js",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/pg": "^8.15.5",
+    "typescript": "^5"
+  }
+}

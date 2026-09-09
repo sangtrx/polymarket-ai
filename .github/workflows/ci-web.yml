@@ -11,6 +11,20 @@ permissions:
 jobs:
   web-baseline:
     runs-on: ubuntu-latest
+    services:
+      operator-bff-postgres:
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_DB: operator_bff_test
+          POSTGRES_USER: operator_bff
+          POSTGRES_PASSWORD: operator_bff_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U operator_bff -d operator_bff_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,12 +55,29 @@ jobs:
           npm run preflight 2>&1 | tee bootstrap-evidence/preflight.log
           node tools/bootstrap/check-bootstrap.mjs --evidence-file bootstrap-evidence/bootstrap-check.json 2>&1 | tee bootstrap-evidence/bootstrap-check.log
 
-      - name: Run web quality gates
+      - name: Run operator console quality gates
         run: |
           set -euo pipefail
           npm run web:lint 2>&1 | tee bootstrap-evidence/web-lint.log
           npm run web:typecheck 2>&1 | tee bootstrap-evidence/web-typecheck.log
           npm run web:build 2>&1 | tee bootstrap-evidence/web-build.log
+
+      - name: Run operator BFF quality gates
+        run: |
+          set -euo pipefail
+          pnpm --filter operator-bff typecheck 2>&1 | tee bootstrap-evidence/operator-bff-typecheck.log
+          pnpm --filter operator-bff test 2>&1 | tee bootstrap-evidence/operator-bff-test.log
+          OPERATOR_BFF_TEST_DATABASE_URL='postgresql://operator_bff:operator_bff_test@127.0.0.1:5432/operator_bff_test' pnpm --filter operator-bff test:postgres 2>&1 | tee bootstrap-evidence/operator-bff-postgres-integration.log
+          pnpm --filter operator-bff build 2>&1 | tee bootstrap-evidence/operator-bff-build.log
+
+      - name: Validate operator BFF container path
+        env:
+          OPERATOR_BFF_AUTH_SECRET: ci-only-operator-bff-secret-1234567890
+          CONTROL_API_BASE_URL: http://host.docker.internal:8080
+        run: |
+          set -euo pipefail
+          docker compose -f compose.operator-bff.yml config 2>&1 | tee bootstrap-evidence/operator-bff-compose-config.log
+          docker build -f apps/operator-bff/Dockerfile -t operator-bff:ci . 2>&1 | tee bootstrap-evidence/operator-bff-docker-build.log
 
       - name: Upload bootstrap evidence
         if: always()
