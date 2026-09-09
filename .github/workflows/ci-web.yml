@@ -70,6 +70,15 @@ jobs:
           OPERATOR_BFF_TEST_DATABASE_URL='postgresql://operator_bff:operator_bff_test@127.0.0.1:5432/operator_bff_test' pnpm --filter operator-bff test:postgres 2>&1 | tee bootstrap-evidence/operator-bff-postgres-integration.log
           pnpm --filter operator-bff build 2>&1 | tee bootstrap-evidence/operator-bff-build.log
 
+      - name: Validate operator BFF container path
+        env:
+          OPERATOR_BFF_AUTH_SECRET: ci-only-operator-bff-secret-1234567890
+          CONTROL_API_BASE_URL: http://host.docker.internal:8080
+        run: |
+          set -euo pipefail
+          docker compose -f compose.operator-bff.yml config 2>&1 | tee bootstrap-evidence/operator-bff-compose-config.log
+          docker build -f apps/operator-bff/Dockerfile -t operator-bff:ci . 2>&1 | tee bootstrap-evidence/operator-bff-docker-build.log
+
       - name: Upload bootstrap evidence
         if: always()
         uses: actions/upload-artifact@v4
